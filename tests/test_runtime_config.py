@@ -112,6 +112,7 @@ def test_apply_restores_previous_config_when_health_check_fails(monkeypatch, tmp
 
     monkeypatch.setattr(runtime_config, "LLAMA_SWAP_CONFIG_PATH", config_path)
     monkeypatch.setattr(runtime_config, "RUNTIME_CONFIG_BACKUP_ROOT", backup_root)
+    monkeypatch.setattr(runtime_config, "_service_active", lambda: True)
     monkeypatch.setattr(
         runtime_config,
         "build_runtime_plan",
