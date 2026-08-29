@@ -4,11 +4,15 @@ The public repository starts at v0.4.2. Version numbers below describe capabilit
 
 ## v0.4.3 — orchestration core
 
+Status: implemented in the v0.4.3 development milestone.
+
 - single task owner
-- durable delegation request/result
-- checkpointed handoff
-- capability-based AUTO routing
-- structured orchestration events
+- durable delegation request/result with bounded child tasks
+- verified immutable checkpoint before handoff ownership changes
+- capability-based AUTO routing with no Role-name special cases
+- durable routing, delegation and handoff history
+
+Exit gates: delegation preserves parent ownership; handoff cannot switch ownership without a verified checkpoint; AUTO routing considers only enabled, model-bound Roles that cover the required capabilities.
 
 ## v0.5.0 — runtime configuration
 

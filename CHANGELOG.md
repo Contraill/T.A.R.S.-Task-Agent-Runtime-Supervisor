@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.3 - Orchestration Core
+
+- added capability-based AUTO Role routing without role-name special cases
+- added structured DelegationRequest/DelegationResult persistence
+- added child delegation tasks that preserve parent ownership
+- added checkpoint-gated transactional task handoff
+- added durable routing, delegation and handoff history
+- added CLI surfaces for routing, delegation and handoff inspection
+
 This repository starts its public Git history at the v0.4.2 development baseline. Earlier work is summarized here rather than reconstructed as artificial commits.
 
 ## 0.4.2 — 2026-08-29

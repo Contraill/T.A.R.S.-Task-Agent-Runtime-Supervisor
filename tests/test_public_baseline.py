@@ -3,7 +3,7 @@ from tars.roles import LEGACY_ROLE_ALIASES
 
 
 def test_version():
-    assert __version__ == "0.4.2"
+    assert __version__ == "0.4.3"
 
 
 def test_legacy_role_aliases():

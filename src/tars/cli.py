@@ -1,4 +1,5 @@
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -55,6 +56,15 @@ from .themes import (
     set_theme,
 )
 from .runner import create_run, run_task_epoch, list_runs, request_control
+from .orchestration import (
+    complete_delegation,
+    create_delegation,
+    delegation_envelope,
+    handoff_task,
+    list_delegations,
+    list_handoffs,
+    route_for_capabilities,
+)
 from .tasks import (
     active_task,
     append_event,
@@ -739,6 +749,144 @@ def command_task_mutation(action, task_id):
     return 0
 
 
+def _parse_scope(values):
+    result = {}
+    for item in values or []:
+        if "=" not in item:
+            raise ValueError(f"scope entry must be KEY=VALUE: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("scope key cannot be empty")
+        result[key] = value.strip()
+    return result
+
+
+def command_route(capabilities, task_id=None):
+    try:
+        decision = route_for_capabilities(capabilities, task_id=task_id)
+    except (LookupError, KeyError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    role = get_role(decision.selected_role)
+    console.print(f"[bold]{role.display_name}[/bold] ({role.id})")
+    console.print("required : " + (", ".join(decision.requested_capabilities) or "-"))
+    console.print(f"reason   : {decision.reason}")
+    table = Table(title="Routing Candidates")
+    table.add_column("Role")
+    table.add_column("Extra capabilities", justify="right")
+    table.add_column("Capabilities")
+    for candidate in decision.candidates:
+        table.add_row(
+            candidate["role_id"],
+            str(candidate["extra_capabilities"]),
+            ", ".join(candidate["capabilities"]),
+        )
+    console.print(table)
+    return 0
+
+
+def command_task_delegate(args):
+    try:
+        delegation = create_delegation(
+            args.task_id,
+            args.goal,
+            role=args.role,
+            required_capabilities=args.capability,
+            scope=_parse_scope(args.scope),
+            constraints=args.constraint,
+            permissions=args.permission,
+            evidence_refs=args.evidence,
+            expected_result=args.expected_result or "",
+        )
+    except (LookupError, KeyError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print(delegation.id)
+    console.print(f"child task : {delegation.child_task_id}")
+    console.print(f"role       : {delegation.requested_role}")
+    console.print("parent owner unchanged")
+    return 0
+
+
+def command_task_delegations(task_id=None, limit=50):
+    try:
+        rows = list_delegations(task_id, limit=limit)
+    except (KeyError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    table = Table(title="Delegations" + (f" · {task_id}" if task_id else ""))
+    table.add_column("ID")
+    table.add_column("Parent")
+    table.add_column("Child")
+    table.add_column("Role")
+    table.add_column("State")
+    table.add_column("Result")
+    table.add_column("Goal")
+    for row in rows:
+        table.add_row(
+            row.id, row.parent_task_id, row.child_task_id, row.requested_role,
+            row.state, row.result_status or "-", row.goal,
+        )
+    console.print(table)
+    return 0
+
+
+def command_task_delegation_show(delegation_id):
+    try:
+        envelope = delegation_envelope(delegation_id)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data=envelope)
+    return 0
+
+
+def command_task_delegation_complete(args):
+    try:
+        data = json.loads(args.result_json) if args.result_json else {}
+        if not isinstance(data, dict):
+            raise ValueError("--result-json must decode to a JSON object")
+        delegation = complete_delegation(
+            args.delegation_id,
+            status=args.status,
+            summary=args.summary,
+            result=data,
+        )
+    except (json.JSONDecodeError, KeyError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print(f"{delegation.id} · {delegation.state} · {delegation.result_status}")
+    return 0
+
+
+def command_task_handoff(task_id, role, reason):
+    try:
+        record = handoff_task(task_id, role, reason=reason)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print(
+        f"{record.id} · {record.from_role} -> {record.to_role} · checkpoint={record.checkpoint_id}"
+    )
+    return 0
+
+
+def command_task_handoffs(task_id=None, limit=50):
+    rows = list_handoffs(task_id, limit=limit)
+    table = Table(title="Handoffs" + (f" · {task_id}" if task_id else ""))
+    table.add_column("ID")
+    table.add_column("Task")
+    table.add_column("From")
+    table.add_column("To")
+    table.add_column("Checkpoint")
+    table.add_column("Reason")
+    for row in rows:
+        table.add_row(row.id, row.task_id, row.from_role, row.to_role, row.checkpoint_id, row.reason)
+    console.print(table)
+    return 0
+
+
 def command_conversation_list(limit=50):
     rows = list_conversations(limit=limit)
     table = Table(title="Conversations")
@@ -928,6 +1076,43 @@ def build_parser():
         p = task_sub.add_parser(name)
         p.add_argument("task_id")
 
+    route = sub.add_parser("route", help="capability-based AUTO role routing")
+    route.add_argument("--capability", action="append", default=[])
+    route.add_argument("--task", dest="task_id")
+
+    task_delegate = task_sub.add_parser("delegate")
+    task_delegate.add_argument("task_id")
+    task_delegate.add_argument("goal")
+    task_delegate.add_argument("--role")
+    task_delegate.add_argument("--capability", action="append", default=[])
+    task_delegate.add_argument("--scope", action="append", default=[], metavar="KEY=VALUE")
+    task_delegate.add_argument("--constraint", action="append", default=[])
+    task_delegate.add_argument("--permission", action="append", default=[])
+    task_delegate.add_argument("--evidence", action="append", default=[])
+    task_delegate.add_argument("--expected-result", default="")
+
+    task_delegations = task_sub.add_parser("delegations")
+    task_delegations.add_argument("task_id", nargs="?")
+    task_delegations.add_argument("--limit", type=int, default=50)
+
+    task_delegation_show = task_sub.add_parser("delegation-show")
+    task_delegation_show.add_argument("delegation_id")
+
+    task_delegation_complete = task_sub.add_parser("delegation-complete")
+    task_delegation_complete.add_argument("delegation_id")
+    task_delegation_complete.add_argument("--status", required=True, choices=["success", "partial", "failed", "cancelled"])
+    task_delegation_complete.add_argument("--summary", required=True)
+    task_delegation_complete.add_argument("--result-json", default="")
+
+    task_handoff = task_sub.add_parser("handoff")
+    task_handoff.add_argument("task_id")
+    task_handoff.add_argument("role")
+    task_handoff.add_argument("--reason", default="manual handoff")
+
+    task_handoffs = task_sub.add_parser("handoffs")
+    task_handoffs.add_argument("task_id", nargs="?")
+    task_handoffs.add_argument("--limit", type=int, default=50)
+
     conv = sub.add_parser("conversation")
     conv_sub = conv.add_subparsers(dest="conversation_command", required=True)
     conv_list = conv_sub.add_parser("list")
@@ -1036,8 +1221,23 @@ def main():
             return command_task_run(cfg, args.task_id, args.reasoning)
         if args.task_command == "runs":
             return command_task_runs(args.task_id, args.limit)
+        if args.task_command == "delegate":
+            return command_task_delegate(args)
+        if args.task_command == "delegations":
+            return command_task_delegations(args.task_id, args.limit)
+        if args.task_command == "delegation-show":
+            return command_task_delegation_show(args.delegation_id)
+        if args.task_command == "delegation-complete":
+            return command_task_delegation_complete(args)
+        if args.task_command == "handoff":
+            return command_task_handoff(args.task_id, args.role, args.reason)
+        if args.task_command == "handoffs":
+            return command_task_handoffs(args.task_id, args.limit)
         if args.task_command in {"activate", "pause", "resume", "cancel", "complete"}:
             return command_task_mutation(args.task_command, args.task_id)
+
+    if args.command == "route":
+        return command_route(args.capability, args.task_id)
 
     if args.command == "conversation":
         if args.conversation_command == "list":

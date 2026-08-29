@@ -7,7 +7,7 @@ from .state_store import connect, ensure_state_store, json_dumps, json_loads, no
 
 EVENT_TYPES = {
     "progress", "tool", "reasoning", "status", "handoff", "delegation",
-    "sideband", "user", "result", "error", "checkpoint",
+    "routing", "sideband", "user", "result", "error", "checkpoint",
 }
 EVENT_VISIBILITY = {"quiet", "normal", "verbose", "internal"}
 

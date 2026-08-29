@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def now_utc() -> str:
@@ -210,6 +210,52 @@ def _schema_sql() -> str:
         ON task_runs(task_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_task_runs_state
         ON task_runs(state, heartbeat_at DESC);
+
+    CREATE TABLE IF NOT EXISTS delegations (
+        id TEXT PRIMARY KEY,
+        parent_task_id TEXT NOT NULL REFERENCES tasks(id),
+        child_task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+        requested_role TEXT NOT NULL,
+        state TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        scope_json TEXT NOT NULL DEFAULT '{}',
+        constraints_json TEXT NOT NULL DEFAULT '[]',
+        permissions_json TEXT NOT NULL DEFAULT '[]',
+        evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+        expected_result TEXT NOT NULL DEFAULT '',
+        result_status TEXT,
+        result_summary TEXT NOT NULL DEFAULT '',
+        result_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_delegations_parent_created
+        ON delegations(parent_task_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS handoffs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        from_role TEXT NOT NULL,
+        to_role TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id),
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_handoffs_task_created
+        ON handoffs(task_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS routing_decisions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        requested_capabilities_json TEXT NOT NULL DEFAULT '[]',
+        selected_role TEXT NOT NULL,
+        candidates_json TEXT NOT NULL DEFAULT '[]',
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_routing_task_created
+        ON routing_decisions(task_id, created_at DESC);
     """
 
 
@@ -274,7 +320,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "tasks", "task_events", "checkpoints", "context_projections", "task_runs"):
+        for table in ("conversations", "messages", "tasks", "task_events", "checkpoints", "context_projections", "task_runs", "delegations", "handoffs", "routing_decisions"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,
