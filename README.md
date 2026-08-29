@@ -8,9 +8,7 @@ The current codebase is a pre-1.0 development snapshot. It already runs on the r
 
 ## Current state
 
-The public baseline starts at **v0.4.2**.
-
-Implemented in the reference build:
+Implemented in the current reference build:
 
 - llama.cpp + llama-swap runtime integration
 - on-demand model loading and Zero-Idle behavior
@@ -21,8 +19,12 @@ Implemented in the reference build:
 - role-aware ContextManager with native tokenizer budgeting
 - streaming model output and backend-emitted reasoning visibility
 - durable task-run state with safe-boundary pause/cancel controls
+- generated, transactional llama-swap runtime configuration
+- transactional Role assignment, unassignment, model swap and profile changes
+- user-service start, stop and log controls
+- capability-based delegation, handoff and AUTO routing
 
-The next milestone is orchestration: delegation, handoff and capability-based AUTO routing.
+Local model download, import, verification and removal are the next lifecycle surface.
 
 ## Roles
 

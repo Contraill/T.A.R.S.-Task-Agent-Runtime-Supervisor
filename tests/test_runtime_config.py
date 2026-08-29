@@ -208,3 +208,44 @@ def test_switch_restores_role_registry_when_runtime_apply_fails(monkeypatch):
 
     assert saved[0]["roles"]["general"]["profile"] == "compact"
     assert saved[-1] == before
+
+
+def test_zero_bound_roles_render_valid_empty_model_map(monkeypatch):
+    monkeypatch.setattr(runtime_config, "list_roles", lambda include_disabled=False: [])
+    plan = runtime_config.build_runtime_plan()
+    assert plan.models == ()
+    assert "models: {}" in runtime_config.render_runtime_config(plan)
+
+
+def test_apply_preserves_stopped_service_state(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    plan = SimpleNamespace(models=())
+    monkeypatch.setattr(runtime_config, "LLAMA_SWAP_CONFIG_PATH", config_path)
+    monkeypatch.setattr(runtime_config, "RUNTIME_CONFIG_BACKUP_ROOT", tmp_path / "backups")
+    monkeypatch.setattr(runtime_config, "build_runtime_plan", lambda **kwargs: plan)
+    monkeypatch.setattr(runtime_config, "render_runtime_config", lambda plan=None: "models: {}\n")
+    monkeypatch.setattr(runtime_config, "_service_active", lambda: False)
+    actions = []
+    monkeypatch.setattr(runtime_config, "start_runtime_service", lambda: actions.append("start"))
+    monkeypatch.setattr(runtime_config, "stop_runtime_service", lambda: actions.append("stop"))
+    monkeypatch.setattr(runtime_config, "_wait_healthy", lambda *args, **kwargs: None)
+
+    runtime_config.apply_runtime_config(object())
+
+    assert actions == ["start", "stop"]
+
+
+def test_unassign_is_transactional(monkeypatch):
+    before = {"roles": {"oracle": {"model": "qwen", "profile": "normal", "enabled": True}}}
+    saved = []
+    monkeypatch.setattr(runtime_config, "resolve_role_id", lambda role: "oracle")
+    monkeypatch.setattr(runtime_config, "get_role", lambda role: SimpleNamespace(model="qwen", profile="normal"))
+    monkeypatch.setattr(runtime_config, "load_role_registry", lambda: __import__("copy").deepcopy(before))
+    monkeypatch.setattr(runtime_config, "save_role_registry", lambda data: saved.append(__import__("copy").deepcopy(data)))
+    monkeypatch.setattr(runtime_config, "apply_runtime_config", lambda cfg: SimpleNamespace(changed=True))
+
+    result = runtime_config.switch_role_runtime(object(), "oracle", unassign=True)
+
+    assert result.model_alias == ""
+    assert saved[-1]["roles"]["oracle"]["model"] == ""
+    assert saved[-1]["roles"]["oracle"]["enabled"] is False

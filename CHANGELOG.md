@@ -6,6 +6,10 @@
 - added read-only runtime plan, render and status commands
 - added guarded runtime apply with atomic config replacement, health checks and rollback
 - added transactional Role/model/profile switching with Role Registry rollback on failure
+- added `model assign`, `model unassign`, `model swap` and `role profile` management commands
+- added user-service `start`, `stop` and `logs` commands
+- preserved the pre-apply service state during validation and rollback
+- supported valid generated configuration when no local Role is bound
 - enforced Zero-Idle llama-swap policy invariants in generated configs
 - added `tars help` as a top-level help alias
 - documented the future Temporary session persistence contract

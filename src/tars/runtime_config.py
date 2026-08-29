@@ -212,8 +212,6 @@ def build_runtime_plan(*, require_files: bool = False) -> RuntimePlan:
         plans.append(plan)
         runtime_ids.add(role.runtime_id)
 
-    if not plans:
-        raise RuntimeError("no enabled, model-bound local llama.cpp Roles")
     if require_files and not LLAMA_SERVER_PATH.is_file():
         raise FileNotFoundError(f"llama-server missing: {LLAMA_SERVER_PATH}")
 
@@ -237,7 +235,7 @@ def render_runtime_config(plan: RuntimePlan | None = None) -> str:
         "performance:",
         "  disabled: " + ("true" if plan.performance_monitor_disabled else "false"),
         "",
-        "models:",
+        "models:" if plan.models else "models: {}",
     ]
 
     for model in plan.models:
@@ -330,6 +328,27 @@ def _restart_service() -> None:
     )
 
 
+def start_runtime_service() -> None:
+    subprocess.run(
+        ["systemctl", "--user", "start", LLAMA_SWAP_SERVICE], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
+    )
+
+
+def stop_runtime_service() -> None:
+    subprocess.run(
+        ["systemctl", "--user", "stop", LLAMA_SWAP_SERVICE], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
+    )
+
+
+def runtime_service_logs(*, lines: int = 100, follow: bool = False) -> int:
+    args = ["journalctl", "--user", "-u", LLAMA_SWAP_SERVICE, "-n", str(lines)]
+    if follow:
+        args.append("-f")
+    return subprocess.run(args, check=False).returncode
+
+
 def _api_runtime_ids(cfg, *, timeout=2.0) -> set[str]:
     with urllib.request.urlopen(
         runtime_base_url(cfg) + "/v1/models", timeout=timeout
@@ -390,12 +409,14 @@ def apply_runtime_config(cfg) -> RuntimeApplyResult:
     digest = _sha256_text(candidate)
     expected_ids = {model.runtime_id for model in plan.models}
 
+    was_active = _service_active()
     previous = None
     backup_path = None
     if LLAMA_SWAP_CONFIG_PATH.exists():
         previous = LLAMA_SWAP_CONFIG_PATH.read_text(encoding="utf-8")
         if previous == candidate:
-            _wait_healthy(cfg, expected_ids)
+            if was_active:
+                _wait_healthy(cfg, expected_ids)
             return RuntimeApplyResult(
                 changed=False,
                 path=LLAMA_SWAP_CONFIG_PATH,
@@ -410,8 +431,13 @@ def apply_runtime_config(cfg) -> RuntimeApplyResult:
 
     _atomic_write(LLAMA_SWAP_CONFIG_PATH, candidate)
     try:
-        _restart_service()
+        if was_active:
+            _restart_service()
+        else:
+            start_runtime_service()
         _wait_healthy(cfg, expected_ids)
+        if not was_active:
+            stop_runtime_service()
     except Exception as exc:
         if previous is None:
             try:
@@ -423,9 +449,12 @@ def apply_runtime_config(cfg) -> RuntimeApplyResult:
 
         rollback_error = None
         try:
-            _restart_service()
-            if previous is not None:
-                _wait_healthy(cfg, expected_ids=set(), timeout=10.0)
+            if was_active:
+                _restart_service()
+                if previous is not None:
+                    _wait_healthy(cfg, expected_ids=set(), timeout=10.0)
+            else:
+                stop_runtime_service()
         except Exception as rollback_exc:
             rollback_error = rollback_exc
 
@@ -449,29 +478,33 @@ def switch_role_runtime(
     *,
     model_alias: str | None = None,
     profile_name: str | None = None,
+    unassign: bool = False,
 ) -> RuntimeSwitchResult:
     role_id = resolve_role_id(role_name)
     current = get_role(role_id)
-    target_model = model_alias or current.model
+    target_model = "" if unassign else (model_alias or current.model)
     target_profile = profile_name or current.profile
-    if not target_model:
+    if not target_model and not unassign:
         raise ValueError(f"role {role_id} has no model binding")
     if target_profile not in {"compact", "normal", "extended"}:
         raise ValueError("profile must be compact, normal or extended")
 
-    model = get_model(target_model)
-    calibration = load_calibration(model.alias)
-    if calibration.get("status") != "ready":
-        raise RuntimeError(f"calibration for {target_model} is not ready")
-    if target_profile not in (calibration.get("profiles") or {}):
-        raise KeyError(f"{target_model} has no calibration profile {target_profile!r}")
+    if target_model:
+        model = get_model(target_model)
+        calibration = load_calibration(model.alias)
+        if calibration.get("status") != "ready":
+            raise RuntimeError(f"calibration for {target_model} is not ready")
+        if target_profile not in (calibration.get("profiles") or {}):
+            raise KeyError(f"{target_model} has no calibration profile {target_profile!r}")
 
     before = load_role_registry()
     candidate = copy.deepcopy(before)
     info = candidate["roles"][role_id]
     info["model"] = target_model
     info["profile"] = target_profile
-    if not info.get("enabled", True):
+    if unassign:
+        info["enabled"] = False
+    elif not info.get("enabled", True):
         raise ValueError(f"role {role_id} is disabled")
 
     save_role_registry(candidate)

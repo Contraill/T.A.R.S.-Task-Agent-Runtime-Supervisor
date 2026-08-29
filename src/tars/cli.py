@@ -48,6 +48,9 @@ from .runtime_config import (
     render_runtime_config,
     runtime_config_status,
     switch_role_runtime,
+    start_runtime_service,
+    stop_runtime_service,
+    runtime_service_logs,
 )
 from .state_store import health as state_store_health
 from .conversation import create_conversation, list_conversations, load_conversation, list_messages, active_conversation
@@ -613,6 +616,48 @@ def command_runtime_switch(cfg, args):
     return 0
 
 
+def command_model_binding(cfg, action, role, alias=None):
+    try:
+        result = switch_role_runtime(
+            cfg, role, model_alias=alias,
+            unassign=action == "unassign",
+        )
+    except Exception as exc:
+        console.print(f"[red]Model {action} failed:[/red] {exc}")
+        return 1
+    target = result.model_alias or "unbound"
+    console.print(
+        f"{result.role_id} -> {target} / {result.profile_name} · "
+        f"runtime {'updated' if result.apply.changed else 'already current'}"
+    )
+    return 0
+
+
+def command_role_profile(cfg, role, profile):
+    try:
+        result = switch_role_runtime(cfg, role, profile_name=profile)
+    except Exception as exc:
+        console.print(f"[red]Profile change failed:[/red] {exc}")
+        return 1
+    console.print(f"{result.role_id} -> {result.profile_name}")
+    return 0
+
+
+def command_service(action, *, lines=100, follow=False):
+    try:
+        if action == "start":
+            start_runtime_service()
+        elif action == "stop":
+            stop_runtime_service()
+        else:
+            return runtime_service_logs(lines=lines, follow=follow)
+    except Exception as exc:
+        console.print(f"[red]Runtime service {action} failed:[/red] {exc}")
+        return 1
+    console.print(f"Runtime service {action}ed.")
+    return 0
+
+
 def _task_table(tasks, *, scheduled_view=False):
     table = Table(title="Scheduled Tasks" if scheduled_view else "Tasks")
     table.add_column("ID")
@@ -1125,6 +1170,12 @@ def build_parser():
     model_sub.add_parser("bindings")
     model_info = model_sub.add_parser("info")
     model_info.add_argument("alias")
+    for name in ["assign", "swap"]:
+        p = model_sub.add_parser(name)
+        p.add_argument("role")
+        p.add_argument("alias")
+    model_unassign = model_sub.add_parser("unassign")
+    model_unassign.add_argument("role")
 
     role = sub.add_parser("role")
     role_sub = role.add_subparsers(dest="role_command", required=True)
@@ -1142,6 +1193,15 @@ def build_parser():
     for name in ["remove", "enable", "disable", "set-default"]:
         p = role_sub.add_parser(name)
         p.add_argument("name")
+    role_profile = role_sub.add_parser("profile")
+    role_profile.add_argument("name")
+    role_profile.add_argument("profile", choices=["compact", "normal", "extended"])
+
+    sub.add_parser("start", help="start the llama-swap user service")
+    sub.add_parser("stop", help="stop the llama-swap user service")
+    logs = sub.add_parser("logs", help="show llama-swap user-service logs")
+    logs.add_argument("-n", "--lines", type=int, default=100)
+    logs.add_argument("-f", "--follow", action="store_true")
 
     theme = sub.add_parser("theme")
     theme_sub = theme.add_subparsers(dest="theme_command", required=True)
@@ -1304,6 +1364,10 @@ def main():
     if args.command == "help":
         parser.print_help()
         return 0
+    if args.command in {"start", "stop"}:
+        return command_service(args.command)
+    if args.command == "logs":
+        return command_service("logs", lines=args.lines, follow=args.follow)
 
     if args.command == "model":
         if args.model_command == "list":
@@ -1312,6 +1376,10 @@ def main():
             return command_model_bindings()
         if args.model_command == "info":
             return command_model_info(args.alias)
+        if args.model_command in {"assign", "swap"}:
+            return command_model_binding(cfg, args.model_command, args.role, args.alias)
+        if args.model_command == "unassign":
+            return command_model_binding(cfg, "unassign", args.role)
 
     if args.command == "role":
         if args.role_command == "list":
@@ -1328,6 +1396,8 @@ def main():
             return command_role_mutation("disable", args.name)
         if args.role_command == "set-default":
             return command_role_mutation("default", args.name)
+        if args.role_command == "profile":
+            return command_role_profile(cfg, args.name, args.profile)
 
     if args.command == "theme":
         if args.theme_command == "list":
