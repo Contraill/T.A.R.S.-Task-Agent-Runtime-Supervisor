@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 - Runtime Configuration
+
+- added RuntimeConfigGenerator from Role, Model Registry and Calibration state
+- added read-only runtime plan, render and status commands
+- added guarded runtime apply with atomic config replacement, health checks and rollback
+- added transactional Role/model/profile switching with Role Registry rollback on failure
+- enforced Zero-Idle llama-swap policy invariants in generated configs
+- added `tars help` as a top-level help alias
+- documented the future Temporary session persistence contract
+
 ## 0.4.3 - Orchestration Core
 
 - added capability-based AUTO Role routing without role-name special cases

@@ -16,9 +16,13 @@ Exit gates: delegation preserves parent ownership; handoff cannot switch ownersh
 
 ## v0.5.0 — runtime configuration
 
-- generated llama-swap config
-- atomic Role/model/profile switching
-- runtime health checks and rollback
+- generated llama-swap config from Role + Model + Calibration state
+- read-only runtime plan/render/status surfaces
+- transactional Role/model/profile switching
+- runtime health checks and automatic config rollback
+- Zero-Idle policy invariants enforced by the generator
+
+Exit gates: generated normal profiles match the calibrated reference runtime; apply never leaves a broken config active; failed switch restores both runtime config and Role Registry; no runtime management path enables persistent performance monitoring.
 
 ## v0.5.1 — model manager
 
@@ -55,6 +59,17 @@ Local models use hardware calibration. Remote APIs use provider capability/healt
 - automatic context epochs, retrieval and compaction
 
 The mechanism lands here; the final First Awakening remains late in the release train.
+
+## v0.6.3 — temporary sessions
+
+- `tars temporary` and `/temporary` isolated ephemeral sessions
+- temporary conversation/task/context/tool trace lives in memory only
+- existing persistent identity/preferences/memory may be read, never mutated by the temporary session
+- exiting temporary mode returns to the pre-temporary normal state without promoting temporary messages or task state
+- temporary sessions cannot create work that must survive the session boundary, including scheduled/future tasks
+- external tool side effects remain real even though T.A.R.S. does not persist its own temporary state
+
+See [TEMPORARY.md](TEMPORARY.md) for the persistence contract.
 
 ## v0.7.x — tools and real agent loop
 

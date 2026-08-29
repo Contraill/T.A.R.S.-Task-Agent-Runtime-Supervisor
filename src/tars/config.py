@@ -21,6 +21,11 @@ TASK_EVENTS_ROOT = TASK_ROOT / "events"
 THEME_ROOT = Path.home() / ".config/tars/themes"
 UI_PREFS_PATH = Path.home() / ".config/tars/ui.toml"
 
+LLAMA_SWAP_CONFIG_PATH = Path.home() / ".config/tars/llama-swap/config.yaml"
+LLAMA_SERVER_PATH = Path.home() / ".local/src/llama.cpp/build-cuda/bin/llama-server"
+LLAMA_SWAP_SERVICE = "tars-llama-swap.service"
+RUNTIME_CONFIG_BACKUP_ROOT = STATE_ROOT / "runtime-config-backups"
+
 
 def load_config():
     with CONFIG_PATH.open("rb") as handle:

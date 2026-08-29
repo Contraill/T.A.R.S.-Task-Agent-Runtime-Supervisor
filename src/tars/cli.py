@@ -42,6 +42,13 @@ from .roles import (
     set_role_profile,
 )
 from .runtime import runtime_models
+from .runtime_config import (
+    apply_runtime_config,
+    build_runtime_plan,
+    render_runtime_config,
+    runtime_config_status,
+    switch_role_runtime,
+)
 from .state_store import health as state_store_health
 from .conversation import create_conversation, list_conversations, load_conversation, list_messages, active_conversation
 from .context import ContextManager, latest_projection
@@ -492,6 +499,117 @@ def command_calibration_list():
             str(row.get("reasonable_max_context", "-")),
         )
     console.print(table)
+    return 0
+
+
+
+def command_runtime_plan():
+    try:
+        plan = build_runtime_plan()
+    except (KeyError, ValueError, RuntimeError, FileNotFoundError) as exc:
+        console.print(f"[red]Runtime plan error:[/red] {exc}")
+        return 2
+
+    console.print(
+        f"[bold]Zero-Idle[/bold] · TTL={plan.global_ttl}s · "
+        f"unload={plan.unload_timeout}s · performance-monitor=disabled"
+    )
+    table = Table(title="Generated Runtime Plan")
+    table.add_column("Role")
+    table.add_column("Runtime")
+    table.add_column("Model")
+    table.add_column("Profile")
+    table.add_column("Context", justify="right")
+    table.add_column("KV")
+    table.add_column("CPU")
+    table.add_column("Threads")
+    table.add_column("NGL")
+    table.add_column("Overrides")
+    for item in plan.models:
+        ngl = "all" if item.ngl is None or str(item.ngl) == "-1" else str(item.ngl)
+        table.add_row(
+            item.display_name,
+            item.runtime_id,
+            item.model_alias,
+            item.profile_name,
+            str(item.context),
+            f"{item.cache_type_k}/{item.cache_type_v}",
+            item.cpus,
+            f"{item.threads}/{item.batch_threads}",
+            ngl,
+            "yes" if item.tensor_overrides else "-",
+        )
+    console.print(table)
+    return 0
+
+
+def command_runtime_render():
+    try:
+        rendered = render_runtime_config(build_runtime_plan())
+    except (KeyError, ValueError, RuntimeError, FileNotFoundError) as exc:
+        console.print(f"[red]Runtime render error:[/red] {exc}")
+        return 2
+    console.print(rendered, markup=False, highlight=False, end="")
+    return 0
+
+
+def command_runtime_status(cfg):
+    try:
+        status = runtime_config_status(cfg)
+    except Exception as exc:
+        console.print(f"[red]Runtime config status error:[/red] {exc}")
+        return 2
+    console.print(f"config       : {status.path}")
+    console.print(f"installed    : {status.installed}")
+    console.print(f"generated    : {status.generated_sha256[:16]}…")
+    console.print(
+        "installed sha: "
+        + (f"{status.installed_sha256[:16]}…" if status.installed_sha256 else "-")
+    )
+    console.print(f"matches      : {status.matches_generated}")
+    console.print(f"service      : {'active' if status.service_active else 'inactive'}")
+    console.print(f"API          : {'healthy' if status.api_healthy else 'unhealthy'}")
+    return 0 if status.service_active and status.api_healthy else 1
+
+
+def command_runtime_apply(cfg, *, yes=False):
+    if not yes:
+        console.print("[yellow]Refusing to modify runtime without --yes.[/yellow]")
+        console.print("Inspect `tars runtime plan` and `tars runtime render` first.")
+        return 2
+    try:
+        result = apply_runtime_config(cfg)
+    except Exception as exc:
+        console.print(f"[red]Runtime apply failed:[/red] {exc}")
+        return 1
+    console.print("Runtime config: " + ("updated" if result.changed else "already current"))
+    console.print(f"sha256       : {result.sha256}")
+    console.print(f"runtime ids  : {', '.join(result.runtime_ids)}")
+    console.print(f"backup       : {result.backup_path or '-'}")
+    return 0
+
+
+def command_runtime_switch(cfg, args):
+    if not args.model and not args.profile:
+        console.print("[red]Specify --model and/or --profile.[/red]")
+        return 2
+    if not args.yes:
+        console.print("[yellow]Refusing runtime switch without --yes.[/yellow]")
+        return 2
+    try:
+        result = switch_role_runtime(
+            cfg,
+            args.role,
+            model_alias=args.model,
+            profile_name=args.profile,
+        )
+    except Exception as exc:
+        console.print(f"[red]Runtime switch failed:[/red] {exc}")
+        return 1
+    console.print(
+        f"{result.role_id} -> {result.model_alias} / {result.profile_name} · "
+        f"runtime {'updated' if result.apply.changed else 'already current'}"
+    )
     return 0
 
 
@@ -999,6 +1117,7 @@ def build_parser():
     sub.add_parser("agents")
     sub.add_parser("paths")
     sub.add_parser("doctor")
+    sub.add_parser("help", help="show top-level help")
 
     model = sub.add_parser("model")
     model_sub = model.add_subparsers(dest="model_command", required=True)
@@ -1041,6 +1160,29 @@ def build_parser():
     calibration = sub.add_parser("calibration")
     calibration_sub = calibration.add_subparsers(dest="calibration_command", required=True)
     calibration_sub.add_parser("list")
+
+    runtime = sub.add_parser("runtime", help="generated local runtime configuration")
+    runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
+    runtime_sub.add_parser("plan", help="show Role/Model/Calibration runtime plan")
+    runtime_sub.add_parser("render", help="render candidate llama-swap YAML without writing")
+    runtime_sub.add_parser("status", help="compare installed and generated runtime config")
+    runtime_apply = runtime_sub.add_parser(
+        "apply", help="atomically apply generated runtime config"
+    )
+    runtime_apply.add_argument(
+        "--yes", action="store_true",
+        help="confirm config replacement, service restart and health-checked rollback",
+    )
+    runtime_switch = runtime_sub.add_parser(
+        "switch", help="transactionally change a Role model/profile and apply runtime"
+    )
+    runtime_switch.add_argument("role")
+    runtime_switch.add_argument("--model")
+    runtime_switch.add_argument("--profile", choices=["compact", "normal", "extended"])
+    runtime_switch.add_argument(
+        "--yes", action="store_true",
+        help="confirm Role Registry and runtime config transaction",
+    )
 
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="task_command", required=True)
@@ -1159,6 +1301,9 @@ def main():
         return command_paths(cfg)
     if args.command == "doctor":
         return command_doctor(cfg)
+    if args.command == "help":
+        parser.print_help()
+        return 0
 
     if args.command == "model":
         if args.model_command == "list":
@@ -1201,6 +1346,18 @@ def main():
     if args.command == "calibration":
         if args.calibration_command == "list":
             return command_calibration_list()
+
+    if args.command == "runtime":
+        if args.runtime_command == "plan":
+            return command_runtime_plan()
+        if args.runtime_command == "render":
+            return command_runtime_render()
+        if args.runtime_command == "status":
+            return command_runtime_status(cfg)
+        if args.runtime_command == "apply":
+            return command_runtime_apply(cfg, yes=args.yes)
+        if args.runtime_command == "switch":
+            return command_runtime_switch(cfg, args)
 
     if args.command == "task":
         if args.task_command == "list":
