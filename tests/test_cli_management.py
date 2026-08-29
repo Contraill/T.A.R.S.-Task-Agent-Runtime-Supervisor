@@ -30,3 +30,10 @@ def test_calibration_cli_parsing():
     assert mid.models == ["one", "two"] and mid.mid
     maximum = parser.parse_args(["calibrate", "one", "--max", "--fresh"])
     assert maximum.max and maximum.fresh
+
+
+def test_runtime_backend_cli_parsing():
+    parser = build_parser()
+    assert parser.parse_args(["backend", "list"]).backend_command == "list"
+    status = parser.parse_args(["backend", "status", "llama.cpp"])
+    assert status.backend == "llama.cpp"

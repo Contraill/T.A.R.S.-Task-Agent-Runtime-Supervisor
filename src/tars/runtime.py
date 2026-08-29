@@ -5,6 +5,8 @@ from urllib.parse import quote
 import urllib.request
 
 from .config import runtime_base_url
+from .runtime_backends import InferenceRequest, backend_binding_ready, backend_for_model
+from .registry import get_model
 from .roles import get_role
 
 
@@ -23,41 +25,6 @@ def post_json(url, payload, timeout=600):
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode())
-
-
-def stream_post_json(url, payload, timeout=1200):
-    """Yield OpenAI-compatible SSE JSON chunks from an HTTP POST.
-
-    llama.cpp/llama-swap use the conventional `data: {...}` stream shape.  The
-    generator deliberately exposes raw decoded JSON objects so higher layers can
-    distinguish final-content, backend reasoning_content and usage without
-    inventing model-specific text parsing.
-    """
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        for raw in response:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line or line.startswith(":"):
-                continue
-            if line.startswith("data:"):
-                line = line[5:].strip()
-            if line == "[DONE]":
-                break
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                yield value
 
 
 def runtime_models(cfg):
@@ -113,39 +80,23 @@ def count_chat_tokens(cfg, runtime_id, messages):
     return len(tokenize_text(cfg, runtime_id, prompt))
 
 
-def _completion_payload(role_record, messages, *, max_tokens, temperature, stream):
-    payload = {
-        "model": role_record.runtime_id,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if stream:
-        payload["stream"] = True
-        payload["stream_options"] = {"include_usage": True}
-    return payload
-
-
 def _checked_role(role):
     role_record = get_role(role)
     if not role_record.enabled:
         raise RuntimeError(f"role {role_record.display_name!r} is disabled")
     if not role_record.model:
         raise RuntimeError(f"role {role_record.display_name!r} has no model binding")
-    return role_record
+    model = get_model(role_record.model)
+    if not backend_binding_ready(model):
+        raise RuntimeError(f"model binding {model.alias!r} is not runtime-ready")
+    return role_record, model
 
 
 def chat_completion(cfg, role, messages, *, max_tokens=1024, temperature=0.2):
-    role_record = _checked_role(role)
-    base = runtime_base_url(cfg)
-    return post_json(
-        base + "/v1/chat/completions",
-        _completion_payload(
-            role_record, messages, max_tokens=max_tokens,
-            temperature=temperature, stream=False,
-        ),
-        timeout=1200,
-    )
+    role_record, model = _checked_role(role)
+    backend = backend_for_model(model, cfg)
+    request = InferenceRequest(role_record.runtime_id, tuple(messages), max_tokens, temperature)
+    return backend.complete(request)
 
 
 def chat_completion_stream(cfg, role, messages, *, max_tokens=1024, temperature=0.2):
@@ -158,31 +109,15 @@ def chat_completion_stream(cfg, role, messages, *, max_tokens=1024, temperature=
     `reasoning` is populated only from backend-emitted reasoning_content (or the
     equivalent reasoning field).  T.A.R.S. never synthesizes Raw reasoning.
     """
-    role_record = _checked_role(role)
-    base = runtime_base_url(cfg)
-    payload = _completion_payload(
-        role_record, messages, max_tokens=max_tokens,
-        temperature=temperature, stream=True,
-    )
-    for chunk in stream_post_json(base + "/v1/chat/completions", payload, timeout=1200):
-        choices = chunk.get("choices") or []
-        delta = {}
-        finish = None
-        if choices:
-            choice = choices[0] or {}
-            delta = choice.get("delta") or {}
-            finish = choice.get("finish_reason")
-        reasoning = (
-            delta.get("reasoning_content")
-            or delta.get("reasoning")
-            or ""
-        )
-        content = delta.get("content") or ""
-        usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else None
+    role_record, model = _checked_role(role)
+    backend = backend_for_model(model, cfg)
+    request = InferenceRequest(role_record.runtime_id, tuple(messages), max_tokens, temperature)
+    for event in backend.stream(request):
         yield {
-            "content": str(content),
-            "reasoning": str(reasoning),
-            "finish_reason": finish,
-            "usage": usage,
-            "raw": chunk,
+            "content": event.content,
+            "reasoning": event.reasoning,
+            "tool_calls": list(event.tool_calls),
+            "finish_reason": event.finish_reason,
+            "usage": event.usage,
+            "raw": event.raw,
         }

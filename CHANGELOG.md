@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.3 - Runtime Backend Boundary
+
+- added a local RuntimeBackend contract for status, capabilities, lifecycle, inference, streaming and diagnostics
+- moved the working llama.cpp/llama-swap path behind the reference LlamaCppBackend
+- normalized backend-emitted content, reasoning, tool calls, finish state and usage
+- added an explicit unavailable ColibriBackend boundary for later Oracle integration
+- added backend inspection commands and legacy runtime-config migration
+- kept external inference providers outside the v1.0 runtime architecture
+
 ## 0.5.2 - Calibration Engine
 
 - added resumable `calibrate` commands with minimum, mid and maximum depth

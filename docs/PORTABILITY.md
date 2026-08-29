@@ -24,4 +24,4 @@ On the destination machine, model manifests are matched against already-installe
 
 Calibration always travels with the bundle. Compatible fingerprints can remain ready; incompatible results remain as history and become stale.
 
-Restore finishes with environment recognition: hardware, provider availability, tool dependencies, workspace paths and network mode are compared against the saved installation. The user is asked only about meaningful differences, then T.A.R.S. enters a Welcome Back flow.
+Restore finishes with environment recognition: hardware, runtime-backend availability, tool dependencies, workspace paths and network mode are compared against the saved installation. The user is asked only about meaningful differences, then T.A.R.S. enters a Welcome Back flow.

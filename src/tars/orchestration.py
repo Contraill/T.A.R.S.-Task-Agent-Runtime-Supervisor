@@ -6,6 +6,8 @@ import uuid
 from .checkpoints import verify_checkpoint
 from .events import append_event
 from .roles import default_role_id, get_role, list_roles, resolve_role_id
+from .runtime_backends import backend_binding_ready
+from .registry import get_model
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import canonical_task_state, checkpoint_task, create_task, load_task, update_task
 
@@ -75,6 +77,8 @@ def _routing_candidates(required_capabilities) -> list[dict]:
     for role in list_roles(include_disabled=False):
         if not role.model:
             continue
+        if not backend_binding_ready(get_model(role.model)):
+            continue
         available = frozenset(role.capabilities)
         missing = sorted(required - available)
         if missing:
@@ -97,7 +101,8 @@ def route_for_capabilities(required_capabilities=(), *, task_id: str | None = No
     configured default Role wins a semantic tie.  Role id is only a final stable
     ordering key, never a capability signal.
     """
-    ensure_state_store()
+    if persist or task_id is not None:
+        ensure_state_store()
     if task_id is not None:
         load_task(task_id)
     required = tuple(dict.fromkeys(str(x).strip() for x in required_capabilities if str(x).strip()))

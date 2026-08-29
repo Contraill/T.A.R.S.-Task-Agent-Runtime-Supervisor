@@ -150,7 +150,7 @@ def _mem_total() -> int:
 
 
 class LlamaBenchProbe:
-    """Objective llama.cpp calibration probe used by the local reference provider."""
+    """Objective llama.cpp calibration probe used by the local reference backend."""
 
     def fingerprint(self) -> dict:
         return hardware_fingerprint()

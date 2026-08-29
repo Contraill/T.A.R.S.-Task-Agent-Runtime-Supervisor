@@ -23,7 +23,7 @@ Setup offers four editable templates:
 | Operator | tool-first system/API work |
 | Oracle | deep review and second-opinion reasoning |
 
-Users may rename, edit, delete or add Roles. A Role may stay unbound/disabled until a model/provider is assigned.
+Users may rename, edit, delete or add Roles. A Role may stay unbound/disabled until a local model/backend is assigned.
 
 The wizard should say explicitly that more Roles are not inherently better. Create another Role when its model, execution style, permission boundary or behavior is meaningfully different.
 
@@ -31,4 +31,4 @@ The wizard should say explicitly that more Roles are not inherently better. Crea
 
 Setup does not present one hard-coded model list as "the correct models". It can discover/import/download models and show compatibility metadata. Reference-tested models may be documented separately, but they are not architecture.
 
-Local models can be calibrated. External API models skip hardware calibration and use provider capability checks.
+Local llama.cpp models require hardware calibration. Later Colibri integration defines its own local readiness checks.

@@ -4,7 +4,7 @@
 
 T.A.R.S. is a local-first agent runtime and control plane for Linux. The project is built around a simple idea: model context is temporary; tasks, memory, permissions and runtime state belong to the supervisor.
 
-The current codebase is a pre-1.0 development snapshot. It already runs on the reference installation, but the generic installer, model manager and real tool loop are still under construction. If you clone it today, treat it as development software rather than a finished end-user package.
+The current codebase is a pre-1.0 development snapshot. It already runs on the reference installation, but the generic installer and real tool loop are still under construction. If you clone it today, treat it as development software rather than a finished end-user package.
 
 ## Current state
 
@@ -27,8 +27,9 @@ Implemented in the current reference build:
 - integrity, compatibility and calibration-aware model readiness
 - content-addressed model artifacts and safe removal
 - resumable objective calibration with hardware-aware runtime profiles
+- local RuntimeBackend boundary with llama.cpp as the reference implementation
 
-External provider bindings are the remaining v0.5 capability gate.
+The v0.5 runtime, model lifecycle, calibration and backend substrate is implemented.
 
 ## Roles
 
@@ -55,21 +56,18 @@ First-time setup will ask for a default workspace. The proposed default is:
 
 The workspace is the default place for project work and the initial scope used by tool policy. It is not meant to be an artificial prison: work outside it can be allowed explicitly through ScopeGuard policy.
 
-## Models and providers
+## Models and runtime backends
 
-Local llama.cpp is the reference backend. T.A.R.S. is being designed so a Role can also bind to an external provider without changing the task or context architecture.
+Local llama.cpp through llama-swap is the reference backend. The runtime boundary also reserves Colibri for later optional Heavy/Oracle integration without coupling Role or task state to one inference implementation.
 
-The current v0.4.2 source still carries the reference machine's initial model-registry seed. That is development bootstrap state, not a model recommendation. v0.5.x replaces that assumption with the generic model/provider lifecycle.
+The initial model-registry seed is development bootstrap state, not a model recommendation.
 
-Planned provider classes include:
+Intended local backend families are:
 
 - local llama.cpp / llama-swap
 - Colibri for optional heavy local workloads
-- OpenAI API
-- OpenAI-compatible HTTP endpoints
-- provider-specific OAuth-backed services where appropriate
 
-External adapters that have not been exercised against a live service will be marked experimental/best-effort rather than presented as tested.
+LlamaCppBackend is reference-tested. ColibriBackend is an unavailable integration boundary in v0.5.3; it does not claim a working Heavy runtime. External cloud inference is outside the v1.0 product scope.
 
 ## Remote use
 

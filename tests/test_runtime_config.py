@@ -269,3 +269,12 @@ def test_idempotent_apply_validates_and_restores_stopped_service(monkeypatch, tm
 
     assert not result.changed
     assert actions == ["start", "healthy", "stop"]
+
+
+def test_colibri_roles_are_excluded_from_llama_swap(monkeypatch):
+    role = _role("oracle", "oracle", "heavy")
+    model = SimpleNamespace(alias="heavy", backend="colibri")
+    monkeypatch.setattr(runtime_config, "list_roles", lambda include_disabled=False: [role])
+    monkeypatch.setattr(runtime_config, "get_model", lambda alias: model)
+    plan = runtime_config.build_runtime_plan()
+    assert plan.models == ()

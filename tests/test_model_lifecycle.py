@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from tars import model_lifecycle as lifecycle
+from tars import registry as model_registry
 
 
 def _registry():
@@ -103,3 +104,14 @@ def test_remove_retains_shared_artifact(monkeypatch, tmp_path):
     monkeypatch.setattr(lifecycle, "calibration_path", lambda digest: tmp_path / "calibration.json")
     assert lifecycle.remove_model("one") is False
     assert artifact.exists()
+
+
+def test_legacy_registry_defaults_to_llama_cpp_backend(monkeypatch, tmp_path):
+    path = tmp_path / "models.toml"
+    path.write_text(
+        'version = 2\n[models."legacy"]\nname = "Legacy"\npath = "/tmp/m.gguf"\n'
+        'sha256 = "abc"\nquant = "Q4"\nnative_context = 4096\n'
+    )
+    monkeypatch.setattr(model_registry, "REGISTRY_PATH", path)
+    loaded = model_registry.load_registry()
+    assert loaded["models"]["legacy"]["backend"] == "llama.cpp"

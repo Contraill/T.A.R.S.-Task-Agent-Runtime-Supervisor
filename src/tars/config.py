@@ -32,7 +32,12 @@ MODEL_DOWNLOAD_ROOT = CACHE_ROOT / "downloads"
 
 def load_config():
     with CONFIG_PATH.open("rb") as handle:
-        return tomllib.load(handle)
+        data = tomllib.load(handle)
+    runtime = data.setdefault("runtime", {})
+    if "backend" not in runtime:
+        legacy = runtime.get("provider", "llama-swap")
+        runtime["backend"] = "llama.cpp" if legacy == "llama-swap" else legacy
+    return data
 
 
 def expand_path(value):

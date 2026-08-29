@@ -17,16 +17,16 @@ Memory           ScopeGuard
                     |
                 ToolRegistry
                     |
-             RuntimeProvider
+             RuntimeBackend
                     |
-          local or external model
+              local model
 ```
 
 ## Core rules
 
 **Task state is not model context.** Conversations, tasks, decisions, checkpoints and evidence are canonical state. A model receives a projection built for its own context window.
 
-**Roles are not models.** A Role owns purpose, capabilities, execution style and policy. A model/provider is bound to a Role and may be replaced.
+**Roles are not models.** A Role owns purpose, capabilities, execution style and policy. Its model and local RuntimeBackend binding may be replaced.
 
 **One task has one owner.** Delegation does not change ownership. Handoff does, and must be transactional.
 
@@ -36,4 +36,4 @@ Memory           ScopeGuard
 
 ## Current state
 
-v0.4.2 contains the state/context/streaming foundation. Tool execution and full orchestration are intentionally not faked before their policy layers exist.
+The v0.5 line contains runtime configuration, model lifecycle, objective calibration and the local RuntimeBackend boundary. Tool execution remains gated on the later ScopeGuard and ToolRegistry layers.

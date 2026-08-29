@@ -47,6 +47,8 @@ def test_router_uses_capabilities_not_role_names(monkeypatch):
     ]
     monkeypatch.setattr(orch, "list_roles", lambda include_disabled=False: roles)
     monkeypatch.setattr(orch, "default_role_id", lambda: "alpha")
+    monkeypatch.setattr(orch, "get_model", lambda alias: SimpleNamespace(alias=alias))
+    monkeypatch.setattr(orch, "backend_binding_ready", lambda model: True)
     decision = orch.route_for_capabilities(["conversation", "planning"], persist=False)
     assert decision.selected_role == "beta"
     assert decision.requested_capabilities == ("conversation", "planning")

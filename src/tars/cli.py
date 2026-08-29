@@ -29,6 +29,7 @@ from .config import (
     load_config,
 )
 from .registry import ensure_registry, get_model, role_for_alias
+from .runtime_backends import BACKEND_TYPES, backend_for_name
 from .model_lifecycle import import_model, pull_model, remove_model, search_huggingface, verify_model
 from .roles import (
     bind_model,
@@ -100,7 +101,7 @@ def command_status(cfg):
     console.print("Config: ", CONFIG_PATH)
     console.print("Models: ", REGISTRY_PATH)
     console.print("Roles:  ", ROLE_REGISTRY_PATH)
-    console.print("Runtime:", cfg["runtime"]["provider"])
+    console.print("Runtime backend:", cfg["runtime"]["backend"])
     console.print("Default role:", get_role(default_role_id()).display_name)
 
     task = active_task()
@@ -389,6 +390,28 @@ def command_model_remove(alias):
         return 1
     console.print(f"Removed {alias}; physical artifact {'deleted' if deleted else 'retained'}.")
     return 0
+
+
+def command_backend_list(cfg):
+    table = Table(title="Runtime Backends")
+    for column in ("Backend", "Availability", "Health", "Support", "Message"):
+        table.add_column(column)
+    for name in BACKEND_TYPES:
+        status = backend_for_name(name, cfg).status()
+        table.add_row(name, "available" if status.available else "unavailable",
+                      "healthy" if status.healthy else "not ready", status.support, status.message)
+    console.print(table)
+    return 0
+
+
+def command_backend_status(cfg, name):
+    try:
+        backend = backend_for_name(name, cfg)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data=backend.diagnostics())
+    return 0 if backend.status().healthy else 1
 
 
 def command_model_bindings():
@@ -1280,6 +1303,11 @@ def build_parser():
     model_verify.add_argument("alias")
     model_remove = model_sub.add_parser("remove")
     model_remove.add_argument("alias")
+    backend = sub.add_parser("backend", help="inspect local runtime backends")
+    backend_sub = backend.add_subparsers(dest="backend_command", required=True)
+    backend_sub.add_parser("list")
+    backend_status = backend_sub.add_parser("status")
+    backend_status.add_argument("backend", choices=sorted(BACKEND_TYPES))
 
     role = sub.add_parser("role")
     role_sub = role.add_subparsers(dest="role_command", required=True)
@@ -1499,6 +1527,10 @@ def main():
             return command_model_verify(args.alias)
         if args.model_command == "remove":
             return command_model_remove(args.alias)
+    if args.command == "backend":
+        if args.backend_command == "list":
+            return command_backend_list(cfg)
+        return command_backend_status(cfg, args.backend)
 
     if args.command == "role":
         if args.role_command == "list":

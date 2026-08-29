@@ -23,6 +23,7 @@ from .config import (
     runtime_base_url,
 )
 from .registry import get_model
+from .runtime_backends import backend_binding_ready
 from .roles import (
     get_role,
     list_roles,
@@ -37,6 +38,10 @@ UNLOAD_TIMEOUT = 10
 SEND_LOADING_STATE = False
 PERFORMANCE_MONITOR_DISABLED = True
 CONCURRENCY_LIMIT = 1
+
+
+def _is_llama_cpp_model(model) -> bool:
+    return getattr(model, "backend", "llama.cpp") == "llama.cpp"
 
 
 @dataclass(frozen=True)
@@ -154,11 +159,8 @@ def build_runtime_plan(*, require_files: bool = False) -> RuntimePlan:
             raise ValueError(f"duplicate enabled runtime id: {role.runtime_id}")
 
         model = get_model(role.model)
-        if model.backend != "llama.cpp":
-            raise ValueError(
-                f"role {role.id} uses backend {model.backend!r}; "
-                "v0.5.0 RuntimeConfigGenerator only renders llama.cpp models"
-            )
+        if not _is_llama_cpp_model(model):
+            continue
 
         calibration = load_calibration(model.alias)
         if calibration.get("status") != "ready":
@@ -497,11 +499,15 @@ def switch_role_runtime(
 
     if target_model:
         model = get_model(target_model)
-        calibration = load_calibration(model.alias)
-        if calibration.get("status") != "ready":
-            raise RuntimeError(f"calibration for {target_model} is not ready")
-        if target_profile not in (calibration.get("profiles") or {}):
-            raise KeyError(f"{target_model} has no calibration profile {target_profile!r}")
+        if _is_llama_cpp_model(model):
+            calibration = load_calibration(model.alias)
+            if calibration.get("status") != "ready":
+                raise RuntimeError(f"calibration for {target_model} is not ready")
+            if target_profile not in (calibration.get("profiles") or {}):
+                raise KeyError(f"{target_model} has no calibration profile {target_profile!r}")
+        else:
+            if not backend_binding_ready(model):
+                raise RuntimeError(f"runtime backend binding for {target_model} is not ready")
 
     before = load_role_registry()
     candidate = copy.deepcopy(before)

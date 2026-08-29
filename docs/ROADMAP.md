@@ -44,7 +44,7 @@ to them.
 
 Status: implemented.
 
-- `--min`, `--mid`, `--max`
+- default minimum depth, plus `--mid` and `--max`
 - hardware/runtime fingerprinting
 - cached/resumable objective tuning
 - compact/normal/extended profiles
@@ -53,17 +53,17 @@ Status: implemented.
 Stage results are keyed by the model artifact and a stable hardware/runtime
 fingerprint. Higher-depth results are not replaced by shallower runs.
 
-## v0.5.3 — external providers
+## v0.5.3 — runtime backend boundary
 
-- provider registry independent of Roles
-- OpenAI API adapter
-- OpenAI-compatible HTTP adapter
-- provider-specific OAuth support where applicable
-- capability/context discovery
-- secrets from protected environment/store, never plain portable config
-- unverified live adapters marked experimental/best-effort
+Status: implemented.
 
-Local models use hardware calibration. Remote APIs use provider capability/health checks instead of pretending local PP/TG/VRAM calibration applies to them.
+- local RuntimeBackend contract independent of Roles
+- reference LlamaCppBackend over llama-swap
+- status, capabilities, lifecycle, inference, streaming and diagnostics surfaces
+- backend-emitted reasoning and tool-call normalization
+- explicit unavailable ColibriBackend boundary for later Oracle integration
+
+External cloud inference providers are outside the v1.0 product scope.
 
 ## v0.6.x — identity, memory and context epochs
 
@@ -98,7 +98,7 @@ See [TEMPORARY.md](TEMPORARY.md) for the persistence contract.
 - one-shot, cron and condition/watch tasks
 - Core/client API
 - optional Tailscale Serve integration
-- Oracle/Colibri provider
+- Oracle/Colibri backend
 - `.tarsbundle` backup/restore/reset
 
 Normal portable bundles exclude model weights and include calibration history. Restore performs environment recognition, then Welcome Back.

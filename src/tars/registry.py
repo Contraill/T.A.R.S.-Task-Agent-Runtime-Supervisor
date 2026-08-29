@@ -105,6 +105,8 @@ def load_registry():
         data = tomllib.load(handle)
 
     data.setdefault("models", {})
+    for info in data["models"].values():
+        info.setdefault("backend", "llama.cpp")
     return data
 
 
