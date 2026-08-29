@@ -1,0 +1,183 @@
+# Python
+
+**pycache**/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build artifacts
+
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage / lint caches
+
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Editors / IDEs
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment / secrets
+
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+tokens/
+
+# T.A.R.S. model files
+
+*.gguf
+*.ggml
+*.safetensors
+*.bin
+models/
+
+# T.A.R.S. portable backups
+
+*.tarsbundle
+
+# T.A.R.S. runtime / user state
+
+tars-state.sqlite3
+tars-memory.sqlite3
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Conversations / tasks / checkpoints / runtime state
+
+state/
+runtime/
+sessions/
+conversations/
+tasks/
+checkpoints/
+events/
+
+# Personal memory / identity
+
+memory/
+user-memory/
+persona/
+identity/
+
+# Calibration generated data
+
+calibration/
+benchmarks/
+benchmark-results/
+fit-kv/
+*.args
+*.bench
+*.benchmark
+
+# Logs / traces
+
+logs/
+*.log
+*.trace
+*.jsonl
+
+# Temporary / cache files
+
+cache/
+.cache/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Runtime generated configuration
+
+generated/
+generated-config/
+runtime-config/
+
+# Local UI / machine-specific preferences
+
+ui.toml
+local.toml
+machine.toml
+
+# Backups created by installers / migrations
+
+backups/
+*.bak
+*.backup
+*.before-*
+*.old
+
+# Downloaded tools / binaries
+
+tools/
+vendor/
+bin/
+
+# Hugging Face / model caches
+
+.huggingface/
+huggingface/
+hf-cache/
+
+# Local workspaces
+
+TARS-Workspace/
+workspace/
+
+# Private development context
+
+TARS_PROJECT_CONTEXT.md
+TARS_PROJECT_CONTEXT.*
+*TARS_PROJECT_CONTEXT*
+
+# Local project notes / scratch
+
+notes-private/
+scratch/
+TODO.local.md
+
+# Installer-generated local artifacts
+
+install-*.log
+
+# Archive files
+
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z

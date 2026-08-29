@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+import uuid
+
+from .checkpoints import create_checkpoint, latest_checkpoint
+from .conversation import active_conversation
+from .events import append_event, read_events, EVENT_TYPES
+from .roles import resolve_role_id
+from .state_store import connect, ensure_state_store, get_meta, json_dumps, json_loads, now_utc, set_meta, transaction
+
+TASK_STATES = {"pending", "running", "paused", "completed", "failed", "cancelled"}
+TASK_KINDS = {"primary", "delegation", "sideband", "scheduled"}
+
+
+@dataclass
+class TaskRecord:
+    id: str
+    goal: str
+    owner_role: str
+    state: str
+    kind: str
+    phase: str
+    progress: float | None
+    parent_task_id: str | None
+    created_at: str
+    updated_at: str
+    checkpoint: dict
+    source: str
+    conversation_id: str | None = None
+    title: str = ""
+    epoch: int = 1
+    constraints: tuple[str, ...] = ()
+    decisions: tuple[str, ...] = ()
+    completed: tuple[str, ...] = ()
+    open_steps: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    schedule_kind: str | None = None
+    schedule_expr: str | None = None
+    next_run_at: str | None = None
+    last_run_at: str | None = None
+    last_result_status: str | None = None
+    schedule_enabled: bool = True
+
+
+def _new_task_id():
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"task-{stamp}-{uuid.uuid4().hex[:6]}"
+
+
+def _from_row(row) -> TaskRecord:
+    cp = latest_checkpoint(row["id"])
+    return TaskRecord(
+        id=row["id"], goal=row["goal"], owner_role=row["owner_role"],
+        state=row["state"], kind=row["kind"], phase=row["phase"],
+        progress=row["progress"], parent_task_id=row["parent_task_id"],
+        created_at=row["created_at"], updated_at=row["updated_at"],
+        checkpoint=cp.state if cp else {}, source=row["source"],
+        conversation_id=row["conversation_id"], title=row["title"], epoch=row["epoch"],
+        constraints=tuple(json_loads(row["constraints_json"], [])),
+        decisions=tuple(json_loads(row["decisions_json"], [])),
+        completed=tuple(json_loads(row["completed_json"], [])),
+        open_steps=tuple(json_loads(row["open_steps_json"], [])),
+        failures=tuple(json_loads(row["failures_json"], [])),
+        evidence_refs=tuple(json_loads(row["evidence_refs_json"], [])),
+        schedule_kind=row["schedule_kind"], schedule_expr=row["schedule_expr"],
+        next_run_at=row["next_run_at"], last_run_at=row["last_run_at"],
+        last_result_status=row["last_result_status"],
+        schedule_enabled=bool(row["schedule_enabled"]),
+    )
+
+
+def ensure_task_store():
+    # Compatibility name retained for v0.3 callers. The canonical store is SQLite.
+    return ensure_state_store()
+
+
+def create_task(
+    goal,
+    owner_role,
+    *,
+    kind="primary",
+    parent_task_id=None,
+    source="cli",
+    make_active=True,
+    conversation_id=None,
+    title="",
+    schedule_kind=None,
+    schedule_expr=None,
+    next_run_at=None,
+):
+    ensure_state_store()
+    role = resolve_role_id(owner_role)
+    if kind not in TASK_KINDS:
+        raise ValueError(f"invalid task kind: {kind}")
+    if parent_task_id is not None:
+        load_task(parent_task_id)
+    if conversation_id is None:
+        conv = active_conversation()
+        conversation_id = conv.id if conv else None
+    now = now_utc()
+    task_id = _new_task_id()
+    with transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks(
+                id,conversation_id,title,goal,owner_role,state,kind,phase,progress,
+                parent_task_id,source,epoch,constraints_json,decisions_json,
+                completed_json,open_steps_json,failures_json,evidence_refs_json,
+                schedule_kind,schedule_expr,next_run_at,last_run_at,last_result_status,
+                schedule_enabled,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                task_id, conversation_id, title, goal, role, "pending", kind, "created", None,
+                parent_task_id, source, 1, "[]", "[]", "[]", "[]", "[]", "[]",
+                schedule_kind, schedule_expr, next_run_at, None, None, 1, now, now,
+            ),
+        )
+        if make_active:
+            conn.execute(
+                "INSERT INTO meta(key,value) VALUES('active_task_id',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (task_id,),
+            )
+    append_event(task_id, "status", f"Task created with owner {role}", role=role,
+                 data={"state": "pending", "kind": kind})
+    return load_task(task_id)
+
+
+def load_task(task_id):
+    ensure_state_store()
+    conn = connect()
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise KeyError(f"unknown task: {task_id}")
+        return _from_row(row)
+    finally:
+        conn.close()
+
+
+def list_tasks(limit=50, *, scheduled_only=False, conversation_id=None):
+    ensure_state_store()
+    sql = "SELECT * FROM tasks WHERE 1=1"
+    params = []
+    if scheduled_only:
+        sql += " AND (kind='scheduled' OR schedule_kind IS NOT NULL)"
+    if conversation_id is not None:
+        sql += " AND conversation_id=?"
+        params.append(conversation_id)
+    sql += " ORDER BY updated_at DESC LIMIT ?"
+    params.append(int(limit))
+    conn = connect()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+        return [_from_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+
+def attach_conversation(task_id, conversation_id):
+    """Attach an existing task to a conversation without altering task ownership."""
+    load_task(task_id)
+    from .conversation import load_conversation
+    load_conversation(conversation_id)
+    with transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE tasks SET conversation_id=?, updated_at=? WHERE id=?",
+            (conversation_id, now_utc(), task_id),
+        )
+    return load_task(task_id)
+
+
+def update_task(
+    task_id,
+    *,
+    state=None,
+    phase=None,
+    progress=None,
+    checkpoint=None,
+    owner_role=None,
+    title=None,
+    constraints=None,
+    decisions=None,
+    completed=None,
+    open_steps=None,
+    failures=None,
+    evidence_refs=None,
+    schedule_kind=None,
+    schedule_expr=None,
+    next_run_at=None,
+    last_run_at=None,
+    last_result_status=None,
+    schedule_enabled=None,
+):
+    task = load_task(task_id)
+    values = {}
+    if state is not None:
+        if state not in TASK_STATES:
+            raise ValueError(f"invalid task state: {state}")
+        values["state"] = state
+    if phase is not None:
+        values["phase"] = phase
+    if progress is not None:
+        if not 0 <= progress <= 1:
+            raise ValueError("progress must be between 0 and 1")
+        values["progress"] = progress
+    if owner_role is not None:
+        values["owner_role"] = resolve_role_id(owner_role)
+    if title is not None:
+        values["title"] = title
+    for key, value in (
+        ("constraints_json", constraints), ("decisions_json", decisions),
+        ("completed_json", completed), ("open_steps_json", open_steps),
+        ("failures_json", failures), ("evidence_refs_json", evidence_refs),
+    ):
+        if value is not None:
+            values[key] = json_dumps(list(value))
+    for key, value in (
+        ("schedule_kind", schedule_kind), ("schedule_expr", schedule_expr),
+        ("next_run_at", next_run_at), ("last_run_at", last_run_at),
+        ("last_result_status", last_result_status),
+    ):
+        if value is not None:
+            values[key] = value
+    if schedule_enabled is not None:
+        values["schedule_enabled"] = 1 if schedule_enabled else 0
+
+    if values:
+        values["updated_at"] = now_utc()
+        assignments = ", ".join(f"{key}=?" for key in values)
+        with transaction(immediate=True) as conn:
+            conn.execute(
+                f"UPDATE tasks SET {assignments} WHERE id=?",
+                (*values.values(), task_id),
+            )
+
+    # Compatibility bridge: v0.3 callers that supplied checkpoint= now create an
+    # immutable snapshot rather than overwriting mutable JSON state.
+    if checkpoint is not None:
+        create_checkpoint(task_id, checkpoint, reason="task update")
+
+    task = load_task(task_id)
+    append_event(
+        task.id, "status", f"Task state updated: {task.state}", role=task.owner_role,
+        data={"state": task.state, "phase": task.phase, "progress": task.progress,
+              "epoch": task.epoch},
+    )
+    return task
+
+
+def canonical_task_state(task_id) -> dict:
+    task = load_task(task_id)
+    return {
+        "task_id": task.id,
+        "title": task.title,
+        "goal": task.goal,
+        "owner_role": task.owner_role,
+        "state": task.state,
+        "kind": task.kind,
+        "phase": task.phase,
+        "progress": task.progress,
+        "epoch": task.epoch,
+        "constraints": list(task.constraints),
+        "decisions": list(task.decisions),
+        "completed": list(task.completed),
+        "open_steps": list(task.open_steps),
+        "failures": list(task.failures),
+        "evidence_refs": list(task.evidence_refs),
+        "parent_task_id": task.parent_task_id,
+        "conversation_id": task.conversation_id,
+        "schedule": {
+            "kind": task.schedule_kind,
+            "expr": task.schedule_expr,
+            "next_run_at": task.next_run_at,
+            "last_run_at": task.last_run_at,
+            "last_result_status": task.last_result_status,
+            "enabled": task.schedule_enabled,
+        },
+    }
+
+
+def checkpoint_task(task_id, *, reason="manual checkpoint", advance_epoch=False):
+    task = load_task(task_id)
+    state = canonical_task_state(task_id)
+    return create_checkpoint(
+        task_id, state, reason=reason, evidence_refs=task.evidence_refs,
+        advance_epoch=advance_epoch,
+    )
+
+
+def set_active_task(task_id):
+    if task_id is not None:
+        load_task(task_id)
+    set_meta("active_task_id", task_id or "")
+
+
+def active_task():
+    task_id = get_meta("active_task_id")
+    if not task_id:
+        return None
+    try:
+        return load_task(task_id)
+    except KeyError:
+        return None
+
+
+def clear_active_task(task_id=None):
+    current = get_meta("active_task_id")
+    if task_id is None or current == task_id:
+        set_meta("active_task_id", "")
+
+
+__all__ = [
+    "TASK_STATES", "TASK_KINDS", "EVENT_TYPES", "TaskRecord", "ensure_task_store",
+    "create_task", "load_task", "list_tasks", "update_task", "append_event",
+    "read_events", "set_active_task", "active_task", "clear_active_task",
+    "canonical_task_state", "checkpoint_task", "attach_conversation",
+]

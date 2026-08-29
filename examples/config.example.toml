@@ -1,0 +1,23 @@
+# Development example. The final setup wizard will generate this.
+version = 1
+
+[paths]
+data = "~/.local/share/tars"
+state = "~/.local/state/tars"
+cache = "~/.cache/tars"
+workspace = "~/TARS-Workspace"
+
+[runtime]
+provider = "llama-swap"
+base_url = "http://127.0.0.1:8080"
+llama_swap_config = "~/.config/tars/llama-swap/config.yaml"
+
+[policy.zero_idle]
+enabled = true
+default_ttl_seconds = 30
+allow_dgpu_sleep = true
+
+[policy.reasoning]
+default_visibility = "hidden"
+persist_raw = false
+separate_tool_trace = true

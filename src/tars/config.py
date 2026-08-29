@@ -1,0 +1,35 @@
+from pathlib import Path
+import tomllib
+
+CONFIG_PATH = Path.home() / ".config/tars/config.toml"
+DATA_ROOT = Path.home() / ".local/share/tars"
+STATE_ROOT = Path.home() / ".local/state/tars"
+CACHE_ROOT = Path.home() / ".cache/tars"
+
+REGISTRY_PATH = DATA_ROOT / "model-registry.toml"
+ROLE_REGISTRY_PATH = DATA_ROOT / "role-registry.toml"
+CALIBRATION_ROOT = STATE_ROOT / "calibration"
+MODEL_CALIBRATION_ROOT = CALIBRATION_ROOT / "models"
+CHAT_STATE_ROOT = STATE_ROOT / "chat"
+STATE_DB_PATH = STATE_ROOT / "tars-state.sqlite3"
+EVIDENCE_ROOT = STATE_ROOT / "evidence"
+ARTIFACT_ROOT = STATE_ROOT / "artifacts"
+# Legacy v0.3 task store paths retained for one-way migration/rollback.
+TASK_ROOT = STATE_ROOT / "tasks"
+TASK_INDEX_PATH = TASK_ROOT / "index.json"
+TASK_EVENTS_ROOT = TASK_ROOT / "events"
+THEME_ROOT = Path.home() / ".config/tars/themes"
+UI_PREFS_PATH = Path.home() / ".config/tars/ui.toml"
+
+
+def load_config():
+    with CONFIG_PATH.open("rb") as handle:
+        return tomllib.load(handle)
+
+
+def expand_path(value):
+    return Path(value).expanduser().resolve()
+
+
+def runtime_base_url(cfg):
+    return cfg["runtime"]["base_url"].rstrip("/")

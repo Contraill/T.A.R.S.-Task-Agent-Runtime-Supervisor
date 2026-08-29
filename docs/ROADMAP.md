@@ -1,0 +1,121 @@
+# Roadmap to 1.0
+
+The public repository starts at v0.4.2. Version numbers below describe capability gates, not calendar promises.
+
+## v0.4.3 — orchestration core
+
+- single task owner
+- durable delegation request/result
+- checkpointed handoff
+- capability-based AUTO routing
+- structured orchestration events
+
+## v0.5.0 — runtime configuration
+
+- generated llama-swap config
+- atomic Role/model/profile switching
+- runtime health checks and rollback
+
+## v0.5.1 — model manager
+
+- pull/import/verify/remove
+- resumable downloads
+- source/license/hash metadata
+- no hard-coded model recommendation requirement
+
+## v0.5.2 — calibration engine
+
+- `--min`, `--mid`, `--max`
+- hardware/runtime fingerprinting
+- cached/resumable objective tuning
+- compact/normal/extended profiles
+- Zero-Idle validation
+
+## v0.5.3 — external providers
+
+- provider registry independent of Roles
+- OpenAI API adapter
+- OpenAI-compatible HTTP adapter
+- provider-specific OAuth support where applicable
+- capability/context discovery
+- secrets from protected environment/store, never plain portable config
+- unverified live adapters marked experimental/best-effort
+
+Local models use hardware calibration. Remote APIs use provider capability/health checks instead of pretending local PP/TG/VRAM calibration applies to them.
+
+## v0.6.x — identity, memory and context epochs
+
+- PromptCompiler and capability-aware system prompt
+- Persona/Identity primitives
+- MemoryManager and user/project memory
+- automatic context epochs, retrieval and compaction
+
+The mechanism lands here; the final First Awakening remains late in the release train.
+
+## v0.7.x — tools and real agent loop
+
+- ScopeGuard
+- ToolRegistry
+- starter native tools
+- verified agent loop
+- Skills and MCP
+
+## v0.8.x — future work, remote use and portability
+
+- one-shot, cron and condition/watch tasks
+- Core/client API
+- optional Tailscale Serve integration
+- Oracle/Colibri provider
+- `.tarsbundle` backup/restore/reset
+
+Normal portable bundles exclude model weights and include calibration history. Restore performs environment recognition, then Welcome Back.
+
+## v0.9.0 — installer/setup
+
+The setup wizard will:
+
+- detect hardware and runtime dependencies
+- choose/create the default workspace (`~/TARS-Workspace` proposed default)
+- offer the starter Role templates General, Builder, Operator and Oracle
+- let the user rename, edit, remove or add Roles before finishing
+- explain why duplicating near-identical Roles usually adds complexity rather than capability
+- bind installed/imported/downloaded models without presenting a fixed tested-model list as a requirement
+- choose calibration depth for local models
+- choose starter tools/skills and permission defaults
+- configure memory/privacy
+- optionally configure private remote access
+- run doctor and Zero-Idle acceptance
+
+At least one enabled, usable default Role is required before setup becomes READY.
+
+## v0.9.1 — final prompt and First Awakening
+
+Only after the installed capabilities are real and healthy:
+
+- build the final system prompt
+- learn the user from setup data and explicit conversation
+- ask only useful missing questions
+- persist confirmed preferences/memory
+
+A restored installation runs environment recognition and Welcome Back instead.
+
+## v0.9.2 — updater and recovery
+
+- periodic, configurable GitHub Release check
+- no silent update installation
+- `tars update check`
+- `tars update` staged download/install
+- release digest/checksum verification
+- schema/compat checks
+- `doctor` before promotion
+- automatic rollback on failed update
+
+The installed release is not maintained with an in-place `git pull`.
+
+## v0.9.5 — release candidate
+
+Clean-install, upgrade, restore, remote-client, scheduled-task, tool-loop, security and Zero-Idle acceptance tests.
+
+## v1.0.0
+
+Stable Linux-first release after all gates above pass.
