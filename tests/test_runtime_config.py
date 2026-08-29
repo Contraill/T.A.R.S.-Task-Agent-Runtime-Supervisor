@@ -248,4 +248,23 @@ def test_unassign_is_transactional(monkeypatch):
 
     assert result.model_alias == ""
     assert saved[-1]["roles"]["oracle"]["model"] == ""
-    assert saved[-1]["roles"]["oracle"]["enabled"] is False
+    assert saved[-1]["roles"]["oracle"]["enabled"] is True
+
+
+def test_idempotent_apply_validates_and_restores_stopped_service(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("models: {}\n", encoding="utf-8")
+    plan = SimpleNamespace(models=())
+    monkeypatch.setattr(runtime_config, "LLAMA_SWAP_CONFIG_PATH", config_path)
+    monkeypatch.setattr(runtime_config, "build_runtime_plan", lambda **kwargs: plan)
+    monkeypatch.setattr(runtime_config, "render_runtime_config", lambda plan=None: "models: {}\n")
+    monkeypatch.setattr(runtime_config, "_service_active", lambda: False)
+    actions = []
+    monkeypatch.setattr(runtime_config, "start_runtime_service", lambda: actions.append("start"))
+    monkeypatch.setattr(runtime_config, "stop_runtime_service", lambda: actions.append("stop"))
+    monkeypatch.setattr(runtime_config, "_wait_healthy", lambda *args, **kwargs: actions.append("healthy"))
+
+    result = runtime_config.apply_runtime_config(object())
+
+    assert not result.changed
+    assert actions == ["start", "healthy", "stop"]

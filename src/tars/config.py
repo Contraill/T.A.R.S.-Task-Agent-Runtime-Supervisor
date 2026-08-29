@@ -25,6 +25,8 @@ LLAMA_SWAP_CONFIG_PATH = Path.home() / ".config/tars/llama-swap/config.yaml"
 LLAMA_SERVER_PATH = Path.home() / ".local/src/llama.cpp/build-cuda/bin/llama-server"
 LLAMA_SWAP_SERVICE = "tars-llama-swap.service"
 RUNTIME_CONFIG_BACKUP_ROOT = STATE_ROOT / "runtime-config-backups"
+MODEL_ARTIFACT_ROOT = DATA_ROOT / "model-artifacts/sha256"
+MODEL_DOWNLOAD_ROOT = CACHE_ROOT / "downloads"
 
 
 def load_config():

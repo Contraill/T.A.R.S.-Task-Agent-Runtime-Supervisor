@@ -417,6 +417,12 @@ def apply_runtime_config(cfg) -> RuntimeApplyResult:
         if previous == candidate:
             if was_active:
                 _wait_healthy(cfg, expected_ids)
+            else:
+                try:
+                    start_runtime_service()
+                    _wait_healthy(cfg, expected_ids)
+                finally:
+                    stop_runtime_service()
             return RuntimeApplyResult(
                 changed=False,
                 path=LLAMA_SWAP_CONFIG_PATH,
@@ -502,9 +508,7 @@ def switch_role_runtime(
     info = candidate["roles"][role_id]
     info["model"] = target_model
     info["profile"] = target_profile
-    if unassign:
-        info["enabled"] = False
-    elif not info.get("enabled", True):
+    if not unassign and not info.get("enabled", True):
         raise ValueError(f"role {role_id} is disabled")
 
     save_role_registry(candidate)

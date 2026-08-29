@@ -11,3 +11,12 @@ def test_management_cli_parsing():
     assert parser.parse_args(["start"]).command == "start"
     assert parser.parse_args(["stop"]).command == "stop"
     assert parser.parse_args(["logs", "--lines", "20"]).lines == 20
+
+
+def test_model_lifecycle_cli_parsing():
+    parser = build_parser()
+    pull = parser.parse_args(["model", "pull", "org/repo", "--filename", "m.gguf", "--alias", "m"])
+    assert pull.source == "org/repo" and pull.alias == "m"
+    imported = parser.parse_args(["model", "import", "/tmp/m.gguf", "--alias", "m"])
+    assert imported.path == "/tmp/m.gguf"
+    assert parser.parse_args(["model", "verify", "m"]).alias == "m"

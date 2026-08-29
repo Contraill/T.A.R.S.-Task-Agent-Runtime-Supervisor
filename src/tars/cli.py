@@ -28,6 +28,7 @@ from .config import (
     load_config,
 )
 from .registry import ensure_registry, get_model, role_for_alias
+from .model_lifecycle import import_model, pull_model, remove_model, search_huggingface, verify_model
 from .roles import (
     bind_model,
     create_role,
@@ -313,6 +314,10 @@ def command_model_info(alias):
     console.print(f"sha256         : {model.sha256}")
     console.print(f"path           : {model.path}")
     console.print(f"file           : {'present' if model.path.exists() else 'missing'}")
+    console.print(f"source         : {model.source}")
+    console.print(f"license        : {model.license}")
+    console.print(f"integrity      : {'verified' if model.integrity_verified else 'pending'}")
+    console.print(f"compatibility  : {'compatible' if model.runtime_compatible else 'pending/unsupported'}")
 
     try:
         cal = load_calibration(alias)
@@ -327,6 +332,61 @@ def command_model_info(alias):
             f"KV={profile.get('cache_type_k')}/{profile.get('cache_type_v')} "
             f"t={profile.get('threads')}"
         )
+    return 0
+
+
+def command_model_search(query, limit):
+    try:
+        rows = search_huggingface(query, limit=limit)
+    except Exception as exc:
+        console.print(f"[red]Model search failed:[/red] {exc}")
+        return 1
+    table = Table(title="Hugging Face GGUF models")
+    for column in ("Repository", "Downloads", "Likes", "License"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(row["id"], str(row["downloads"]), str(row["likes"]), row["license"])
+    console.print(table)
+    return 0
+
+
+def command_model_acquire(action, args):
+    try:
+        if action == "import":
+            path = import_model(args.path, args.alias, expected_sha256=args.sha256,
+                                name=args.name, license_name=args.license,
+                                quant=args.quant, native_context=args.native_context)
+        else:
+            path = pull_model(args.source, args.alias, expected_sha256=args.sha256,
+                              license_name=args.license, revision=args.revision,
+                              filename=args.filename, quant=args.quant,
+                              native_context=args.native_context)
+    except Exception as exc:
+        console.print(f"[red]Model {action} failed:[/red] {exc}")
+        return 1
+    console.print(f"{args.alias}: {path}")
+    console.print("Readiness: integrity verified; runtime compatibility checked; calibration pending")
+    return 0
+
+
+def command_model_verify(alias):
+    try:
+        result = verify_model(alias)
+    except Exception as exc:
+        console.print(f"[red]Model verification failed:[/red] {exc}")
+        return 1
+    state = "runtime ready" if result.runtime_ready else "calibration pending"
+    console.print(f"{alias}: sha256={result.sha256} · compatible={result.runtime_compatible} · {state}")
+    return 0 if result.runtime_compatible else 1
+
+
+def command_model_remove(alias):
+    try:
+        deleted = remove_model(alias)
+    except Exception as exc:
+        console.print(f"[red]Model removal failed:[/red] {exc}")
+        return 1
+    console.print(f"Removed {alias}; physical artifact {'deleted' if deleted else 'retained'}.")
     return 0
 
 
@@ -654,7 +714,7 @@ def command_service(action, *, lines=100, follow=False):
     except Exception as exc:
         console.print(f"[red]Runtime service {action} failed:[/red] {exc}")
         return 1
-    console.print(f"Runtime service {action}ed.")
+    console.print("Runtime service " + ("started." if action == "start" else "stopped."))
     return 0
 
 
@@ -1176,6 +1236,27 @@ def build_parser():
         p.add_argument("alias")
     model_unassign = model_sub.add_parser("unassign")
     model_unassign.add_argument("role")
+    model_search = model_sub.add_parser("search")
+    model_search.add_argument("query")
+    model_search.add_argument("--limit", type=int, default=10)
+    model_pull = model_sub.add_parser("pull")
+    model_pull.add_argument("source")
+    model_pull.add_argument("--alias", required=True)
+    model_pull.add_argument("--filename")
+    model_pull.add_argument("--revision", default="main")
+    model_import = model_sub.add_parser("import")
+    model_import.add_argument("path")
+    model_import.add_argument("--alias", required=True)
+    for p in (model_pull, model_import):
+        p.add_argument("--sha256")
+        p.add_argument("--license", default="unknown")
+        p.add_argument("--quant", default="unknown")
+        p.add_argument("--native-context", type=int, default=0)
+    model_import.add_argument("--name")
+    model_verify = model_sub.add_parser("verify")
+    model_verify.add_argument("alias")
+    model_remove = model_sub.add_parser("remove")
+    model_remove.add_argument("alias")
 
     role = sub.add_parser("role")
     role_sub = role.add_subparsers(dest="role_command", required=True)
@@ -1380,6 +1461,14 @@ def main():
             return command_model_binding(cfg, args.model_command, args.role, args.alias)
         if args.model_command == "unassign":
             return command_model_binding(cfg, "unassign", args.role)
+        if args.model_command == "search":
+            return command_model_search(args.query, args.limit)
+        if args.model_command in {"pull", "import"}:
+            return command_model_acquire(args.model_command, args)
+        if args.model_command == "verify":
+            return command_model_verify(args.alias)
+        if args.model_command == "remove":
+            return command_model_remove(args.alias)
 
     if args.command == "role":
         if args.role_command == "list":

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tars-runtime-supervisor"
-version = "0.5.0"
+version = "0.5.1"
 description = "Local-first agent runtime and control plane for Linux"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,6 +40,9 @@ tars = "tars.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+tars = ["compatibility_manifest.json"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

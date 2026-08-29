@@ -16,6 +16,8 @@ Exit gates: delegation preserves parent ownership; handoff cannot switch ownersh
 
 ## v0.5.0 — runtime configuration
 
+Status: implemented.
+
 - generated llama-swap config from Role + Model + Calibration state
 - read-only runtime plan/render/status surfaces
 - transactional Role/model/profile switching
@@ -26,10 +28,17 @@ Exit gates: generated normal profiles match the calibrated reference runtime; ap
 
 ## v0.5.1 — model manager
 
+Status: implemented.
+
 - pull/import/verify/remove
 - resumable downloads
 - source/license/hash metadata
 - no hard-coded model recommendation requirement
+
+Local llama.cpp models become runtime-ready only after integrity verification,
+compatibility validation and calibration for the current artifact. Physical
+artifacts are addressed by SHA-256 and retained while any registry entry refers
+to them.
 
 ## v0.5.2 — calibration engine
 

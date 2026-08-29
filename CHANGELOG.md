@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1 - Model Lifecycle
+
+- added Hugging Face GGUF search and resumable download support
+- added local GGUF import with disk-space and SHA-256 preflight checks
+- added content-addressed artifact storage with deduplication
+- added integrity, llama.cpp compatibility and calibration-aware readiness checks
+- recorded source, revision, license and artifact metadata in the Model Registry
+- added safe removal with assigned-Role and shared-artifact protection
+- added a versioned backend compatibility manifest
+
 ## 0.5.0 - Runtime Configuration
 
 - added RuntimeConfigGenerator from Role, Model Registry and Calibration state

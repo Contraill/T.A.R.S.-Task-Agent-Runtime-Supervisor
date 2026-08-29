@@ -28,7 +28,7 @@ def default_registry():
             "kat-coder-v2.5-dev": {
                 "name": "KAT-Coder V2.5-Dev 35B-A3B",
                 "path": str(models_root / "coder/kat-coder-v2.5-dev/KAT-Coder-V2.5-Dev.i1-Q4_K_M.gguf"),
-                "sha256": "36b86b60f2eb38e69c1ceaa713eb14a5462717b5e67b070cb9b7c8b087c730",
+                "sha256": "36b86b60f2eb38e69c1ceaeaa713eb14a5462717b5e67b070cb9b7c8b087c730",
                 "backend": "llama.cpp",
                 "quant": "Q4_K_M",
                 "native_context": 262144,
@@ -60,6 +60,15 @@ def serialize_registry(data):
             f"quant = {_quote(model.get('quant', 'unknown'))}",
             f"native_context = {int(model.get('native_context', 0))}",
         ])
+        for key in ("source", "source_revision", "license", "artifact_sha256"):
+            if key in model:
+                lines.append(f"{key} = {_quote(model[key])}")
+        for key in ("size",):
+            if key in model:
+                lines.append(f"{key} = {int(model[key])}")
+        for key in ("integrity_verified", "runtime_compatible"):
+            if key in model:
+                lines.append(f"{key} = {'true' if model[key] else 'false'}")
 
     return "\n".join(lines) + "\n"
 

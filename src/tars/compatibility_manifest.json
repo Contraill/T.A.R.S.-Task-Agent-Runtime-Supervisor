@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "tested": {
+    "llama.cpp": {
+      "artifact_formats": ["GGUF v2", "GGUF v3"],
+      "readiness_requires": ["integrity", "runtime_compatibility", "calibration"],
+      "support": "supported",
+      "architecture_policy": "format-compatible; no required model architecture"
+    }
+  }
+}

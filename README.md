@@ -23,8 +23,11 @@ Implemented in the current reference build:
 - transactional Role assignment, unassignment, model swap and profile changes
 - user-service start, stop and log controls
 - capability-based delegation, handoff and AUTO routing
+- resumable Hugging Face downloads and local GGUF import
+- integrity, compatibility and calibration-aware model readiness
+- content-addressed model artifacts and safe removal
 
-Local model download, import, verification and removal are the next lifecycle surface.
+Calibration automation is the next local-model lifecycle gate.
 
 ## Roles
 

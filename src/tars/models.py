@@ -11,6 +11,12 @@ class ModelRecord:
     backend: str
     quant: str
     native_context: int
+    source: str = "seed"
+    source_revision: str = ""
+    license: str = "unknown"
+    size: int = 0
+    integrity_verified: bool = False
+    runtime_compatible: bool = False
 
     @classmethod
     def from_dict(cls, alias, data):
@@ -22,6 +28,12 @@ class ModelRecord:
             backend=data.get("backend", "llama.cpp"),
             quant=data.get("quant", "unknown"),
             native_context=int(data.get("native_context", 0)),
+            source=data.get("source", "seed"),
+            source_revision=data.get("source_revision", ""),
+            license=data.get("license", "unknown"),
+            size=int(data.get("size", 0)),
+            integrity_verified=bool(data.get("integrity_verified", False)),
+            runtime_compatible=bool(data.get("runtime_compatible", False)),
         )
 
 
