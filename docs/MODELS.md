@@ -17,6 +17,8 @@ Downloads resume from a partial cache file when the source supports HTTP range r
 
 Readiness progresses through acquisition, integrity verification, runtime compatibility and calibration. A local llama.cpp model is not eligible for generated runtime configuration until calibration for its exact SHA-256 artifact is ready.
 
+Run `tars calibrate <alias>` for the minimum objective pass, or add `--mid` or `--max` for broader context, CPU, placement and pressure searches. `--fresh` ignores compatible stage cache entries without allowing a shallower result to replace a deeper one.
+
 Removal is refused while any Role is assigned to the alias. Removing an alias does not delete a physical artifact that another registry entry still references.
 
 The compatibility manifest is versioned in the implementation. It describes supported backends and readiness requirements; it is not a model recommendation list.

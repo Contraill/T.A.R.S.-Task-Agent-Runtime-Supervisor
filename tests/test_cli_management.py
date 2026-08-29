@@ -20,3 +20,13 @@ def test_model_lifecycle_cli_parsing():
     imported = parser.parse_args(["model", "import", "/tmp/m.gguf", "--alias", "m"])
     assert imported.path == "/tmp/m.gguf"
     assert parser.parse_args(["model", "verify", "m"]).alias == "m"
+
+
+def test_calibration_cli_parsing():
+    parser = build_parser()
+    default = parser.parse_args(["calibrate"])
+    assert default.models == [] and not default.mid and not default.max
+    mid = parser.parse_args(["calibrate", "one", "two", "--mid"])
+    assert mid.models == ["one", "two"] and mid.mid
+    maximum = parser.parse_args(["calibrate", "one", "--max", "--fresh"])
+    assert maximum.max and maximum.fresh

@@ -26,8 +26,9 @@ Implemented in the current reference build:
 - resumable Hugging Face downloads and local GGUF import
 - integrity, compatibility and calibration-aware model readiness
 - content-addressed model artifacts and safe removal
+- resumable objective calibration with hardware-aware runtime profiles
 
-Calibration automation is the next local-model lifecycle gate.
+External provider bindings are the remaining v0.5 capability gate.
 
 ## Roles
 

@@ -12,6 +12,7 @@ from .calibration import (
     list_calibrations,
     load_calibration,
 )
+from .calibration_engine import CalibrationEngine
 from .chat import run_chat
 from .config import (
     CACHE_ROOT,
@@ -563,6 +564,28 @@ def command_calibration_list():
         )
     console.print(table)
     return 0
+
+
+def command_calibrate(args):
+    aliases = args.models or list(ensure_registry()["models"])
+    depth = "max" if args.max else "mid" if args.mid else "min"
+    failures = 0
+    engine = CalibrationEngine()
+    for alias in aliases:
+        try:
+            result = engine.calibrate(alias, depth=depth, fresh=args.fresh)
+        except Exception as exc:
+            console.print(f"[red]{alias}: calibration failed:[/red] {exc}")
+            failures += 1
+            continue
+        if result.get("protected_from_shallower"):
+            state = f"retained {result.get('depth')} result"
+        elif result.get("resumed"):
+            state = f"already ready ({result.get('depth')})"
+        else:
+            state = f"ready ({result.get('depth')})"
+        console.print(f"{alias}: {state} · max_ctx={result.get('reasonable_max_context', '-')}")
+    return 1 if failures else 0
 
 
 
@@ -1302,6 +1325,13 @@ def build_parser():
     calibration_sub = calibration.add_subparsers(dest="calibration_command", required=True)
     calibration_sub.add_parser("list")
 
+    calibrate = sub.add_parser("calibrate", help="run objective local-model calibration")
+    calibrate.add_argument("models", nargs="*")
+    depth = calibrate.add_mutually_exclusive_group()
+    depth.add_argument("--mid", action="store_true")
+    depth.add_argument("--max", action="store_true")
+    calibrate.add_argument("--fresh", action="store_true", help="ignore compatible stage cache")
+
     runtime = sub.add_parser("runtime", help="generated local runtime configuration")
     runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
     runtime_sub.add_parser("plan", help="show Role/Model/Calibration runtime plan")
@@ -1505,6 +1535,8 @@ def main():
     if args.command == "calibration":
         if args.calibration_command == "list":
             return command_calibration_list()
+    if args.command == "calibrate":
+        return command_calibrate(args)
 
     if args.command == "runtime":
         if args.runtime_command == "plan":

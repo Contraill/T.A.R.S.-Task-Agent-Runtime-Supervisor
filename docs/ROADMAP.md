@@ -42,11 +42,16 @@ to them.
 
 ## v0.5.2 — calibration engine
 
+Status: implemented.
+
 - `--min`, `--mid`, `--max`
 - hardware/runtime fingerprinting
 - cached/resumable objective tuning
 - compact/normal/extended profiles
 - Zero-Idle validation
+
+Stage results are keyed by the model artifact and a stable hardware/runtime
+fingerprint. Higher-depth results are not replaced by shallower runs.
 
 ## v0.5.3 — external providers
 

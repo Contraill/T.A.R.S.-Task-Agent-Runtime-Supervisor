@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.2 - Calibration Engine
+
+- added resumable `calibrate` commands with minimum, mid and maximum depth
+- added stable hardware/runtime fingerprints and stale stage-cache detection
+- added adaptive FIT, context/KV, CPU and placement searches using objective llama.cpp benchmarks
+- recorded prompt-processing, token-generation, RAM and VRAM measurements
+- generated compact, normal, extended and reasonable-maximum runtime profiles
+- protected higher-depth results from shallower replacement
+- required a finite Zero-Idle check before calibration promotion
+
 ## 0.5.1 - Model Lifecycle
 
 - added Hugging Face GGUF search and resumable download support
