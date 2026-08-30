@@ -34,8 +34,9 @@ Implemented in the current reference build:
 - conspicuous Temporary sessions that leave no new durable T.A.R.S. state
 - optional inspectable memory maintenance and provenance-backed reflection staging
 - deterministic execution policy, scoped approvals and redacted action audit records
+- guarded host execution, rootless container isolation and an experimental bounded SSH backend
 
-The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0 trusted-execution policy core are implemented.
+The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0–v0.7.1 trusted policy and execution boundaries are implemented.
 
 ## Roles
 

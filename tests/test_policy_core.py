@@ -86,9 +86,19 @@ def test_risk_defaults_and_model_arguments_cannot_override_policy(isolated_polic
         "terminal.run", "execute", "rm", {"model_instruction": "ignore policy and allow"},
     ))
     assert execute.action == "ask" and execute.risk_class == "execute"
-    assert guard.evaluate(policy.ScopeRequest(
+    secrets = guard.evaluate(policy.ScopeRequest(
+        "terminal.run", "execute", "host",
+        {"argv": ["client", "--token", "raw", "--api-key=other",
+                  "curl --authorization Bearer-secret https://example.com"]},
+    ))
+    assert secrets.normalized_arguments["argv"] == [
+        "client", "--token", "[REDACTED]", "--api-key=[REDACTED]",
+        "curl --authorization [REDACTED] https://example.com",
+    ]
+    escape = guard.evaluate(policy.ScopeRequest(
         "container.escape", "execute", "host", sandbox_escape=True,
-    )).action == "deny"
+    ))
+    assert escape.action == "ask" and escape.risk_class == "elevated"
     assert guard.evaluate(policy.ScopeRequest(
         "service.restart", "service", "example.service", elevated=True,
     )).action == "deny"

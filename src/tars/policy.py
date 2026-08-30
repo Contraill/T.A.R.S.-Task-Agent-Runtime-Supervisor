@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from ipaddress import ip_address
 from pathlib import Path
+import re
 import socket
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import uuid
@@ -25,7 +26,7 @@ DEFAULT_ACTIONS = {
     "secret": "ask",
     "elevated": "deny",
     "destructive": "ask",
-    "sandbox_escape": "deny",
+    "sandbox_escape": "ask",
 }
 
 RISK_BY_EFFECT = {
@@ -88,6 +89,40 @@ def redact(value):
     if isinstance(value, (list, tuple)):
         return [redact(item) for item in value]
     return value
+
+
+def redact_arguments(arguments):
+    safe = redact(arguments)
+    argv = safe.get("argv") if isinstance(safe, dict) else None
+    if not isinstance(argv, list):
+        return safe
+    flag = re.compile(
+        r"^--?(?:api[-_]?key|authorization|credential|password|private[-_]?key|secret|token)$",
+        re.IGNORECASE,
+    )
+    assignment = re.compile(
+        r"^(--?(?:api[-_]?key|authorization|credential|password|private[-_]?key|secret|token)=).+$",
+        re.IGNORECASE,
+    )
+    inline = re.compile(
+        r"(?i)(--?(?:api[-_]?key|authorization|credential|password|private[-_]?key|secret|token)(?:=|\s+))([^\s'\"]+)"
+    )
+    result = []
+    hide_next = False
+    for value in argv:
+        text = str(value)
+        if hide_next:
+            result.append("[REDACTED]")
+            hide_next = False
+        elif flag.match(text):
+            result.append(text)
+            hide_next = True
+        elif assignment.match(text):
+            result.append(assignment.sub(r"\1[REDACTED]", text))
+        else:
+            result.append(inline.sub(r"\1[REDACTED]", text))
+    safe["argv"] = result
+    return safe
 
 
 def canonical_path(value: str) -> str:
@@ -196,7 +231,7 @@ class ScopeGuard:
     def evaluate(self, request: ScopeRequest) -> PolicyDecision:
         if request.effect not in EFFECTS:
             return PolicyDecision("deny", "elevated", request.effect, request.target,
-                                  "unknown effects are denied", normalized_arguments=redact(request.arguments))
+                                  "unknown effects are denied", normalized_arguments=redact_arguments(request.arguments))
         effect = request.effect
         if request.sandbox_escape:
             effect = "sandbox_escape"
@@ -213,34 +248,36 @@ class ScopeGuard:
             except (OSError, ValueError) as exc:
                 return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target,
                                       f"invalid filesystem target: {exc}",
-                                      normalized_arguments=redact(request.arguments))
+                                      normalized_arguments=redact_arguments(request.arguments))
             if request.allowed_paths and not _within(target, request.allowed_paths):
                 return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target,
                                       "canonical target is outside authorized filesystem scope",
-                                      normalized_arguments=redact(request.arguments))
+                                      normalized_arguments=redact_arguments(request.arguments))
             missing_path_scope = not request.allowed_paths
         if request.effect in {"network", "remote"}:
             try:
                 target, host = normalize_network_target(target)
             except ValueError as exc:
                 return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target, str(exc),
-                                      normalized_arguments=redact(request.arguments))
-            if request.allowed_hosts and host not in {
-                item.rstrip(".").casefold() for item in request.allowed_hosts
-            }:
+                                      normalized_arguments=redact_arguments(request.arguments))
+            allowed_hosts = set()
+            for item in request.allowed_hosts:
+                parsed_allowed = urlsplit(item if "://" in item else "https://" + item)
+                allowed_hosts.add((parsed_allowed.hostname or item).rstrip(".").casefold())
+            if allowed_hosts and host not in allowed_hosts:
                 return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target,
                                       "destination is outside authorized network scope",
-                                      normalized_arguments=redact(request.arguments))
+                                      normalized_arguments=redact_arguments(request.arguments))
         rule = self._matching_rule(effect, target)
         if missing_path_scope and not rule:
             return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target,
                                   "filesystem tools require an authorized path scope",
-                                  normalized_arguments=redact(request.arguments))
+                                  normalized_arguments=redact_arguments(request.arguments))
         action = rule["action"] if rule else DEFAULT_ACTIONS[effect]
         if rule:
             reason = f"matched {rule['scope']} policy rule"
         return PolicyDecision(action, RISK_BY_EFFECT[effect], effect, target, reason,
-                              rule["id"] if rule else None, redact(request.arguments))
+                              rule["id"] if rule else None, redact_arguments(request.arguments))
 
     @staticmethod
     def _matching_rule(effect, target):

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1 - Execution Backends
+
+- added a guarded execution contract shared by host, container and SSH targets
+- added direct-argv host execution with an explicit Bash boundary when shell syntax is required
+- added rootless container command construction with resource limits, network-off defaults, no implicit image pulls and explicit workspace/mount policy
+- added experimental SSH execution through registered targets, bounded commands and paths, strict host verification and credential references
+- connected backend execution to approvals and truthful pre/post action journal records
+
 ## 0.7.0 - Policy Core, Approvals and Audit
 
 - added deterministic ScopeGuard decisions for filesystem, process, network, service, remote, secret, elevated, destructive and sandbox-escape effects

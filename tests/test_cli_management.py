@@ -81,3 +81,5 @@ def test_policy_approval_and_audit_cli_parsing():
     assert approval.approve == "approval-one"
     audit = parser.parse_args(["audit", "--state", "denied"])
     assert audit.state == "denied"
+    backend = parser.parse_args(["execution-backend", "container"])
+    assert backend.backend == "container"

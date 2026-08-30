@@ -108,6 +108,7 @@ from .temporary import run_temporary
 from .policy import ScopeGuard, ScopeRequest, add_rule as add_policy_rule, list_rules as list_policy_rules
 from .approvals import ApprovalBroker
 from .action_journal import list_actions as list_audit_actions, load_action
+from .execution_backends import ContainerBackend, HostBackend, SSHBackend
 
 console = Console()
 
@@ -1415,6 +1416,22 @@ def command_audit(args):
     return 0
 
 
+def command_execution_backend(args):
+    backends = {
+        "host": HostBackend(), "container": ContainerBackend(), "ssh": SSHBackend(),
+    }
+    names = [args.backend] if args.backend else list(backends)
+    rows = []
+    for name in names:
+        status = backends[name].status()
+        rows.append({
+            "backend": status.backend, "available": status.available,
+            "support": status.support, "message": status.message,
+        })
+    console.print_json(data=rows)
+    return 0 if all(row["available"] for row in rows) or not args.backend else 1
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="tars")
     parser.add_argument("--version", action="version", version=__version__)
@@ -1471,6 +1488,11 @@ def build_parser():
     audit.add_argument("--task")
     audit.add_argument("--state", choices=["proposed", "running", "succeeded", "failed", "denied", "cancelled", "unknown"])
     audit.add_argument("--limit", type=int, default=50)
+
+    execution_backend = sub.add_parser(
+        "execution-backend", help="inspect host, container and SSH execution backends",
+    )
+    execution_backend.add_argument("backend", nargs="?", choices=["host", "container", "ssh"])
 
     model = sub.add_parser("model")
     model_sub = model.add_subparsers(dest="model_command", required=True)
@@ -1767,6 +1789,8 @@ def main():
         except KeyError as exc:
             console.print(f"[red]{exc}[/red]")
             return 2
+    if args.command == "execution-backend":
+        return command_execution_backend(args)
     if args.command in {"start", "stop"}:
         return command_service(args.command)
     if args.command == "logs":

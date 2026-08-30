@@ -141,7 +141,18 @@ Status: implemented.
 
 See [POLICY.md](POLICY.md) for the policy and audit contracts.
 
-- v0.7.1: host, container and SSH execution backends
+### v0.7.1 — execution backends
+
+Status: implemented.
+
+- reference-tested guarded host execution
+- tested rootless Podman/Docker command boundary with bounded resources, mounts and network
+- ephemeral workspaces by default and separately authorized writable host workspaces
+- experimental, mock-tested SSH execution through registered bounded targets
+- backend results attached to the v0.7.0 action journal
+
+See [EXECUTION.md](EXECUTION.md) for backend support and isolation behavior.
+
 - v0.7.2: typed native tools, web research, evidence and isolated browser automation
 - v0.7.3: verified agent loop and live steering
 - v0.7.4: workspace checkpoints and rollback
