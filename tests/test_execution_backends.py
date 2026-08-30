@@ -1,4 +1,5 @@
 from pathlib import Path
+import socket
 import subprocess
 
 import pytest
@@ -31,6 +32,9 @@ def isolated_execution(monkeypatch, tmp_path):
     monkeypatch.setattr(state_store, "TASK_ROOT", tmp_path / "legacy")
     monkeypatch.setattr(state_store, "TASK_EVENTS_ROOT", tmp_path / "legacy-events")
     monkeypatch.setattr(state_store, "TASK_INDEX_PATH", tmp_path / "legacy-index")
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+    ])
     return tmp_path
 
 
@@ -147,7 +151,7 @@ def test_container_mount_outside_workspace_requires_separate_escape_approval(iso
     )
     decision = guard.evaluate(scope_request)
     broker = approvals.ApprovalBroker()
-    pending = broker.request(scope_request, decision)
+    pending = broker.request(scope_request, decision, scope="target")
     broker.decide(pending.id, approve=True)
     result = execution.GuardedExecutor(
         {"container": backend}, guard=guard, broker=broker,
@@ -309,6 +313,7 @@ def test_ssh_backend_uses_registered_target_and_secret_reference(monkeypatch, is
     broker = approvals.ApprovalBroker()
     pending = broker.request(
         policy.ScopeRequest("terminal.run", "remote", "https://example.com"), decision,
+        scope="target",
     )
     broker.decide(pending.id, approve=True)
     result = execution.GuardedExecutor({"ssh": backend}, broker=broker).execute(

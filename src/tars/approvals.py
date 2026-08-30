@@ -157,6 +157,8 @@ class ApprovalBroker:
             return False
         if approval.expires_at and approval.expires_at <= now_utc():
             return False
+        if approval.scope == "call" and approval.request.get("arguments") != decision.normalized_arguments:
+            return False
         if approval.scope == "task":
             return approval.task_id == request.task_id
         if approval.scope == "session":

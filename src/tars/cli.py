@@ -109,6 +109,8 @@ from .policy import ScopeGuard, ScopeRequest, add_rule as add_policy_rule, list_
 from .approvals import ApprovalBroker
 from .action_journal import list_actions as list_audit_actions, load_action
 from .execution_backends import ContainerBackend, HostBackend, SSHBackend
+from .tool_registry import ToolRegistry
+from .evidence import list_records as list_evidence_records
 
 console = Console()
 
@@ -1432,6 +1434,26 @@ def command_execution_backend(args):
     return 0 if all(row["available"] for row in rows) or not args.backend else 1
 
 
+def command_tool_list():
+    console.print_json(data=[{
+        "name": item.name, "capability": item.capability, "effect": item.effect,
+        "native": item.native, "available": item.available, "support": item.support,
+    } for item in ToolRegistry().list()])
+    return 0
+
+
+def command_evidence(args):
+    console.print_json(data=[{
+        "id": item.id, "task_id": item.task_id, "event_uuid": item.event_uuid,
+        "type": item.evidence_type, "source": item.source,
+        "sha256": item.content_sha256, "result_ref": item.result_ref,
+        "metadata": item.metadata, "created_at": item.created_at,
+    } for item in list_evidence_records(
+        task_id=args.task, evidence_type=args.type, limit=args.limit,
+    )])
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="tars")
     parser.add_argument("--version", action="version", version=__version__)
@@ -1493,6 +1515,12 @@ def build_parser():
         "execution-backend", help="inspect host, container and SSH execution backends",
     )
     execution_backend.add_argument("backend", nargs="?", choices=["host", "container", "ssh"])
+    tool = sub.add_parser("tool", help="inspect native semantic tools")
+    tool.add_subparsers(dest="tool_command", required=True).add_parser("list")
+    evidence = sub.add_parser("evidence", help="inspect task evidence records")
+    evidence.add_argument("--task")
+    evidence.add_argument("--type")
+    evidence.add_argument("--limit", type=int, default=50)
 
     model = sub.add_parser("model")
     model_sub = model.add_subparsers(dest="model_command", required=True)
@@ -1791,6 +1819,10 @@ def main():
             return 2
     if args.command == "execution-backend":
         return command_execution_backend(args)
+    if args.command == "tool":
+        return command_tool_list()
+    if args.command == "evidence":
+        return command_evidence(args)
     if args.command in {"start", "stop"}:
         return command_service(args.command)
     if args.command == "logs":

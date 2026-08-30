@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.2 - Native Tool Foundation
+
+- added typed filesystem, terminal/process, Git, user-service, Pacman and structured system tools
+- added bounded HTTP requests with DNS/private-network validation, redirect policy, response limits and conditional caching
+- added optional Tavily search, extract and crawl capabilities using an environment secret reference
+- added isolated Playwright browser profiles, downloads, stable element references and destination enforcement
+- added task-linked EvidenceRecords for filesystem, execution, Git, HTTP, browser, service and system observations
+- added bounded archive, PDF, document, spreadsheet, image and checksum utilities with capability reporting
+- added typed desktop notification and screen-capture boundaries
+- added native-first tool selection and inspection surfaces
+
 ## 0.7.1 - Execution Backends
 
 - added a guarded execution contract shared by host, container and SSH targets

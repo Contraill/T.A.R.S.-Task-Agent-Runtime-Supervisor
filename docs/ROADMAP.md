@@ -153,7 +153,21 @@ Status: implemented.
 
 See [EXECUTION.md](EXECUTION.md) for backend support and isolation behavior.
 
-- v0.7.2: typed native tools, web research, evidence and isolated browser automation
+### v0.7.2 — native tools, research, evidence and browser
+
+Status: implemented.
+
+- native filesystem, terminal/process, Git, user-service, Pacman and system inspection tools
+- direct argv and explicit Bash/PTY boundaries with bounded output and durable background logs
+- HTTP destination validation, SSRF protection, redirects, limits and cache validators
+- optional Tavily search/extract/crawl with `env:TAVILY_API_KEY`; mock-tested without a live credential
+- isolated Playwright browser profile/download policy and stable element references; live-tested on the reference environment and mock-tested in dependency-minimal CI
+- ZIP/tar archive handling, artifact checksums and capability-reported PDF, document, spreadsheet and image utilities
+- typed desktop notifications and capability-reported screen capture
+- lightweight task/event-linked EvidenceRecords
+
+See [TOOLS.md](TOOLS.md) for tool contracts and verified support boundaries.
+
 - v0.7.3: verified agent loop and live steering
 - v0.7.4: workspace checkpoints and rollback
 - v0.7.5: bounded delegation and subagents

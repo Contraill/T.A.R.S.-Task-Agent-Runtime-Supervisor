@@ -38,7 +38,8 @@ RISK_BY_EFFECT = {
 
 SENSITIVE_KEYS = {
     "authorization", "cookie", "cookies", "password", "passwd", "secret", "token",
-    "api_key", "apikey", "access_key", "private_key", "credential", "credentials",
+    "set_cookie", "api_key", "apikey", "access_key", "private_key", "credential",
+    "credentials",
 }
 
 

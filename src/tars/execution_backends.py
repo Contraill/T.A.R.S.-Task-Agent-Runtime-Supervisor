@@ -13,7 +13,7 @@ import uuid
 
 from .action_journal import begin_action, finish_action, record_denied
 from .approvals import ApprovalBroker
-from .policy import ScopeGuard, ScopeRequest, canonical_path, redact
+from .policy import ScopeGuard, ScopeRequest, canonical_path, normalize_network_target, redact
 
 
 @dataclass(frozen=True)
@@ -93,17 +93,20 @@ class ExecutionResult:
     started_at: str
     completed_at: str
     timed_out: bool = False
+    action_ids: tuple[str, ...] = ()
 
     @property
     def succeeded(self):
         return self.state == "succeeded" and self.exit_code == 0
 
     def audit_result(self):
+        limit = 16_384
         return redact({
             "execution_id": self.execution_id, "backend": self.backend,
             "target": self.target, "exit_code": self.exit_code,
-            "stdout": self.stdout, "stderr": self.stderr,
+            "stdout": self.stdout[:limit], "stderr": self.stderr[:limit],
             "state": self.state, "timed_out": self.timed_out,
+            "truncated": len(self.stdout) > limit or len(self.stderr) > limit,
         })
 
 
@@ -446,6 +449,11 @@ class GuardedExecutor:
             task_id=task_id, session_id=session_id, sandbox_escape=escape,
         )
         decision = self.guard.evaluate(scope_request)
+        if backend_name == "ssh" and decision.action != "deny":
+            try:
+                normalize_network_target(target, resolve_dns=True)
+            except ValueError as exc:
+                decision = replace(decision, action="deny", reason=str(exc))
         approval_map = approval_id if isinstance(approval_id, dict) else {"primary": approval_id}
         actions = [begin_action(
             scope_request, decision, approval_id=approval_map.get("primary"), broker=self.broker,
@@ -475,6 +483,13 @@ class GuardedExecutor:
                     allowed_hosts=request.network_hosts,
                 )
                 network_decision = self.guard.evaluate(network_request)
+                if network_decision.action != "deny":
+                    try:
+                        normalize_network_target(host, resolve_dns=True)
+                    except ValueError as exc:
+                        network_decision = replace(
+                            network_decision, action="deny", reason=str(exc),
+                        )
                 try:
                     actions.append(begin_action(
                         network_request, network_decision,
@@ -504,4 +519,4 @@ class GuardedExecutor:
             raise
         for action in actions:
             finish_action(action.id, state=result.state, result=result.audit_result())
-        return result
+        return replace(result, action_ids=tuple(action.id for action in actions))

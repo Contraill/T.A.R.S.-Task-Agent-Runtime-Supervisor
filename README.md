@@ -35,8 +35,9 @@ Implemented in the current reference build:
 - optional inspectable memory maintenance and provenance-backed reflection staging
 - deterministic execution policy, scoped approvals and redacted action audit records
 - guarded host execution, rootless container isolation and an experimental bounded SSH backend
+- typed native tools, artifact utilities, source evidence, optional Tavily research and isolated browser automation
 
-The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0–v0.7.1 trusted policy and execution boundaries are implemented.
+The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0–v0.7.2 trusted policy, execution and native-tool foundations are implemented.
 
 ## Roles
 
