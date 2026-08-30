@@ -105,6 +105,9 @@ from .tasks import (
     canonical_task_state,
 )
 from .temporary import run_temporary
+from .policy import ScopeGuard, ScopeRequest, add_rule as add_policy_rule, list_rules as list_policy_rules
+from .approvals import ApprovalBroker
+from .action_journal import list_actions as list_audit_actions, load_action
 
 console = Console()
 
@@ -1349,6 +1352,69 @@ def command_context_search(conversation_id, query, limit):
     return 0
 
 
+def command_scope(args):
+    if args.scope_command == "rules":
+        console.print_json(data=list_policy_rules())
+        return 0
+    if args.scope_command == "rule-add":
+        rule_id = add_policy_rule(
+            args.effect, args.action, target=args.target or "",
+            target_kind="path" if args.path else None,
+        )
+        console.print(rule_id)
+        return 0
+    request = ScopeRequest(
+        tool=args.tool, effect=args.effect, target=args.target or "",
+        arguments=json.loads(args.arguments), task_id=args.task,
+        session_id=args.session, allowed_paths=tuple(args.allow_path),
+        allowed_hosts=tuple(args.allow_host), destructive=args.destructive,
+        elevated=args.elevated, sandbox_escape=args.sandbox_escape,
+    )
+    decision = ScopeGuard().evaluate(request)
+    console.print_json(data={
+        "action": decision.action, "risk_class": decision.risk_class,
+        "effect": decision.effect, "target": decision.target,
+        "reason": decision.reason, "rule_id": decision.rule_id,
+        "normalized_arguments": decision.normalized_arguments,
+    })
+    return 1 if decision.action == "deny" else 0
+
+
+def command_approvals(args):
+    broker = ApprovalBroker()
+    if args.approve or args.deny:
+        approval = broker.decide(
+            args.approve or args.deny, approve=bool(args.approve), reason=args.reason,
+        )
+        console.print(f"{approval.id}: {approval.state}")
+        return 0
+    console.print_json(data=[{
+        "id": item.id, "state": item.state, "risk_class": item.risk_class,
+        "tool": item.tool, "target": item.target, "scope": item.scope,
+        "task_id": item.task_id, "session_id": item.session_id,
+        "created_at": item.created_at, "decision_reason": item.decision_reason,
+    } for item in broker.list(state=args.state, limit=args.limit)])
+    return 0
+
+
+def command_audit(args):
+    if args.action_id:
+        rows = [load_action(args.action_id)]
+    else:
+        rows = list_audit_actions(task_id=args.task, state=args.state, limit=args.limit)
+    console.print_json(data=[{
+        "id": item.id, "task_id": item.task_id, "session_id": item.session_id,
+        "event_uuid": item.event_uuid, "tool": item.tool,
+        "arguments": item.normalized_arguments, "target": item.target,
+        "effect": item.effect, "risk_class": item.risk_class,
+        "policy_action": item.policy_action, "policy_reason": item.policy_reason,
+        "approval_id": item.approval_id, "state": item.state,
+        "result": item.result, "created_at": item.created_at,
+        "started_at": item.started_at, "completed_at": item.completed_at,
+    } for item in rows])
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="tars")
     parser.add_argument("--version", action="version", version=__version__)
@@ -1364,6 +1430,47 @@ def build_parser():
     sub.add_parser("paths")
     sub.add_parser("doctor")
     sub.add_parser("help", help="show top-level help")
+
+    scope = sub.add_parser("scope", help="inspect deterministic execution policy")
+    scope_sub = scope.add_subparsers(dest="scope_command", required=True)
+    scope_explain = scope_sub.add_parser("explain")
+    scope_explain.add_argument("tool")
+    scope_explain.add_argument("effect", choices=sorted({
+        "read", "write", "execute", "network", "service", "remote", "secret",
+        "elevated", "destructive", "sandbox_escape",
+    }))
+    scope_explain.add_argument("target", nargs="?", default="")
+    scope_explain.add_argument("--arguments", default="{}")
+    scope_explain.add_argument("--task")
+    scope_explain.add_argument("--session")
+    scope_explain.add_argument("--allow-path", action="append", default=[])
+    scope_explain.add_argument("--allow-host", action="append", default=[])
+    scope_explain.add_argument("--destructive", action="store_true")
+    scope_explain.add_argument("--elevated", action="store_true")
+    scope_explain.add_argument("--sandbox-escape", action="store_true")
+    scope_sub.add_parser("rules")
+    scope_rule = scope_sub.add_parser("rule-add")
+    scope_rule.add_argument("effect", choices=sorted({
+        "read", "write", "execute", "network", "service", "remote", "secret",
+        "elevated", "destructive", "sandbox_escape",
+    }))
+    scope_rule.add_argument("action", choices=["allow", "deny", "ask"])
+    scope_rule.add_argument("target", nargs="?", default="")
+    scope_rule.add_argument("--path", action="store_true", help="treat target as a filesystem root")
+
+    approvals = sub.add_parser("approvals", help="inspect or decide approval requests")
+    approval_decision = approvals.add_mutually_exclusive_group()
+    approval_decision.add_argument("--approve")
+    approval_decision.add_argument("--deny")
+    approvals.add_argument("--reason", default="")
+    approvals.add_argument("--state", choices=["pending", "approved", "denied", "expired", "consumed"])
+    approvals.add_argument("--limit", type=int, default=50)
+
+    audit = sub.add_parser("audit", help="inspect guarded action truth")
+    audit.add_argument("action_id", nargs="?")
+    audit.add_argument("--task")
+    audit.add_argument("--state", choices=["proposed", "running", "succeeded", "failed", "denied", "cancelled", "unknown"])
+    audit.add_argument("--limit", type=int, default=50)
 
     model = sub.add_parser("model")
     model_sub = model.add_subparsers(dest="model_command", required=True)
@@ -1642,6 +1749,24 @@ def main():
     if args.command == "help":
         parser.print_help()
         return 0
+    if args.command == "scope":
+        try:
+            return command_scope(args)
+        except (json.JSONDecodeError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 2
+    if args.command == "approvals":
+        try:
+            return command_approvals(args)
+        except (KeyError, RuntimeError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 2
+    if args.command == "audit":
+        try:
+            return command_audit(args)
+        except KeyError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 2
     if args.command in {"start", "stop"}:
         return command_service(args.command)
     if args.command == "logs":

@@ -33,8 +33,9 @@ Implemented in the current reference build:
 - bounded context with atomic task-preserving Context Epoch rollover
 - conspicuous Temporary sessions that leave no new durable T.A.R.S. state
 - optional inspectable memory maintenance and provenance-backed reflection staging
+- deterministic execution policy, scoped approvals and redacted action audit records
 
-The v0.5 runtime substrate and complete v0.6 continuity, identity, memory, context, Temporary-session and maintenance foundations are implemented.
+The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0 trusted-execution policy core are implemented.
 
 ## Roles
 

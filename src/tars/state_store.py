@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def now_utc() -> str:
@@ -185,6 +185,62 @@ def _schema_sql() -> str:
     );
     CREATE INDEX IF NOT EXISTS idx_memory_maintenance_created
         ON memory_maintenance_runs(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS policy_rules (
+        id TEXT PRIMARY KEY,
+        effect TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('allow','deny','ask')),
+        target TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL DEFAULT 'persistent',
+        created_at TEXT NOT NULL,
+        expires_at TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_policy_rules_effect_target
+        ON policy_rules(effect, target);
+
+    CREATE TABLE IF NOT EXISTS approvals (
+        id TEXT PRIMARY KEY,
+        state TEXT NOT NULL CHECK(state IN ('pending','approved','denied','expired','consumed')),
+        risk_class TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        target TEXT NOT NULL DEFAULT '',
+        request_json TEXT NOT NULL DEFAULT '{}',
+        scope TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        session_id TEXT REFERENCES sessions(id),
+        decision_reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        expires_at TEXT,
+        consumed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_approvals_state_created
+        ON approvals(state, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS action_journal (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        session_id TEXT REFERENCES sessions(id),
+        event_uuid TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        normalized_arguments_json TEXT NOT NULL DEFAULT '{}',
+        target TEXT NOT NULL DEFAULT '',
+        effect TEXT NOT NULL,
+        risk_class TEXT NOT NULL,
+        policy_action TEXT NOT NULL,
+        policy_reason TEXT NOT NULL DEFAULT '',
+        approval_id TEXT REFERENCES approvals(id),
+        state TEXT NOT NULL CHECK(state IN ('proposed','running','succeeded','failed','denied','cancelled','unknown')),
+        result_json TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_action_journal_created
+        ON action_journal(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_action_journal_task
+        ON action_journal(task_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
@@ -435,7 +491,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,

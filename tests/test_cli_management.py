@@ -68,3 +68,16 @@ def test_memory_maintenance_cli_parsing():
         "memory", "maintain", "--trigger", "scheduled", "--apply",
     ])
     assert args.memory_command == "maintain" and args.trigger == "scheduled" and args.apply
+
+
+def test_policy_approval_and_audit_cli_parsing():
+    parser = build_parser()
+    scope = parser.parse_args([
+        "scope", "explain", "fs.write", "write", "/tmp/work/file",
+        "--allow-path", "/tmp/work",
+    ])
+    assert scope.scope_command == "explain" and scope.allow_path == ["/tmp/work"]
+    approval = parser.parse_args(["approvals", "--approve", "approval-one"])
+    assert approval.approve == "approval-one"
+    audit = parser.parse_args(["audit", "--state", "denied"])
+    assert audit.state == "denied"

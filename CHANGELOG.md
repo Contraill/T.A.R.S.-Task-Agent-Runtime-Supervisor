@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 - Policy Core, Approvals and Audit
+
+- added deterministic ScopeGuard decisions for filesystem, process, network, service, remote, secret, elevated, destructive and sandbox-escape effects
+- added canonical path and symlink scope enforcement plus private-network and SSRF destination rejection
+- added scoped one-call, task, session, target and explicit persistent approvals
+- added an action journal that records policy truth before execution and real redacted results afterward
+- added policy, approval and audit inspection commands
+
 ## 0.6.4 - Memory Maintenance and Reflection
 
 - added inspectable maintenance runs for explicit, session-close, context-rollover and scheduled triggers

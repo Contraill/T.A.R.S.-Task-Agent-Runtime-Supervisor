@@ -129,11 +129,24 @@ Status: implemented.
 
 ## v0.7.x — tools and real agent loop
 
-- ScopeGuard
-- ToolRegistry
-- starter native tools
-- verified agent loop
-- Skills and MCP
+### v0.7.0 — policy core, approvals and audit
+
+Status: implemented.
+
+- deterministic effect and risk classification outside inference
+- canonical filesystem scopes with traversal and symlink-escape protection
+- destination restrictions for network actions and private-network SSRF rejection
+- ephemeral and explicit persistent approval scopes
+- redacted action records linked to canonical state events
+
+See [POLICY.md](POLICY.md) for the policy and audit contracts.
+
+- v0.7.1: host, container and SSH execution backends
+- v0.7.2: typed native tools, web research, evidence and isolated browser automation
+- v0.7.3: verified agent loop and live steering
+- v0.7.4: workspace checkpoints and rollback
+- v0.7.5: bounded delegation and subagents
+- v0.7.6: skills and guarded MCP interoperability
 
 ## v0.8.x — future work, remote use and portability
 
