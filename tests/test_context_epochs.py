@@ -35,7 +35,7 @@ def test_epoch_rollover_checkpoints_archives_and_protects_truth(isolated_state):
     hits = context_epochs.search_transcript(conv.id, "old instruction")
     assert hits[0]["include_in_context"] == 0
     assert context_epochs.list_epochs(task.id)[0].id == epoch.id
-    assert state_store.health()["schema_version"] == 12
+    assert state_store.health()["schema_version"] == 13
 
 
 def test_rollover_without_eligible_history_is_safe(isolated_state):

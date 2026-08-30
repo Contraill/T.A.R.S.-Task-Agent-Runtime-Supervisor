@@ -196,7 +196,19 @@ Status: implemented.
 
 See [WORKSPACE_RECOVERY.md](WORKSPACE_RECOVERY.md) for support and recovery truth.
 
-- v0.7.5: bounded delegation and subagents
+### v0.7.5 — bounded delegation and subagents
+
+Status: implemented.
+
+- parent/child task contracts with separate canonical task/event state and bounded context
+- immutable tool, filesystem, effect, destination, remote-target and secret-reference ceilings
+- nested permission and resource budgets that can only narrow parent authority
+- cancel, join and cooperative timeout truth with local GPU inference concurrency of one
+- isolated/shared read-only/read-write workspace policies with exclusive mutation scheduling
+- explicit completion evidence, parent acceptance and staged child-memory promotion
+
+See [DELEGATION.md](DELEGATION.md) for contracts, scheduling and acceptance semantics.
+
 - v0.7.6: skills and guarded MCP interoperability
 
 ## v0.8.x — future work, remote use and portability

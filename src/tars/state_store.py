@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 def now_utc() -> str:
@@ -449,6 +449,32 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_delegations_parent_created
         ON delegations(parent_task_id, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS delegation_contracts (
+        delegation_id TEXT PRIMARY KEY REFERENCES delegations(id),
+        parent_delegation_id TEXT REFERENCES delegations(id),
+        tool_allowlist_json TEXT NOT NULL DEFAULT '[]',
+        authority_json TEXT NOT NULL DEFAULT '{}',
+        budget_json TEXT NOT NULL DEFAULT '{}',
+        workspace_json TEXT NOT NULL DEFAULT '{}',
+        completion_json TEXT NOT NULL DEFAULT '{}',
+        state TEXT NOT NULL DEFAULT 'created',
+        accepted INTEGER CHECK(accepted IS NULL OR accepted IN (0,1)),
+        acceptance_reason TEXT NOT NULL DEFAULT '',
+        started_at TEXT,
+        deadline_at TEXT,
+        finished_at TEXT,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS delegation_memory (
+        delegation_id TEXT NOT NULL REFERENCES delegations(id),
+        candidate_id TEXT NOT NULL REFERENCES memory_candidates(id),
+        state TEXT NOT NULL CHECK(state IN ('staged','accepted','rejected')),
+        created_at TEXT NOT NULL,
+        reviewed_at TEXT,
+        PRIMARY KEY(delegation_id,candidate_id)
+    );
+
     CREATE TABLE IF NOT EXISTS handoffs (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -536,7 +562,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,

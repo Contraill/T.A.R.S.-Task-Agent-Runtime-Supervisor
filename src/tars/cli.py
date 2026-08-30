@@ -113,6 +113,8 @@ from .tool_registry import ToolRegistry
 from .evidence import list_records as list_evidence_records
 from .agent_loop import submit_task_control
 from .control_queue import list_controls as list_task_controls
+from .delegation import (accept as accept_child, cancel as cancel_child,
+                         create_child, load_contract as load_child_contract)
 from .workspace_recovery import (WorkspaceRecovery, load as load_workspace_checkpoint,
                                  list_checkpoints as list_workspace_checkpoints)
 
@@ -1241,6 +1243,36 @@ def command_task_delegation_complete(args):
     return 0
 
 
+def command_task_child_control(args):
+    try:
+        if args.task_command == "child-cancel":
+            result = cancel_child(args.delegation_id)
+        elif args.task_command == "child-accept":
+            result = accept_child(args.delegation_id, accept_result=not args.reject,
+                                  reason=args.reason)
+            result = result.__dict__
+        else:
+            result = load_child_contract(args.delegation_id).__dict__
+    except (KeyError, ValueError, RuntimeError, PermissionError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data=result)
+    return 0
+
+
+def command_task_child_create(args):
+    try:
+        contract = json.loads(args.contract_json)
+        if not isinstance(contract, dict):
+            raise ValueError("--contract-json must decode to an object")
+        record = create_child(args.task_id, args.goal, **contract)
+    except (json.JSONDecodeError, KeyError, ValueError, RuntimeError, PermissionError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data=record.__dict__)
+    return 0
+
+
 def command_task_handoff(task_id, role, reason):
     try:
         record = handoff_task(task_id, role, reason=reason)
@@ -1816,6 +1848,18 @@ def build_parser():
     task_delegation_complete.add_argument("--summary", required=True)
     task_delegation_complete.add_argument("--result-json", default="")
 
+    for name in ("child-show", "child-cancel"):
+        child_command = task_sub.add_parser(name)
+        child_command.add_argument("delegation_id")
+    child_accept = task_sub.add_parser("child-accept")
+    child_accept.add_argument("delegation_id")
+    child_accept.add_argument("--reject", action="store_true")
+    child_accept.add_argument("--reason", default="")
+    child_create = task_sub.add_parser("child-create")
+    child_create.add_argument("task_id")
+    child_create.add_argument("goal")
+    child_create.add_argument("--contract-json", required=True)
+
     task_handoff = task_sub.add_parser("handoff")
     task_handoff.add_argument("task_id")
     task_handoff.add_argument("role")
@@ -2021,6 +2065,10 @@ def main():
             return command_task_delegation_show(args.delegation_id)
         if args.task_command == "delegation-complete":
             return command_task_delegation_complete(args)
+        if args.task_command in {"child-show", "child-cancel", "child-accept"}:
+            return command_task_child_control(args)
+        if args.task_command == "child-create":
+            return command_task_child_create(args)
         if args.task_command == "handoff":
             return command_task_handoff(args.task_id, args.role, args.reason)
         if args.task_command == "handoffs":

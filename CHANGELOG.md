@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.5 - Delegation and Subagents
+
+- added durable child contracts with bounded tools, authority, budgets, workspaces and completion evidence
+- enforced parent-to-child permission and resource ceilings for nested delegation
+- added cooperative cancel, join and timeout lifecycle truth with serialized local inference
+- added explicit parent acceptance and staged child-memory promotion
+- added child contract inspection and control commands
+
 ## 0.7.4 - Workspace Checkpoints and Recovery
 
 - added durable Git-aware and bounded filesystem workspace checkpoints
