@@ -76,4 +76,4 @@ def test_maintenance_triggers_are_explicit_and_inspectable(isolated_memory):
     assert len(maintenance.list_runs()) == len(maintenance.TRIGGERS)
     with pytest.raises(ValueError):
         maintenance.run_maintenance(trigger="startup")
-    assert state_store.health()["schema_version"] == 11
+    assert state_store.health()["schema_version"] == 12

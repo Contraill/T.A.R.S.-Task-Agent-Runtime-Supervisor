@@ -181,7 +181,21 @@ Status: implemented.
 
 See [AGENT_LOOP.md](AGENT_LOOP.md) for loop, control and completion contracts.
 
-- v0.7.4: workspace checkpoints and rollback
+### v0.7.4 — workspace checkpoints and rollback
+
+Status: implemented.
+
+- durable Git-aware checkpoints preserving tracked index/worktree and bounded untracked files
+- bounded non-Git captured-file snapshots with symlink and resource limits
+- explicit rollback preview and destructive approval
+- same-HEAD Git recovery without branch/history movement
+- new untracked files moved to checkpoint quarantine rather than deleted
+- automatic pre-rollback safety checkpoint and post-restore hash verification
+- agent-loop pre-mutation checkpoint hook
+- external effects explicitly marked non-reversible
+
+See [WORKSPACE_RECOVERY.md](WORKSPACE_RECOVERY.md) for support and recovery truth.
+
 - v0.7.5: bounded delegation and subagents
 - v0.7.6: skills and guarded MCP interoperability
 

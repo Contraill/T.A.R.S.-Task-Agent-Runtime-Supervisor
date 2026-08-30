@@ -86,6 +86,7 @@ class ToolBinding:
     execute: object
     cancel: object | None = None
     retry_safe: bool = False
+    before_execute: object | None = None
 
     @property
     def cancellable(self):
@@ -96,10 +97,14 @@ class ToolDispatcher:
     def __init__(self):
         self._bindings = {}
 
-    def register(self, name, execute, *, cancel=None, retry_safe=False):
+    def register(self, name, execute, *, cancel=None, retry_safe=False,
+                 before_execute=None):
         if not callable(execute):
             raise TypeError("tool execute binding must be callable")
-        self._bindings[str(name)] = ToolBinding(execute, cancel, retry_safe)
+        if before_execute is not None and not callable(before_execute):
+            raise TypeError("before_execute must be callable")
+        self._bindings[str(name)] = ToolBinding(execute, cancel, retry_safe,
+                                                before_execute)
         return self
 
     def binding(self, name):
@@ -349,6 +354,30 @@ class AgentLoop:
                         return self._stop("paused", "tool failure guard", iteration, results,
                                           checkpoint_id)
                     continue
+                if binding.before_execute is not None:
+                    try:
+                        hook_arguments = dict(decision.arguments)
+                        signature = inspect.signature(binding.before_execute).parameters
+                        if "task_id" in signature:
+                            hook_arguments["task_id"] = task.id
+                        checkpoint_result = binding.before_execute(**hook_arguments)
+                        if not isinstance(checkpoint_result, ToolResult):
+                            raise TypeError("pre-execution checkpoint must return ToolResult")
+                        if not checkpoint_result.succeeded:
+                            return self._stop("paused", "workspace checkpoint failed",
+                                              iteration, results, checkpoint_id)
+                        results.append(checkpoint_result)
+                        refs = tuple(dict.fromkeys((*load_task(task.id).evidence_refs,
+                                                    *checkpoint_result.evidence_ids)))
+                        update_task(task.id, evidence_refs=refs,
+                                    phase="workspace-checkpointed")
+                        checkpoint_id = checkpoint_result.data.get("checkpoint_id")
+                    except Exception as exc:
+                        append_event(task.id, "error", f"Workspace checkpoint failed: {exc}",
+                                     role=task.owner_role,
+                                     data={"tool": decision.tool})
+                        return self._stop("paused", "workspace checkpoint failed",
+                                          iteration, results, checkpoint_id)
                 with self._active_lock:
                     self._active_binding, self._active_tool = binding, decision.tool
                 try:

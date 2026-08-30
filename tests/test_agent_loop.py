@@ -207,3 +207,29 @@ def test_repetition_context_and_unsafe_retry_guards(loop_state):
         ),
     ).run()
     assert failed.reason == "unsafe retry guard"
+
+
+def test_risky_tool_checkpoint_hook_runs_before_mutation(loop_state):
+    task, _ = loop_state
+    order = []
+    checkpoint_evidence = evidence.record(
+        "workspace_checkpoint", "/workspace", "checkpoint", task_id=task.id,
+    )
+    def checkpoint(**kwargs):
+        order.append("checkpoint")
+        return ToolResult("workspace.checkpoint", "succeeded",
+                          {"checkpoint_id": "wcp-real"},
+                          evidence_ids=(checkpoint_evidence.id,))
+    def mutate(task_id=None):
+        order.append("mutate")
+        return result_for(task_id)
+    decisions = iter((
+        {"type": "tool", "tool": "fs.write", "arguments": {}},
+        {"type": "finish", "summary": "done"},
+    ))
+    dispatcher = agent_loop.ToolDispatcher().register(
+        "fs.write", mutate, before_execute=checkpoint,
+    )
+    outcome = agent_loop.AgentLoop(task.id, lambda current, controls: next(decisions),
+                                   dispatcher).run()
+    assert outcome.state == "completed" and order == ["checkpoint", "mutate"]

@@ -79,6 +79,9 @@ NATIVE_TOOLS = (
                            ("compress", "write"))),
     ToolDescriptor("notify.send", "desktop.notify", "write", support="optional"),
     ToolDescriptor("screen.capture", "desktop.capture", "write", support="optional"),
+    ToolDescriptor("workspace.checkpoint", "workspace.checkpoint", "read"),
+    ToolDescriptor("workspace.rollback_preview", "workspace.rollback_preview", "read"),
+    ToolDescriptor("workspace.rollback", "workspace.rollback", "destructive"),
 )
 
 

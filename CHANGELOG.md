@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.4 - Workspace Checkpoints and Recovery
+
+- added durable Git-aware and bounded filesystem workspace checkpoints
+- added rollback previews with explicit supported scope and external-effect limitations
+- added same-HEAD Git worktree/index restoration with untracked-file quarantine
+- added pre-rollback safety checkpoints and post-restore hash verification
+- added agent-loop pre-mutation checkpoint hooks and workspace inspection commands
+
 ## 0.7.3 - Agent Loop and Live Steering
 
 - added a canonical model/action/policy/tool/evidence/checkpoint loop with real ToolResult enforcement

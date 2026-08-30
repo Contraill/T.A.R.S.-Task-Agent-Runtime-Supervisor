@@ -37,8 +37,9 @@ Implemented in the current reference build:
 - guarded host execution, rootless container isolation and an experimental bounded SSH backend
 - typed native tools, artifact utilities, source evidence, optional Tavily research and isolated browser automation
 - verified autonomous task loops with durable queued messages, interrupt and redirect controls
+- recoverable Git and bounded filesystem workspace checkpoints with explicit rollback previews
 
-The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0–v0.7.3 trusted execution and agent-loop foundations are implemented.
+The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0–v0.7.4 trusted execution, agent-loop and workspace-recovery foundations are implemented.
 
 ## Roles
 

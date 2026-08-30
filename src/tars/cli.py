@@ -113,6 +113,8 @@ from .tool_registry import ToolRegistry
 from .evidence import list_records as list_evidence_records
 from .agent_loop import submit_task_control
 from .control_queue import list_controls as list_task_controls
+from .workspace_recovery import (WorkspaceRecovery, load as load_workspace_checkpoint,
+                                 list_checkpoints as list_workspace_checkpoints)
 
 console = Console()
 
@@ -1481,6 +1483,37 @@ def command_evidence(args):
     return 0
 
 
+def command_workspace(args):
+    try:
+        if args.workspace_command == "list":
+            rows = list_workspace_checkpoints(task_id=args.task, limit=args.limit)
+            console.print_json(data=[{"id": row.id, "task_id": row.task_id,
+                                      "kind": row.kind, "root": row.root,
+                                      "state": row.state, "metadata": row.metadata,
+                                      "created_at": row.created_at,
+                                      "restored_at": row.restored_at} for row in rows])
+            return 0
+        if args.workspace_command == "checkpoint":
+            recovery = WorkspaceRecovery((args.root,))
+            result = (recovery.create_filesystem(args.root, args.path, task_id=args.task)
+                      if args.path else recovery.create_git(args.root, task_id=args.task))
+        else:
+            checkpoint = load_workspace_checkpoint(args.checkpoint_id)
+            recovery = WorkspaceRecovery((checkpoint.root,))
+            if args.workspace_command == "preview":
+                result = recovery.preview(args.checkpoint_id, task_id=args.task)
+            else:
+                result = recovery.rollback(args.checkpoint_id, approval_id=args.approval,
+                                           task_id=args.task)
+    except Exception as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data={"tool": result.tool, "state": result.state,
+                             "data": result.data, "error": result.error,
+                             "evidence_ids": result.evidence_ids})
+    return 0 if result.succeeded else 1
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="tars")
     parser.add_argument("--version", action="version", version=__version__)
@@ -1548,6 +1581,22 @@ def build_parser():
     evidence.add_argument("--task")
     evidence.add_argument("--type")
     evidence.add_argument("--limit", type=int, default=50)
+    workspace = sub.add_parser("workspace", help="inspect and recover bounded workspace checkpoints")
+    workspace_sub = workspace.add_subparsers(dest="workspace_command", required=True)
+    workspace_list = workspace_sub.add_parser("list")
+    workspace_list.add_argument("--task")
+    workspace_list.add_argument("--limit", type=int, default=50)
+    workspace_checkpoint = workspace_sub.add_parser("checkpoint")
+    workspace_checkpoint.add_argument("root")
+    workspace_checkpoint.add_argument("--path", action="append", default=[])
+    workspace_checkpoint.add_argument("--task")
+    workspace_preview = workspace_sub.add_parser("preview")
+    workspace_preview.add_argument("checkpoint_id")
+    workspace_preview.add_argument("--task")
+    workspace_rollback = workspace_sub.add_parser("rollback")
+    workspace_rollback.add_argument("checkpoint_id")
+    workspace_rollback.add_argument("--approval", required=True)
+    workspace_rollback.add_argument("--task")
 
     model = sub.add_parser("model")
     model_sub = model.add_subparsers(dest="model_command", required=True)
@@ -1858,6 +1907,8 @@ def main():
         return command_tool_list()
     if args.command == "evidence":
         return command_evidence(args)
+    if args.command == "workspace":
+        return command_workspace(args)
     if args.command in {"start", "stop"}:
         return command_service(args.command)
     if args.command == "logs":
