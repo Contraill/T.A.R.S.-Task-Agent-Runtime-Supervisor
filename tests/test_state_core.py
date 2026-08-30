@@ -17,7 +17,7 @@ def isolated_state(monkeypatch, tmp_path):
     return db
 
 
-def test_schema_five_session_event_role_and_project_state(monkeypatch, isolated_state, tmp_path):
+def test_schema_session_event_role_and_project_state(monkeypatch, isolated_state, tmp_path):
     monkeypatch.setattr(sessions, "resolve_role_id", lambda value: value)
     monkeypatch.setattr(role_state, "resolve_role_id", lambda value: value)
     conv = conversation.create_conversation(title="Durable")
@@ -38,7 +38,7 @@ def test_schema_five_session_event_role_and_project_state(monkeypatch, isolated_
     context = projects.register_project(tmp_path)
     assert [path.name for path in context.files] == ["TARS.md", "AGENTS.md"]
     health = state_store.health()
-    assert health["ok"] and health["schema_version"] == 5
+    assert health["ok"] and health["schema_version"] == 6
     assert health["counts"]["sessions"] == 1 and health["counts"]["state_events"] == 4
 
 
@@ -55,7 +55,7 @@ def test_schema_upgrade_preserves_existing_conversation(isolated_state):
         conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
     state_store.ensure_state_store()
     assert conversation.load_conversation(conv.id).title == "before upgrade"
-    assert state_store.health()["schema_version"] == 5
+    assert state_store.health()["schema_version"] == 6
 
 
 def test_identity_inheritance_and_prompt_explain(monkeypatch, tmp_path):

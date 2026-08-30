@@ -31,6 +31,16 @@ from .config import (
 from .registry import ensure_registry, get_model, role_for_alias
 from .runtime_backends import BACKEND_TYPES, backend_for_name
 from .model_lifecycle import import_model, pull_model, remove_model, search_huggingface, verify_model
+from .memory import (
+    decide_candidate,
+    doctor as memory_doctor,
+    forget as forget_memory,
+    inspect as inspect_memory,
+    remember as remember_memory,
+    review_candidates,
+    search as search_memory,
+    status as memory_status,
+)
 from .roles import (
     bind_model,
     create_role,
@@ -412,6 +422,55 @@ def command_backend_status(cfg, name):
         return 2
     console.print_json(data=backend.diagnostics())
     return 0 if backend.status().healthy else 1
+
+
+def command_memory(args):
+    if args.memory_command == "status":
+        result = memory_status()
+        console.print_json(data=result)
+        return 0 if result["ok"] else 1
+    if args.memory_command == "doctor":
+        result = memory_doctor()
+        console.print_json(data=result)
+        return 0 if result["ok"] else 1
+    if args.memory_command == "remember":
+        entry = remember_memory(
+            args.content, kind=args.kind, scope=args.scope, title=args.title,
+            source="user", confidence=args.confidence, tags=args.tag,
+        )
+        console.print_json(data={"id": entry.id, "path": entry.path, "scope": entry.scope})
+        return 0
+    if args.memory_command == "search":
+        hits = search_memory(args.query, scope=args.scope, kind=args.kind, limit=args.limit)
+        console.print_json(data=[{
+            "id": hit.entry.id, "title": hit.entry.title, "scope": hit.entry.scope,
+            "content": hit.entry.content, "score": hit.score,
+            "signals": list(hit.signals), "source": hit.entry.source,
+        } for hit in hits])
+        return 0
+    if args.memory_command == "inspect":
+        entry = inspect_memory(args.memory_id)
+        console.print_json(data={
+            "id": entry.id, "kind": entry.kind, "scope": entry.scope,
+            "title": entry.title, "content": entry.content, "source": entry.source,
+            "confidence": entry.confidence, "tags": list(entry.tags), "path": entry.path,
+        })
+        return 0
+    if args.memory_command == "forget":
+        archived = forget_memory(args.memory_id)
+        console.print(f"forgot {args.memory_id} · archive={archived}")
+        return 0
+    if args.memory_command == "review":
+        if args.promote or args.reject:
+            if not args.candidate_id:
+                console.print("[red]candidate id is required for a review decision[/red]")
+                return 2
+            entry = decide_candidate(args.candidate_id, promote=args.promote, reason=args.reason)
+            console.print(f"{args.candidate_id}: {'promoted to ' + entry.id if entry else 'rejected'}")
+            return 0
+        console.print_json(data=review_candidates())
+        return 0
+    return 2
 
 
 def command_model_bindings():
@@ -1309,6 +1368,33 @@ def build_parser():
     backend_status = backend_sub.add_parser("status")
     backend_status.add_argument("backend", choices=sorted(BACKEND_TYPES))
 
+    memory = sub.add_parser("memory", help="inspect and maintain durable personal memory")
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+    memory_sub.add_parser("status")
+    memory_sub.add_parser("doctor")
+    memory_search = memory_sub.add_parser("search")
+    memory_search.add_argument("query")
+    memory_search.add_argument("--scope")
+    memory_search.add_argument("--kind", choices=sorted({"system", "profile", "projects", "episodic", "reference"}))
+    memory_search.add_argument("--limit", type=int, default=10)
+    memory_inspect = memory_sub.add_parser("inspect")
+    memory_inspect.add_argument("memory_id")
+    memory_remember = memory_sub.add_parser("remember")
+    memory_remember.add_argument("content")
+    memory_remember.add_argument("--kind", default="profile", choices=sorted({"system", "profile", "projects", "episodic", "reference"}))
+    memory_remember.add_argument("--scope", default="global")
+    memory_remember.add_argument("--title", default="")
+    memory_remember.add_argument("--confidence", type=float, default=1.0)
+    memory_remember.add_argument("--tag", action="append", default=[])
+    memory_forget = memory_sub.add_parser("forget")
+    memory_forget.add_argument("memory_id")
+    memory_review = memory_sub.add_parser("review")
+    memory_review.add_argument("candidate_id", nargs="?")
+    decision = memory_review.add_mutually_exclusive_group()
+    decision.add_argument("--promote", action="store_true")
+    decision.add_argument("--reject", action="store_true")
+    memory_review.add_argument("--reason", default="")
+
     role = sub.add_parser("role")
     role_sub = role.add_subparsers(dest="role_command", required=True)
     role_sub.add_parser("list")
@@ -1531,6 +1617,8 @@ def main():
         if args.backend_command == "list":
             return command_backend_list(cfg)
         return command_backend_status(cfg, args.backend)
+    if args.command == "memory":
+        return command_memory(args)
 
     if args.command == "role":
         if args.role_command == "list":

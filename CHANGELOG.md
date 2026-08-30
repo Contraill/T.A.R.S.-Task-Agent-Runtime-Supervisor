@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1 - Memory Core
+
+- added a human-readable canonical memory corpus with structured provenance, scope, confidence, expiry, tags and supersession metadata
+- added immutable local revision archives for destructive memory changes
+- added staged candidate review and promotion policy owned by MemoryManager APIs
+- added rebuildable SQLite/FTS5 lexical retrieval with scope, expiry, recency and deduplication signals
+- added explainable memory recall integration for PromptCompiler
+- added memory status, search, inspect, review, remember, forget and doctor commands
+
 ## 0.6.0 - Session Core, Identity and PromptCompiler
 
 - extended the canonical SQLite state store with durable sessions, general state events, Role state and project references

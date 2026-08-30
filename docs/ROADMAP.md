@@ -75,6 +75,16 @@ Status: implemented.
 - explicit prompt sources with inspectable token allocation
 - backend-emitted reasoning visibility kept separate from Activity Trace
 
+## v0.6.1 — memory core
+
+Status: implemented.
+
+- human-readable canonical memory corpus and immutable revision history
+- structured scope, provenance, confidence, expiry, tags and supersession
+- staged candidate review and deterministic promotion policy
+- rebuildable SQLite/FTS5 lexical retrieval with explainable ranking signals
+- memory inspection, search, remember, forget, review and repair commands
+
 ## v0.6.x — identity, memory and context epochs
 
 - PromptCompiler and capability-aware system prompt

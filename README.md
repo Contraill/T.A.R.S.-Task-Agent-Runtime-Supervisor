@@ -29,8 +29,9 @@ Implemented in the current reference build:
 - resumable objective calibration with hardware-aware runtime profiles
 - local RuntimeBackend boundary with llama.cpp as the reference implementation
 - durable session/event state, shared identity and explainable prompt composition
+- inspectable durable memory with offline lexical retrieval and rebuildable indexes
 
-The v0.5 runtime substrate and v0.6.0 continuity foundation are implemented.
+The v0.5 runtime substrate and v0.6.0–v0.6.1 continuity and memory foundations are implemented.
 
 ## Roles
 

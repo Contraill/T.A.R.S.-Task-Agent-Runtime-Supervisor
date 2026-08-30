@@ -37,3 +37,14 @@ def test_runtime_backend_cli_parsing():
     assert parser.parse_args(["backend", "list"]).backend_command == "list"
     status = parser.parse_args(["backend", "status", "llama.cpp"])
     assert status.backend == "llama.cpp"
+
+
+def test_memory_cli_parsing():
+    parser = build_parser()
+    remember = parser.parse_args([
+        "memory", "remember", "prefers concise answers", "--scope", "profile",
+        "--tag", "preference",
+    ])
+    assert remember.memory_command == "remember" and remember.tag == ["preference"]
+    search = parser.parse_args(["memory", "search", "concise", "--limit", "3"])
+    assert search.query == "concise" and search.limit == 3

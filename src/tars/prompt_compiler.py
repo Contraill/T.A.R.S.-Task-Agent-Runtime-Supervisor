@@ -7,6 +7,7 @@ from .checkpoints import latest_checkpoint
 from .context import estimate_messages_tokens
 from .conversation import list_messages
 from .identity import load_identity
+from .memory import search as search_memory
 from .projects import discover_project_context
 from .roles import get_role, resolve_role_id
 from .tasks import canonical_task_state
@@ -46,7 +47,8 @@ def _source(name, content, *, protected=False, provenance=()):
 
 class PromptCompiler:
     def compile(self, *, role_name, conversation_id=None, task_id=None, project_path=None,
-                personal_memory=(), evidence=(), skills=(), tool_schemas=(), pending_controls=(),
+                personal_memory=(), memory_query=None, memory_scope=None,
+                evidence=(), skills=(), tool_schemas=(), pending_controls=(),
                 recent_limit=100):
         role_id = resolve_role_id(role_name)
         role = get_role(role_id)
@@ -58,8 +60,15 @@ class PromptCompiler:
                     protected=True, provenance=identity.sources[2:]),
             _source("capabilities", json.dumps(list(role.capabilities), ensure_ascii=False)),
         ]
-        if personal_memory:
-            sources.append(_source("personal_memory", "\n".join(map(str, personal_memory))))
+        recalled = list(map(str, personal_memory))
+        memory_provenance = []
+        if memory_query:
+            hits = search_memory(memory_query, scope=memory_scope)
+            recalled.extend(hit.entry.content for hit in hits)
+            memory_provenance.extend(hit.entry.id for hit in hits)
+        if recalled:
+            sources.append(_source("personal_memory", "\n".join(recalled),
+                                   provenance=memory_provenance))
         if project_path:
             project = discover_project_context(project_path)
             sources.append(_source("project_context", project.content,

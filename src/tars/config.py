@@ -24,6 +24,8 @@ PERSONA_ROOT = Path.home() / ".config/tars/persona"
 IDENTITY_PATH = PERSONA_ROOT / "IDENTITY.md"
 SOUL_PATH = PERSONA_ROOT / "SOUL.md"
 ROLE_PERSONA_ROOT = PERSONA_ROOT / "roles"
+MEMORY_ROOT = DATA_ROOT / "memory"
+MEMORY_HISTORY_ROOT = MEMORY_ROOT / ".history"
 
 LLAMA_SWAP_CONFIG_PATH = Path.home() / ".config/tars/llama-swap/config.yaml"
 LLAMA_SERVER_PATH = Path.home() / ".local/src/llama.cpp/build-cuda/bin/llama-server"
