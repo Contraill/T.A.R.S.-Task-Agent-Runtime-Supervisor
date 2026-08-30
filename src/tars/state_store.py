@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def now_utc() -> str:
@@ -86,6 +86,54 @@ def _schema_sql() -> str:
     );
     CREATE INDEX IF NOT EXISTS idx_messages_conversation_seq
         ON messages(conversation_id, seq);
+
+    CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        role_id TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'open',
+        mode TEXT NOT NULL DEFAULT 'normal',
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        ended_at TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_conversation_updated
+        ON sessions(conversation_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS state_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_uuid TEXT NOT NULL UNIQUE,
+        session_id TEXT REFERENCES sessions(id),
+        conversation_id TEXT REFERENCES conversations(id),
+        task_id TEXT REFERENCES tasks(id),
+        timestamp TEXT NOT NULL,
+        type TEXT NOT NULL,
+        source_role TEXT,
+        message TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        visibility TEXT NOT NULL DEFAULT 'normal'
+    );
+    CREATE INDEX IF NOT EXISTS idx_state_events_session_id
+        ON state_events(session_id, id);
+    CREATE INDEX IF NOT EXISTS idx_state_events_task_id
+        ON state_events(task_id, id);
+
+    CREATE TABLE IF NOT EXISTS role_state (
+        role_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS project_refs (
+        id TEXT PRIMARY KEY,
+        canonical_path TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL DEFAULT '',
+        context_files_json TEXT NOT NULL DEFAULT '[]',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
@@ -320,7 +368,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "tasks", "task_events", "checkpoints", "context_projections", "task_runs", "delegations", "handoffs", "routing_decisions"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,

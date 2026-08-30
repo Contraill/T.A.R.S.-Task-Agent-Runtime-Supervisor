@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 - Session Core, Identity and PromptCompiler
+
+- extended the canonical SQLite state store with durable sessions, general state events, Role state and project references
+- added append-safe session and activity event APIs with stable identifiers and timestamps
+- added shared identity and per-Role overlay discovery from the persona directory
+- added native and compatibility project-context discovery without treating context files as permission sources
+- added a PromptCompiler with explicit source composition and token-allocation explanations
+- separated backend-emitted reasoning visibility from the durable Activity Trace
+
 ## 0.5.3 - Runtime Backend Boundary
 
 - added a local RuntimeBackend contract for status, capabilities, lifecycle, inference, streaming and diagnostics

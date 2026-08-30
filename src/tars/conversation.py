@@ -119,10 +119,12 @@ def add_message(
     include_in_context=True,
     related_task_id=None,
     metadata=None,
+    session_id=None,
 ) -> MessageRecord:
     ensure_state_store()
     now = now_utc()
     message_id = "msg-" + uuid.uuid4().hex
+    from .state_events import insert_state_event
     with transaction(immediate=True) as conn:
         if not conn.execute("SELECT 1 FROM conversations WHERE id=?", (conversation_id,)).fetchone():
             raise KeyError(f"unknown conversation: {conversation_id}")
@@ -148,6 +150,14 @@ def add_message(
             (now, now, conversation_id),
         )
         row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+        if role in {"user", "assistant"}:
+            insert_state_event(
+                conn,
+                "user_message" if role == "user" else "assistant_response",
+                session_id=session_id, conversation_id=conversation_id,
+                task_id=related_task_id, message=content,
+                payload={"message_id": message_id, "kind": kind},
+            )
     return _message_from_row(row)
 
 

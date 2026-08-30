@@ -65,6 +65,16 @@ Status: implemented.
 
 External cloud inference providers are outside the v1.0 product scope.
 
+## v0.6.0 — session core, identity and PromptCompiler
+
+Status: implemented.
+
+- schema-versioned sessions, state events, Role state and project references
+- shared identity with explicit per-Role overlays
+- native `TARS.md` / `.tars.md` project context and compatibility-source discovery
+- explicit prompt sources with inspectable token allocation
+- backend-emitted reasoning visibility kept separate from Activity Trace
+
 ## v0.6.x — identity, memory and context epochs
 
 - PromptCompiler and capability-aware system prompt

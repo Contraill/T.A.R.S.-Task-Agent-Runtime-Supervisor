@@ -28,8 +28,9 @@ Implemented in the current reference build:
 - content-addressed model artifacts and safe removal
 - resumable objective calibration with hardware-aware runtime profiles
 - local RuntimeBackend boundary with llama.cpp as the reference implementation
+- durable session/event state, shared identity and explainable prompt composition
 
-The v0.5 runtime, model lifecycle, calibration and backend substrate is implemented.
+The v0.5 runtime substrate and v0.6.0 continuity foundation are implemented.
 
 ## Roles
 
