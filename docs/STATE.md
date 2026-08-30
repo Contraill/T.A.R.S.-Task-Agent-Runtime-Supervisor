@@ -1,6 +1,6 @@
 # State and prompt composition
 
-SQLite is the canonical transactional store for conversations, sessions, tasks, task events, checkpoints, Role state and project references. Schema upgrades are additive and preserve existing records. Checkpoints remain immutable, while ordered state events provide stable identifiers and timestamps for session, model, control and execution activity.
+SQLite is the canonical transactional store for conversations, sessions, tasks, task events, task controls, checkpoints, Role state and project references. Schema upgrades are additive and preserve existing records. Checkpoints remain immutable, while ordered state events provide stable identifiers and timestamps for session, model, control and execution activity.
 
 Identity is loaded from:
 

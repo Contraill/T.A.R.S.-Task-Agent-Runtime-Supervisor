@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def now_utc() -> str:
@@ -255,6 +255,23 @@ def _schema_sql() -> str:
     );
     CREATE INDEX IF NOT EXISTS idx_evidence_task_created
         ON evidence_records(task_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS task_controls (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        session_id TEXT REFERENCES sessions(id),
+        seq INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('cancel','interrupt','approval','redirect','message','pause','resume')),
+        priority INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending','processing','applied','failed')),
+        message TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        applied_at TEXT,
+        UNIQUE(task_id, seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_controls_pending
+        ON task_controls(task_id, state, priority, seq);
 
     CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
@@ -505,7 +522,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,

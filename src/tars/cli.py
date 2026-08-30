@@ -111,6 +111,8 @@ from .action_journal import list_actions as list_audit_actions, load_action
 from .execution_backends import ContainerBackend, HostBackend, SSHBackend
 from .tool_registry import ToolRegistry
 from .evidence import list_records as list_evidence_records
+from .agent_loop import submit_task_control
+from .control_queue import list_controls as list_task_controls
 
 console = Console()
 
@@ -1038,6 +1040,31 @@ def command_task_runs(task_id=None, limit=20):
     return 0
 
 
+def command_task_control(task_id, kind, message):
+    try:
+        control, feedback = submit_task_control(task_id, kind, message)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data={"id": control.id, "task_id": control.task_id,
+                             "seq": control.seq, "kind": control.kind,
+                             "state": control.state, "feedback": feedback})
+    return 0
+
+
+def command_task_controls(task_id, limit=50):
+    try:
+        rows = list_task_controls(task_id, limit=limit)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data=[{"id": row.id, "seq": row.seq, "kind": row.kind,
+                              "state": row.state, "message": row.message,
+                              "payload": row.payload, "created_at": row.created_at,
+                              "applied_at": row.applied_at} for row in rows])
+    return 0
+
+
 def command_task_run(cfg, task_id, reasoning="hidden"):
     try:
         task = load_task(task_id)
@@ -1700,6 +1727,14 @@ def build_parser():
     task_runs = task_sub.add_parser("runs")
     task_runs.add_argument("task_id", nargs="?")
     task_runs.add_argument("--limit", type=int, default=20)
+    task_control = task_sub.add_parser("control")
+    task_control.add_argument("task_id")
+    task_control.add_argument("kind", choices=["cancel", "interrupt", "approval", "redirect",
+                                               "message", "pause", "resume"])
+    task_control.add_argument("message", nargs="?", default="")
+    task_controls = task_sub.add_parser("controls")
+    task_controls.add_argument("task_id")
+    task_controls.add_argument("--limit", type=int, default=50)
     for name in ["activate", "pause", "resume", "cancel", "complete"]:
         p = task_sub.add_parser(name)
         p.add_argument("task_id")
@@ -1923,6 +1958,10 @@ def main():
             return command_task_run(cfg, args.task_id, args.reasoning)
         if args.task_command == "runs":
             return command_task_runs(args.task_id, args.limit)
+        if args.task_command == "control":
+            return command_task_control(args.task_id, args.kind, args.message)
+        if args.task_command == "controls":
+            return command_task_controls(args.task_id, args.limit)
         if args.task_command == "delegate":
             return command_task_delegate(args)
         if args.task_command == "delegations":

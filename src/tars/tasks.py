@@ -255,10 +255,13 @@ def update_task(
 
 def canonical_task_state(task_id) -> dict:
     task = load_task(task_id)
+    from .control_queue import latest_redirect
+    redirect = latest_redirect(task_id)
     return {
         "task_id": task.id,
         "title": task.title,
         "goal": task.goal,
+        "current_instruction": redirect.message if redirect else task.goal,
         "owner_role": task.owner_role,
         "state": task.state,
         "kind": task.kind,

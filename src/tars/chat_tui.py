@@ -30,6 +30,7 @@ from .conversation import create_conversation, add_message
 from .tasks import active_task, append_event, list_tasks, load_task, set_active_task
 from .events import read_events, read_events_since
 from .runner import create_run, run_task_epoch, request_control, list_runs
+from .agent_loop import submit_task_control, is_task_loop_active
 from .temporary import TEMPORARY_NOTICE, TemporarySession
 from .themes import (
     VALID_LOGOS,
@@ -302,6 +303,14 @@ class ChatTUI:
         @kb.add("escape")
         def _escape(event):
             self.input.buffer.complete_state = None
+            if self.busy:
+                task = active_task()
+                if task:
+                    instruction = self.input.text.strip() or "Immediate interrupt requested."
+                    _, feedback = submit_task_control(task.id, "interrupt", instruction)
+                    self.input.buffer.reset()
+                    self._append_system(feedback)
+                    self.activity = "Interrupt pending"
             event.app.invalidate()
 
         self.style = Style.from_dict(prompt_toolkit_style(self.theme))
@@ -745,6 +754,10 @@ class ChatTUI:
             self._enqueue(QueueItem("temporary", self.role_id, value))
             return
         task = active_task()
+        if self.busy and task is not None and is_task_loop_active(task.id):
+            _, feedback = submit_task_control(task.id, "message", value)
+            self._append_system(feedback)
+            return
         add_message(
             self.conversation.id, "user", value, kind="message", include_in_context=True,
             related_task_id=task.id if task else None, metadata={"role_id": self.role_id},

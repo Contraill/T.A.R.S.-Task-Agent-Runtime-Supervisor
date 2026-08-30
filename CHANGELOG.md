@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.3 - Agent Loop and Live Steering
+
+- added a canonical model/action/policy/tool/evidence/checkpoint loop with real ToolResult enforcement
+- added deterministic repetition, no-progress, time, tool-failure, context-pressure and unsafe-retry guards
+- added durable ordered task controls for queued messages, interrupts, redirects, approvals, pause, resume and cancel
+- added truthful cancellable and pending non-cancellable interrupt handling at safe tool boundaries
+- added evidence-backed completion contracts and durable control inspection surfaces
+- added TUI queued-message feedback and Esc interrupt submission
+
 ## 0.7.2 - Native Tool Foundation
 
 - added typed filesystem, terminal/process, Git, user-service, Pacman and structured system tools

@@ -168,7 +168,19 @@ Status: implemented.
 
 See [TOOLS.md](TOOLS.md) for tool contracts and verified support boundaries.
 
-- v0.7.3: verified agent loop and live steering
+### v0.7.3 — verified agent loop and live steering
+
+Status: implemented.
+
+- canonical context → model decision → policy/tool → real ToolResult → evidence → checkpoint loop
+- evidence-backed completion contracts; model text alone cannot complete a task
+- repetition, no-progress, time, tool-failure, context-pressure and unsafe-retry guards
+- durable priority-ordered message, interrupt, approval, redirect, pause, resume and cancel controls
+- next-safe-boundary queued delivery with truthful cancellable/non-cancellable interrupt state
+- TUI queued-message feedback and Esc interrupt submission
+
+See [AGENT_LOOP.md](AGENT_LOOP.md) for loop, control and completion contracts.
+
 - v0.7.4: workspace checkpoints and rollback
 - v0.7.5: bounded delegation and subagents
 - v0.7.6: skills and guarded MCP interoperability

@@ -36,8 +36,9 @@ Implemented in the current reference build:
 - deterministic execution policy, scoped approvals and redacted action audit records
 - guarded host execution, rootless container isolation and an experimental bounded SSH backend
 - typed native tools, artifact utilities, source evidence, optional Tavily research and isolated browser automation
+- verified autonomous task loops with durable queued messages, interrupt and redirect controls
 
-The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0–v0.7.2 trusted policy, execution and native-tool foundations are implemented.
+The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0–v0.7.3 trusted execution and agent-loop foundations are implemented.
 
 ## Roles
 
