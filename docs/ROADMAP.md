@@ -224,9 +224,21 @@ Status: implemented.
 
 See [SKILLS_MCP.md](SKILLS_MCP.md) and [GENERATION.md](GENERATION.md) for support and policy details.
 
-## v0.8.x — future work, remote use and portability
+## v0.8.x — durable automation, remote use and portability
 
-- one-shot, cron and condition/watch tasks
+### v0.8.0 — durable scheduler
+
+Status: implemented.
+
+- one-shot, recurring interval and condition/watch schedules over canonical tasks
+- durable idempotent run journal, checkpoint recovery and missed-run policy
+- bounded concurrency, delivery state and pause/edit/archive controls
+- event-driven waiting with no inference model residency
+
+See [SCHEDULER.md](SCHEDULER.md) for scheduling and recovery semantics.
+
+### Remaining v0.8.x work
+
 - Core/client API
 - optional Tailscale Serve integration
 - Oracle/Colibri backend

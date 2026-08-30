@@ -1,11 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - Durable Scheduler and TUI Transcript
 
 - replaced the TUI's joined-line transcript with structured user, assistant, system, tool and error entries
 - stream ordinary assistant content directly into the selectable Conversation viewer using buffered updates
 - added rail-based message hierarchy, OS/configured display names, scroll follow control and new-output indication
 - added mouse and keyboard transcript navigation plus selection-only clipboard copy
+- added durable one-shot, recurring interval and model-free condition/watch schedules
+- added idempotent run journals, missed-run policies, checkpoint-aware restart recovery and bounded concurrency
+- added durable delivery state plus schedule pause, resume, edit, archive, health and run inspection controls
+- kept scheduler waiting event-driven and independent of inference model residency
 
 ## 0.7.6 - Skills, MCP and Generation Policy
 

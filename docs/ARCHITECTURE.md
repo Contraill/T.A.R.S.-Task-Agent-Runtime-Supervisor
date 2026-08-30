@@ -36,4 +36,4 @@ Memory           ScopeGuard
 
 ## Current state
 
-The v0.5 line contains runtime configuration, model lifecycle, objective calibration and the local RuntimeBackend boundary. v0.6.0 adds the canonical session/event store, shared identity and PromptCompiler. Tool execution remains gated on the later ScopeGuard and ToolRegistry layers.
+The implemented platform includes local runtime lifecycle, canonical continuity state, guarded tool execution, durable delegation and a model-free scheduler. Schedules reference canonical tasks and checkpoints; they do not keep inference models resident while waiting. Core API and portability layers remain separate later boundaries.

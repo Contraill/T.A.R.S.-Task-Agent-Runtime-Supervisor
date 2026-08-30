@@ -70,6 +70,17 @@ def test_memory_maintenance_cli_parsing():
     assert args.memory_command == "maintain" and args.trigger == "scheduled" and args.apply
 
 
+def test_scheduler_cli_surface():
+    parser = build_parser()
+    add = parser.parse_args([
+        "schedule", "add", "task-one", "recurring", "every 10m",
+        "--missed", "catch-up", "--max-catch-up", "3",
+    ])
+    assert add.schedule_command == "add" and add.max_catch_up == 3
+    assert parser.parse_args(["schedule", "pause", "sch-one"]).schedule_id == "sch-one"
+    assert parser.parse_args(["schedule", "run-due"]).schedule_command == "run-due"
+
+
 def test_policy_approval_and_audit_cli_parsing():
     parser = build_parser()
     scope = parser.parse_args([

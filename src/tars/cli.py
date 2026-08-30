@@ -120,8 +120,74 @@ from .workspace_recovery import (WorkspaceRecovery, load as load_workspace_check
 from .skills import SkillRegistry
 from .mcp import (MCPClient, list_servers as list_mcp_servers,
                   register as register_mcp_server, set_enabled as set_mcp_enabled)
+from .scheduler import (Scheduler, create_schedule, edit_schedule, list_runs as list_schedule_runs,
+                        health as scheduler_health, list_schedules, load_schedule, remove_schedule,
+                        set_enabled as set_schedule_enabled)
 
 console = Console()
+
+
+def command_schedule_list():
+    table = Table(title="Schedules")
+    for column in ("ID", "Task", "Kind", "Expression", "Next", "State"):
+        table.add_column(column)
+    for item in list_schedules():
+        table.add_row(item.id, item.task_id, item.kind, item.expression,
+                      item.next_run_at or "-", "enabled" if item.enabled else "paused")
+    console.print(table)
+
+
+def command_schedule_show(schedule_id):
+    item = load_schedule(schedule_id)
+    console.print_json(data={
+        "id": item.id, "task_id": item.task_id, "kind": item.kind,
+        "expression": item.expression, "timezone": item.timezone,
+        "next_run_at": item.next_run_at, "missed_policy": item.missed_policy,
+        "max_catch_up": item.max_catch_up, "enabled": item.enabled,
+        "concurrency_key": item.concurrency_key,
+        "max_concurrency": item.max_concurrency,
+        "delivery_target": item.delivery_target,
+        "revision": item.revision, "removed_at": item.removed_at,
+    })
+
+
+def command_schedule_add(args):
+    item = create_schedule(
+        args.task_id, args.kind, args.expression, next_run_at=args.next,
+        missed_policy=args.missed, max_catch_up=args.max_catch_up,
+        concurrency_key=args.concurrency_key, max_concurrency=args.max_concurrency,
+        delivery_target=args.delivery_target)
+    console.print(f"[green]Registered[/green] {item.id} · next {item.next_run_at or '-'}")
+
+
+def command_schedule_runs(schedule_id, limit):
+    table = Table(title="Schedule Run Journal")
+    for column in ("Run", "Schedule", "Planned", "State", "Attempt", "Checkpoint"):
+        table.add_column(column)
+    for run in list_schedule_runs(schedule_id, limit=limit):
+        table.add_row(run.id, run.schedule_id, run.planned_for, run.state,
+                      str(run.attempt), run.checkpoint_id or "-")
+    console.print(table)
+
+
+def command_schedule_run_due(cfg):
+    engine = Scheduler(max_concurrency=int(cfg.get("scheduler", {}).get("max_concurrency", 1)))
+    recovered = engine.recover()
+    claimed = engine.claim_due()
+
+    def execute(scheduled_run):
+        run = create_run(scheduled_run.task_id)
+        outcome = run_task_epoch(cfg, run.id)
+        finished = outcome["run"]
+        if finished.state in {"failed", "cancelled"}:
+            raise RuntimeError(f"task run {finished.id} {finished.state}: {finished.error or finished.finish_reason}")
+        return {"task_run_id": finished.id, "state": finished.state,
+                "finish_reason": finished.finish_reason,
+                "checkpoint_id": outcome.get("checkpoint_id")}
+
+    completed = engine.execute_claimed(execute)
+    console.print(f"Recovered {recovered} · claimed {len(claimed)} · completed {len(completed)}")
+    return 1 if any(run.state == "failed" for run in completed) else 0
 
 
 def command_status(cfg):
@@ -1877,6 +1943,39 @@ def build_parser():
         help="confirm Role Registry and runtime config transaction",
     )
 
+    schedule = sub.add_parser("schedule", help="durable model-free scheduling")
+    schedule_sub = schedule.add_subparsers(dest="schedule_command", required=True)
+    schedule_sub.add_parser("list")
+    schedule_sub.add_parser("status")
+    schedule_show = schedule_sub.add_parser("show")
+    schedule_show.add_argument("schedule_id")
+    schedule_add = schedule_sub.add_parser("add")
+    schedule_add.add_argument("task_id")
+    schedule_add.add_argument("kind", choices=["one-shot", "recurring", "condition"])
+    schedule_add.add_argument("expression")
+    schedule_add.add_argument("--next")
+    schedule_add.add_argument("--missed", choices=["skip", "run-once", "catch-up"], default="run-once")
+    schedule_add.add_argument("--max-catch-up", type=int, default=1)
+    schedule_add.add_argument("--concurrency-key", default="default")
+    schedule_add.add_argument("--max-concurrency", type=int, default=1)
+    schedule_add.add_argument("--delivery-target", default="")
+    for name in ("pause", "resume", "remove"):
+        command = schedule_sub.add_parser(name)
+        command.add_argument("schedule_id")
+    schedule_edit = schedule_sub.add_parser("edit")
+    schedule_edit.add_argument("schedule_id")
+    schedule_edit.add_argument("--expression")
+    schedule_edit.add_argument("--next")
+    schedule_edit.add_argument("--missed", choices=["skip", "run-once", "catch-up"])
+    schedule_edit.add_argument("--max-catch-up", type=int)
+    schedule_edit.add_argument("--concurrency-key")
+    schedule_edit.add_argument("--max-concurrency", type=int)
+    schedule_edit.add_argument("--delivery-target")
+    schedule_runs = schedule_sub.add_parser("runs")
+    schedule_runs.add_argument("schedule_id", nargs="?")
+    schedule_runs.add_argument("--limit", type=int, default=50)
+    schedule_sub.add_parser("run-due")
+
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="task_command", required=True)
     task_list = task_sub.add_parser("list")
@@ -2136,6 +2235,40 @@ def main():
             return command_runtime_apply(cfg, yes=args.yes)
         if args.runtime_command == "switch":
             return command_runtime_switch(cfg, args)
+
+    if args.command == "schedule":
+        if args.schedule_command == "list":
+            return command_schedule_list()
+        if args.schedule_command == "status":
+            report = scheduler_health()
+            console.print_json(data=report)
+            return 0 if report["ok"] else 1
+        if args.schedule_command == "show":
+            return command_schedule_show(args.schedule_id)
+        if args.schedule_command == "add":
+            return command_schedule_add(args)
+        if args.schedule_command == "pause":
+            set_schedule_enabled(args.schedule_id, False)
+            return 0
+        if args.schedule_command == "resume":
+            set_schedule_enabled(args.schedule_id, True)
+            return 0
+        if args.schedule_command == "remove":
+            remove_schedule(args.schedule_id)
+            return 0
+        if args.schedule_command == "edit":
+            item = edit_schedule(
+                args.schedule_id, expression=args.expression, next_run_at=args.next,
+                missed_policy=args.missed, max_catch_up=args.max_catch_up,
+                concurrency_key=args.concurrency_key,
+                max_concurrency=args.max_concurrency,
+                delivery_target=args.delivery_target)
+            console.print(f"[green]Updated[/green] {item.id} · revision {item.revision}")
+            return 0
+        if args.schedule_command == "runs":
+            return command_schedule_runs(args.schedule_id, args.limit)
+        if args.schedule_command == "run-due":
+            return command_schedule_run_due(cfg)
 
     if args.command == "task":
         if args.task_command == "list":

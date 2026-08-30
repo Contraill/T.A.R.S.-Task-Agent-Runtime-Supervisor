@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def now_utc() -> str:
@@ -322,6 +322,65 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_tasks_schedule
         ON tasks(schedule_kind, next_run_at);
 
+    CREATE TABLE IF NOT EXISTS schedules (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        kind TEXT NOT NULL CHECK(kind IN ('one-shot','recurring','condition')),
+        expression TEXT NOT NULL,
+        timezone TEXT NOT NULL DEFAULT 'UTC',
+        next_run_at TEXT,
+        missed_policy TEXT NOT NULL DEFAULT 'run-once'
+            CHECK(missed_policy IN ('skip','run-once','catch-up')),
+        max_catch_up INTEGER NOT NULL DEFAULT 1 CHECK(max_catch_up >= 1),
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+        concurrency_key TEXT NOT NULL DEFAULT 'default',
+        max_concurrency INTEGER NOT NULL DEFAULT 1 CHECK(max_concurrency >= 1),
+        delivery_target TEXT NOT NULL DEFAULT '',
+        condition_state INTEGER NOT NULL DEFAULT 0 CHECK(condition_state IN (0,1)),
+        revision INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        removed_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_active_task
+        ON schedules(task_id) WHERE removed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_schedules_due
+        ON schedules(enabled, next_run_at) WHERE removed_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS schedule_runs (
+        id TEXT PRIMARY KEY,
+        schedule_id TEXT NOT NULL REFERENCES schedules(id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        planned_for TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN
+            ('claimed','running','succeeded','failed','skipped','cancelled')),
+        attempt INTEGER NOT NULL DEFAULT 1,
+        checkpoint_id TEXT REFERENCES checkpoints(id),
+        result_json TEXT NOT NULL DEFAULT '{}',
+        error TEXT NOT NULL DEFAULT '',
+        claimed_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_runs_planned
+        ON schedule_runs(schedule_id, planned_for);
+    CREATE INDEX IF NOT EXISTS idx_schedule_runs_state
+        ON schedule_runs(state, claimed_at);
+
+    CREATE TABLE IF NOT EXISTS schedule_deliveries (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE REFERENCES schedule_runs(id),
+        target TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending','delivered','failed','suppressed')),
+        attempt INTEGER NOT NULL DEFAULT 0,
+        result_json TEXT NOT NULL DEFAULT '{}',
+        error TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_schedule_deliveries_state
+        ON schedule_deliveries(state, updated_at);
+
     CREATE TABLE IF NOT EXISTS task_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_uuid TEXT NOT NULL UNIQUE,
@@ -573,7 +632,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,
