@@ -41,6 +41,7 @@ from .memory import (
     search as search_memory,
     status as memory_status,
 )
+from .memory_maintenance import list_runs as list_maintenance_runs, run_maintenance
 from .roles import (
     bind_model,
     create_role,
@@ -471,6 +472,21 @@ def command_memory(args):
             console.print(f"{args.candidate_id}: {'promoted to ' + entry.id if entry else 'rejected'}")
             return 0
         console.print_json(data=review_candidates())
+        return 0
+    if args.memory_command == "maintain":
+        run = run_maintenance(trigger=args.trigger, apply=args.apply)
+        console.print_json(data={
+            "id": run.id, "trigger": run.trigger, "mode": run.mode,
+            "status": run.status, "report": run.report,
+            "actions": list(run.actions), "rollback_refs": list(run.rollback_refs),
+        })
+        return 0 if run.status == "completed" else 1
+    if args.memory_command == "maintenance-runs":
+        console.print_json(data=[{
+            "id": run.id, "trigger": run.trigger, "mode": run.mode,
+            "status": run.status, "created_at": run.created_at,
+            "model_provenance": run.model_provenance,
+        } for run in list_maintenance_runs(args.limit)])
         return 0
     return 2
 
@@ -1414,6 +1430,14 @@ def build_parser():
     decision.add_argument("--promote", action="store_true")
     decision.add_argument("--reject", action="store_true")
     memory_review.add_argument("--reason", default="")
+    memory_maintain = memory_sub.add_parser("maintain")
+    memory_maintain.add_argument(
+        "--trigger", default="explicit",
+        choices=["explicit", "session_close", "context_rollover", "scheduled"],
+    )
+    memory_maintain.add_argument("--apply", action="store_true")
+    memory_runs = memory_sub.add_parser("maintenance-runs")
+    memory_runs.add_argument("--limit", type=int, default=50)
 
     role = sub.add_parser("role")
     role_sub = role.add_subparsers(dest="role_command", required=True)

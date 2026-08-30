@@ -61,3 +61,10 @@ def test_context_epoch_cli_parsing():
 def test_temporary_cli_parsing():
     args = build_parser().parse_args(["temporary", "--role", "general"])
     assert args.command == "temporary" and args.role == "general"
+
+
+def test_memory_maintenance_cli_parsing():
+    args = build_parser().parse_args([
+        "memory", "maintain", "--trigger", "scheduled", "--apply",
+    ])
+    assert args.memory_command == "maintain" and args.trigger == "scheduled" and args.apply

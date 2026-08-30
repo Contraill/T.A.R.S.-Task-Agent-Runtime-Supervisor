@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def now_utc() -> str:
@@ -170,6 +170,21 @@ def _schema_sql() -> str:
         created_at TEXT NOT NULL,
         reviewed_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS memory_maintenance_runs (
+        id TEXT PRIMARY KEY,
+        trigger TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        report_json TEXT NOT NULL DEFAULT '{}',
+        actions_json TEXT NOT NULL DEFAULT '[]',
+        rollback_refs_json TEXT NOT NULL DEFAULT '[]',
+        model_provenance_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_maintenance_created
+        ON memory_maintenance_runs(created_at DESC);
 
     CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
@@ -420,7 +435,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,

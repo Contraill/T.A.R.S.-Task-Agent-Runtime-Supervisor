@@ -32,8 +32,9 @@ Implemented in the current reference build:
 - inspectable durable memory with offline lexical retrieval and rebuildable indexes
 - bounded context with atomic task-preserving Context Epoch rollover
 - conspicuous Temporary sessions that leave no new durable T.A.R.S. state
+- optional inspectable memory maintenance and provenance-backed reflection staging
 
-The v0.5 runtime substrate and v0.6.0–v0.6.3 continuity, memory, context and Temporary-session foundations are implemented.
+The v0.5 runtime substrate and complete v0.6 continuity, identity, memory, context, Temporary-session and maintenance foundations are implemented.
 
 ## Roles
 

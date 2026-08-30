@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.4 - Memory Maintenance and Reflection
+
+- added inspectable maintenance runs for explicit, session-close, context-rollover and scheduled triggers
+- added model-free duplicate, supersession, expiry, index-drift and prompt-pressure audits
+- added recoverable expired-memory cleanup and derived-index repair with rollback references
+- added model-assisted reflection staging with required model/backend provenance
+- kept reflection proposals in candidate review rather than promoting model output directly
+- added memory maintenance and maintenance-run inspection commands
+
 ## 0.6.3 - Temporary Sessions
 
 - added `tars temporary` and interactive `/temporary` entry points

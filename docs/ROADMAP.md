@@ -117,6 +117,16 @@ Status: implemented.
 
 See [TEMPORARY.md](TEMPORARY.md) for the persistence contract.
 
+## v0.6.4 — memory maintenance and reflection
+
+Status: implemented.
+
+- optional explicit, session-close, context-rollover and scheduled triggers
+- model-free duplicate, supersession, expiry, index-drift and prompt-pressure audits
+- recoverable expiry cleanup and derived-index repair
+- reflection proposals staged for review with model/backend provenance
+- inspectable maintenance actions and rollback references
+
 ## v0.7.x — tools and real agent loop
 
 - ScopeGuard
