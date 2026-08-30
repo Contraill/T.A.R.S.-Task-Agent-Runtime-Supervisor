@@ -56,3 +56,8 @@ def test_context_epoch_cli_parsing():
     assert epochs.task_id == "task-one"
     search = parser.parse_args(["context", "search", "conv-one", "needle"])
     assert search.conversation_id == "conv-one" and search.query == "needle"
+
+
+def test_temporary_cli_parsing():
+    args = build_parser().parse_args(["temporary", "--role", "general"])
+    assert args.command == "temporary" and args.role == "general"

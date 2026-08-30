@@ -103,6 +103,7 @@ from .tasks import (
     checkpoint_task,
     canonical_task_state,
 )
+from .temporary import run_temporary
 
 console = Console()
 
@@ -1339,6 +1340,8 @@ def build_parser():
 
     chat = sub.add_parser("chat")
     chat.add_argument("--role", default=None)
+    temporary = sub.add_parser("temporary", help="start an ephemeral conversation")
+    temporary.add_argument("--role", default=None)
 
     sub.add_parser("status")
     sub.add_parser("agents")
@@ -1602,6 +1605,8 @@ def main():
         return run_chat(cfg)
     if args.command == "chat":
         return run_chat(cfg, initial_role=args.role)
+    if args.command == "temporary":
+        return run_temporary(cfg, role_id=args.role or default_role_id())
     if args.command == "status":
         return command_status(cfg)
     if args.command == "agents":

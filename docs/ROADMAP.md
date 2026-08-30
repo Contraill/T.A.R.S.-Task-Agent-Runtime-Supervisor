@@ -106,6 +106,8 @@ The mechanism lands here; the final First Awakening remains late in the release 
 
 ## v0.6.3 — temporary sessions
 
+Status: implemented.
+
 - `tars temporary` and `/temporary` isolated ephemeral sessions
 - temporary conversation/task/context/tool trace lives in memory only
 - existing persistent identity/preferences/memory may be read, never mutated by the temporary session

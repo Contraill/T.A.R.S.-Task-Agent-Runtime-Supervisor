@@ -2,7 +2,7 @@
 
 Temporary mode is an ephemeral T.A.R.S. session. It is intended for work that may use normal reasoning and tools but must not become part of T.A.R.S.'s durable personal state.
 
-Planned entry points:
+Entry points:
 
 ```text
 tars temporary
@@ -29,11 +29,11 @@ Closing temporary mode discards the entire ephemeral session. A crash also disca
 
 `tars temporary` starts a new ephemeral session and may read already-persisted identity, preferences and memory that the user has allowed T.A.R.S. to use. Those persistent sources are read-only for the lifetime of the temporary session.
 
-Entering `/temporary` from a normal conversation creates an isolated ephemeral branch from a read-only snapshot of the current context. Leaving temporary mode returns to the normal conversation at the pre-temporary point. Temporary messages do not appear in normal history afterwards.
+Entering `/temporary` from a normal conversation creates an isolated in-memory branch. It reads canonical identity and memory and uses the active Role's existing context budget without writing a context projection. Leaving Temporary mode returns to the same normal conversation at the pre-temporary point. Temporary messages do not appear in normal history afterwards.
 
 ## Tools
 
-Tools remain available subject to the same ScopeGuard and permission policy as normal operation. T.A.R.S. does not persist its own temporary tool/activity trace after the session ends.
+Tools remain subject to the same ScopeGuard and permission policy as normal operation when the tool loop is available. T.A.R.S. does not persist its own temporary tool/activity trace after the session ends.
 
 Temporary mode is not an undo mechanism or operating-system privacy sandbox. External side effects remain real. A tool may create or edit files, make Git commits, change a service, contact an API, or cause logs to be written by another program or remote system. T.A.R.S. cannot erase those effects merely because its own session is temporary.
 
@@ -43,4 +43,4 @@ Immediate ephemeral delegation is allowed once the agent loop supports it. Anyth
 
 ## UI
 
-Temporary state should always be conspicuous in the CLI/TUI, for example with a pinned `TEMPORARY` indicator. Exiting temporary mode should explicitly confirm that the ephemeral state was discarded.
+The standalone CLI displays a `TEMPORARY` prompt. The TUI pins a `TEMPORARY` indicator and uses in-memory input history until the mode exits. Exiting confirms that ephemeral state was discarded.

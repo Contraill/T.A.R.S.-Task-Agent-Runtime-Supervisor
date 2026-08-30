@@ -27,8 +27,9 @@ def ensure_identity_files() -> None:
         SOUL_PATH.write_text("# Operating principles\n\nPreserve truth, continuity, and user control.\n", encoding="utf-8")
 
 
-def load_identity(role_id: str) -> IdentityBundle:
-    ensure_identity_files()
+def load_identity(role_id: str, *, create=True) -> IdentityBundle:
+    if create:
+        ensure_identity_files()
     overlay = ROLE_PERSONA_ROOT / f"{role_id}.md"
     sources = [str(IDENTITY_PATH), str(SOUL_PATH)]
     if overlay.is_file():

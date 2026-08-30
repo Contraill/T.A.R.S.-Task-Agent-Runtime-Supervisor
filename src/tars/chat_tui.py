@@ -13,7 +13,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.history import FileHistory
+from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import ConditionalContainer, Dimension, DynamicContainer, FormattedTextControl, HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.margins import ScrollbarMargin
@@ -30,6 +30,7 @@ from .conversation import create_conversation, add_message
 from .tasks import active_task, append_event, list_tasks, load_task, set_active_task
 from .events import read_events, read_events_since
 from .runner import create_run, run_task_epoch, request_control, list_runs
+from .temporary import TEMPORARY_NOTICE, TemporarySession
 from .themes import (
     VALID_LOGOS,
     current_logo,
@@ -60,6 +61,7 @@ STATIC_COMMANDS = [
     ("/theme [name]", "Show or change UI color theme"),
     ("/logo [mode]", "Show or change HUD logo mode"),
     ("/new", "Clear conversation only; task state stays"),
+    ("/temporary", "Enter or exit ephemeral conversation mode"),
     ("/help", "Show all commands"),
     ("/quit", "Exit chat"),
 ]
@@ -149,6 +151,7 @@ class CommandCompleter(Completer):
             ("/theme", "UI color theme"),
             ("/logo", "HUD logo mode"),
             ("/new", "new conversation"),
+            ("/temporary", "ephemeral conversation mode"),
             ("/help", "command help"),
             ("/quit", "exit"),
         ]
@@ -206,9 +209,11 @@ class ChatTUI:
         self.live_stream_started = None
         self.live_reasoning_chars = 0
         self._event_cursor: dict[str, int] = {}
+        self.temporary: TemporarySession | None = None
 
         CHAT_STATE_ROOT.mkdir(parents=True, exist_ok=True)
         history = FileHistory(str(CHAT_STATE_ROOT / "prompt-history.txt"))
+        self._persistent_history = history
 
         self.output = TextArea(
             text="",
@@ -467,6 +472,7 @@ class ChatTUI:
         pct_text = f"{ratio * 100:.0f}%" if maximum else "—"
 
         return FormattedText([
+            ("class:error", " TEMPORARY " if self.temporary else ""),
             ("class:role", f" {role.display_name}"),
             ("class:dim", "  •  "),
             ("class:model", self._model_name()),
@@ -732,6 +738,12 @@ class ChatTUI:
                 return
 
         self._append_user(value)
+        if self.temporary is not None:
+            if self.busy or self.queued:
+                self._append_system("Wait for the current TEMPORARY response before sending another turn.")
+                return
+            self._enqueue(QueueItem("temporary", self.role_id, value))
+            return
         task = active_task()
         add_message(
             self.conversation.id, "user", value, kind="message", include_in_context=True,
@@ -751,6 +763,28 @@ class ChatTUI:
         if command == "/help":
             text = "\n".join(f"{usage:<36} {desc}" for usage, desc in STATIC_COMMANDS)
             self._append("Help ·", text)
+            return True
+
+        if command == "/temporary":
+            if self.busy or self.queued:
+                self._append_system("Wait for active inference to finish before changing mode.")
+                return True
+            if self.temporary is None:
+                self.temporary = TemporarySession(self.cfg, self.role_id)
+                self.input.buffer.history = InMemoryHistory()
+                self._append_system(TEMPORARY_NOTICE)
+            else:
+                self.temporary.close()
+                self.temporary = None
+                self.input.buffer.history = self._persistent_history
+                self._append_system("TEMPORARY ended. Ephemeral state was discarded; normal conversation resumed.")
+            self.app.invalidate()
+            return True
+
+        if self.temporary is not None and command in {
+            "/new", "/run", "/resume", "/pause", "/cancel", "/ask",
+        }:
+            self._append_system(f"{command} is unavailable in TEMPORARY mode.")
             return True
 
         if command == "/status":
@@ -914,6 +948,8 @@ class ChatTUI:
             self._append_system(f"{role.display_name} is disabled.")
             return True
         self.role_id = role_id
+        if self.temporary is not None:
+            self.temporary.role_id = role_id
         self.activity = f"Role: {role.display_name}"
         self._append_system(f"Role switched to {role.display_name}. Task state unchanged.")
         self.app.invalidate()
@@ -1126,6 +1162,17 @@ class ChatTUI:
                             f"Task reasoning epoch finished for {item.task_id}. Durable result/checkpoint written; task paused for the next safe continuation."
                         )
 
+                elif item.kind == "temporary":
+                    if self.temporary is None:
+                        raise RuntimeError("temporary mode ended before queued inference")
+                    response = await asyncio.to_thread(self.temporary.send, item.text)
+                    content, raw, finish = self._response_parts(response)
+                    if self.reasoning == "raw" and raw:
+                        self._append(f"{role_name} · raw", raw[-16000:])
+                    self._append_assistant(
+                        item.role_id, content or f"[no final content · {finish}]"
+                    )
+
                 elif item.kind == "sideband":
                     task = active_task()
                     if task:
@@ -1218,6 +1265,9 @@ class ChatTUI:
         try:
             return self.app.run(pre_run=self._pre_run)
         finally:
+            if self.temporary is not None:
+                self.temporary.close()
+                self.temporary = None
             self._closed = True
 
 

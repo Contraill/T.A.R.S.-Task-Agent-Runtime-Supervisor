@@ -49,10 +49,10 @@ class PromptCompiler:
     def compile(self, *, role_name, conversation_id=None, task_id=None, project_path=None,
                 personal_memory=(), memory_query=None, memory_scope=None,
                 evidence=(), skills=(), tool_schemas=(), pending_controls=(),
-                recent_limit=100):
+                recent_limit=100, create_identity=True):
         role_id = resolve_role_id(role_name)
         role = get_role(role_id)
-        identity = load_identity(role_id)
+        identity = load_identity(role_id, create=create_identity)
         sources = [
             _source("base_identity", f"{identity.identity}\n\n{identity.soul}", protected=True,
                     provenance=identity.sources[:2]),
@@ -86,8 +86,10 @@ class PromptCompiler:
             sources.append(_source("tool_schemas", json.dumps(list(tool_schemas), ensure_ascii=False)))
         if pending_controls:
             sources.append(_source("pending_controls", "\n".join(map(str, pending_controls)), protected=True))
-        messages = [{"role": "system", "content": f"[{s.name}]\n{s.content}"}
-                    for s in sources if s.content]
+        system_content = "\n\n".join(
+            f"[{source.name}]\n{source.content}" for source in sources if source.content
+        )
+        messages = [{"role": "system", "content": system_content}] if system_content else []
         if conversation_id:
             records = list_messages(conversation_id, include_sideband=False, limit=recent_limit)
             history = [{"role": r.role, "content": r.content} for r in records

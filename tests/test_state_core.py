@@ -78,7 +78,8 @@ def test_identity_inheritance_and_prompt_explain(monkeypatch, tmp_path):
     names = [source["name"] for source in explanation["sources"]]
     assert names == ["base_identity", "role_overlay", "capabilities", "personal_memory", "pending_controls"]
     assert explanation["sources"][-1]["protected"]
-    assert "Be concise" in compiled.messages[1]["content"]
+    assert len([message for message in compiled.messages if message["role"] == "system"]) == 1
+    assert "Be concise" in compiled.messages[0]["content"]
 
 
 def test_reasoning_visibility_never_synthesizes_raw():

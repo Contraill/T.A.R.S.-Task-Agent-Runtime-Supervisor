@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.3 - Temporary Sessions
+
+- added `tars temporary` and interactive `/temporary` entry points
+- added coherent in-memory multi-turn sessions using existing identity, memory and context budgets read-only
+- prevented temporary turns from entering conversation, task, checkpoint, context-projection, memory and scheduler stores
+- used in-memory command history while the TUI is in Temporary mode
+- blocked durable task controls and sideband persistence from Temporary mode
+- restored the pre-temporary normal conversation after exit and discarded ephemeral state on exit or crash
+
 ## 0.6.2 - Context Engine and Context Epochs
 
 - added explicit soft, hard and emergency context-pressure watermarks

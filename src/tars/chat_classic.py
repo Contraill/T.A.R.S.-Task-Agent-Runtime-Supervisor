@@ -18,6 +18,7 @@ from .roles import (
 from .runtime import chat_completion, runtime_models
 from .conversation import create_conversation, add_message
 from .tasks import active_task, append_event, list_tasks, load_task
+from .temporary import TEMPORARY_NOTICE, TemporarySession
 
 console = Console()
 
@@ -108,6 +109,7 @@ def _show_help():
         ("/progress quiet|normal|verbose", "progress event visibility"),
         ("/reasoning hidden|raw", "backend reasoning visibility"),
         ("/new", "clear current conversation only"),
+        ("/temporary", "enter or exit ephemeral conversation mode"),
         ("/help", "show this help"),
         ("/quit", "exit chat"),
     ]
@@ -255,6 +257,7 @@ def run_chat(cfg, *, initial_role=None):
         progress_mode = "normal"
 
     messages = []
+    temporary = None
     conversation = create_conversation(
         title="T.A.R.S. chat", source="chat-classic",
         metadata={"initial_role": role_id}, make_active=True,
@@ -294,6 +297,30 @@ def run_chat(cfg, *, initial_role=None):
                     _show_help()
                     continue
 
+                if command == "/temporary":
+                    if temporary is None:
+                        temporary = TemporarySession(cfg, role_id)
+                        try:
+                            import readline
+                            readline.set_auto_history(False)
+                        except (ImportError, AttributeError):
+                            pass
+                        console.print(Panel(TEMPORARY_NOTICE, title="TEMPORARY", border_style="red"))
+                    else:
+                        temporary.close()
+                        temporary = None
+                        try:
+                            import readline
+                            readline.set_auto_history(True)
+                        except (ImportError, AttributeError):
+                            pass
+                        console.print("[bold red]TEMPORARY ended; ephemeral state discarded.[/bold red]")
+                    continue
+
+                if temporary is not None and command not in {"/quit", "/exit", "/help", "/role"}:
+                    console.print(f"[yellow]{command} is unavailable in TEMPORARY mode.[/yellow]")
+                    continue
+
                 if command == "/new":
                     messages.clear()
                     conversation = create_conversation(
@@ -330,6 +357,8 @@ def run_chat(cfg, *, initial_role=None):
                         )
                         continue
                     role_id = requested_role.id
+                    if temporary is not None:
+                        temporary.role_id = role_id
                     console.print()
                     _banner(role_id, reasoning, progress_mode)
                     continue
@@ -347,6 +376,8 @@ def run_chat(cfg, *, initial_role=None):
                         )
                         continue
                     role_id = shortcut_role.id
+                    if temporary is not None:
+                        temporary.role_id = role_id
                     console.print()
                     _banner(role_id, reasoning, progress_mode)
                     continue
@@ -422,6 +453,16 @@ def run_chat(cfg, *, initial_role=None):
                 )
                 continue
 
+            if temporary is not None:
+                try:
+                    with console.status("[bold red]TEMPORARY response…[/bold red]", spinner="dots"):
+                        response = temporary.send(value)
+                except Exception as exc:
+                    console.print(Panel(str(exc), title="TEMPORARY runtime error", border_style="red"))
+                    continue
+                _print_response(response, reasoning)
+                continue
+
             messages.append({"role": "user", "content": value})
 
             try:
@@ -451,6 +492,13 @@ def run_chat(cfg, *, initial_role=None):
             )
 
     finally:
+        if temporary is not None:
+            temporary.close()
+            try:
+                import readline
+                readline.set_auto_history(True)
+            except (ImportError, AttributeError):
+                pass
         _save_readline(history)
 
     console.print("[dim]Session closed.[/dim]")

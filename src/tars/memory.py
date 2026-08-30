@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import tempfile
 import uuid
 
@@ -180,13 +181,24 @@ def find_duplicate(content, *, scope):
     return None
 
 
-def search(query, *, scope=None, kind=None, limit=10):
-    ensure_state_store()
+def search(query, *, scope=None, kind=None, limit=10, initialize=True):
+    readonly_path = None
+    if initialize:
+        ensure_state_store()
+    else:
+        from . import state_store
+        if not state_store.STATE_DB_PATH.is_file():
+            return []
+        readonly_path = state_store.STATE_DB_PATH
     query = str(query).strip()
     if not query:
         return []
+    terms = re.findall(r"[\w-]+", query, flags=re.UNICODE)
+    if not terms:
+        return []
+    fts_query = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
     clauses = ["memory_fts MATCH ?"]
-    params = [query]
+    params = [fts_query]
     if scope:
         clauses.append("m.scope=?")
         params.append(scope)
@@ -197,7 +209,11 @@ def search(query, *, scope=None, kind=None, limit=10):
     clauses.append("(m.expiry IS NULL OR m.expiry > ?)")
     clauses.append("NOT EXISTS (SELECT 1 FROM memory_index newer WHERE newer.supersedes=m.id)")
     params.extend([now_utc(), int(limit)])
-    conn = connect()
+    if readonly_path is None:
+        conn = connect()
+    else:
+        conn = sqlite3.connect(f"file:{readonly_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
             f"""SELECT m.*, bm25(memory_fts) AS rank FROM memory_fts
@@ -209,7 +225,7 @@ def search(query, *, scope=None, kind=None, limit=10):
         conn.close()
     hits = []
     for row in rows:
-        entry = inspect(row["id"])
+        entry = _parse(Path(row["path"]))
         signals = ["fts5", f"scope:{entry.scope}", f"confidence:{entry.confidence:g}", "recency"]
         hits.append(MemoryHit(entry, float(-row["rank"]), tuple(signals)))
     return hits
