@@ -48,3 +48,11 @@ def test_memory_cli_parsing():
     assert remember.memory_command == "remember" and remember.tag == ["preference"]
     search = parser.parse_args(["memory", "search", "concise", "--limit", "3"])
     assert search.query == "concise" and search.limit == 3
+
+
+def test_context_epoch_cli_parsing():
+    parser = build_parser()
+    epochs = parser.parse_args(["context", "epochs", "task-one"])
+    assert epochs.task_id == "task-one"
+    search = parser.parse_args(["context", "search", "conv-one", "needle"])
+    assert search.conversation_id == "conv-one" and search.query == "needle"

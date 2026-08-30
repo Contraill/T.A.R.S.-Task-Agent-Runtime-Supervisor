@@ -68,6 +68,7 @@ from .runtime_config import (
 from .state_store import health as state_store_health
 from .conversation import create_conversation, list_conversations, load_conversation, list_messages, active_conversation
 from .context import ContextManager, latest_projection
+from .context_epochs import list_epochs, search_transcript
 from .checkpoints import list_checkpoints, verify_checkpoint
 from .themes import (
     VALID_LOGOS,
@@ -1315,6 +1316,22 @@ def command_context_show(cfg, role_name=None, conversation_id=None, exact=False)
     return 0
 
 
+def command_context_epochs(task_id, limit):
+    console.print_json(data=[{
+        "id": epoch.id, "task_id": epoch.task_id, "epoch": epoch.epoch,
+        "from_message_seq": epoch.from_message_seq,
+        "through_message_seq": epoch.through_message_seq,
+        "checkpoint_id": epoch.checkpoint_id,
+        "archived_messages": len(epoch.archived_messages), "created_at": epoch.created_at,
+    } for epoch in list_epochs(task_id, limit)])
+    return 0
+
+
+def command_context_search(conversation_id, query, limit):
+    console.print_json(data=search_transcript(conversation_id, query, limit=limit))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="tars")
     parser.add_argument("--version", action="version", version=__version__)
@@ -1559,6 +1576,13 @@ def build_parser():
         "--exact", action="store_true",
         help="use target llama.cpp tokenizer; may load the selected model",
     )
+    context_epochs = context_sub.add_parser("epochs")
+    context_epochs.add_argument("task_id")
+    context_epochs.add_argument("--limit", type=int, default=50)
+    context_search = context_sub.add_parser("search")
+    context_search.add_argument("conversation_id")
+    context_search.add_argument("query")
+    context_search.add_argument("--limit", type=int, default=50)
 
     return parser
 
@@ -1720,6 +1744,10 @@ def main():
             return command_context_show(
                 cfg, args.role, args.conversation, args.exact
             )
+        if args.context_command == "epochs":
+            return command_context_epochs(args.task_id, args.limit)
+        if args.context_command == "search":
+            return command_context_search(args.conversation_id, args.query, args.limit)
 
     parser.error("unsupported command")
     return 2

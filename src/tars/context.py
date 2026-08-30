@@ -198,7 +198,14 @@ def _history_messages(conversation_id: str, *, limit: int) -> tuple[list[dict], 
             continue
         if rec.role not in {"system", "user", "assistant", "tool"}:
             continue
-        result.append({"role": rec.role, "content": rec.content})
+        result.append({
+            "role": rec.role,
+            "content": rec.content,
+            "_protected": (
+                rec.kind in {"control", "pending_control"}
+                or (rec.role == "tool" and rec.metadata.get("unresolved") is True)
+            ),
+        })
         through_seq = max(through_seq, rec.seq)
     return result, through_seq
 
@@ -223,7 +230,8 @@ def _normalize_selected_history(selected: list[dict], *, omitted: bool) -> None:
         return
     # Avoid beginning a truncated transcript with an orphan assistant/tool turn.
     # Keep removing old orphaned turns, never the newest surviving message.
-    while len(selected) > 1 and selected[0].get("role") in {"assistant", "tool"}:
+    while (len(selected) > 1 and selected[0].get("role") in {"assistant", "tool"}
+           and not selected[0].get("_protected")):
         del selected[0]
 
 
@@ -358,12 +366,27 @@ class ContextManager:
                         "newest conversation turns are preserved."
                     ),
                 }]
-            return [*prefix, *marker, *selected, *suffix]
+            history_messages = [
+                {"role": item["role"], "content": item["content"]} for item in selected
+            ]
+            return [*prefix, *marker, *history_messages, *suffix]
+
+        def drop_oldest(count: int) -> int:
+            removed = 0
+            index = 0
+            while index < len(selected) - 1 and removed < count:
+                if selected[index].get("_protected"):
+                    index += 1
+                    continue
+                del selected[index]
+                removed += 1
+            return removed
 
         # Cheap pre-prune avoids repeated tokenizer calls for obviously oversized logs.
         while len(selected) > 1 and estimate_messages_tokens(candidate_messages()) > target_for_estimate:
             drop = max(1, len(selected) // 8)
-            del selected[:drop]
+            if not drop_oldest(drop):
+                break
         _normalize_selected_history(selected, omitted=(len(selected) < original_count))
 
         messages = candidate_messages()
@@ -384,7 +407,8 @@ class ContextManager:
                     overflow = token_count - budget.usable_input
                     estimated_per_message = max(1, estimate_messages_tokens(selected) // len(selected))
                     drop = max(1, min(len(selected) - 1, (overflow // estimated_per_message) + 1))
-                    del selected[:drop]
+                    if not drop_oldest(drop):
+                        break
                     _normalize_selected_history(selected, omitted=True)
                     messages = candidate_messages()
                     token_count = count_chat_tokens(

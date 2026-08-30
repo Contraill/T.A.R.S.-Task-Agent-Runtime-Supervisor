@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.2 - Context Engine and Context Epochs
+
+- added explicit soft, hard and emergency context-pressure watermarks
+- added atomic task checkpoint, transcript archival and Context Epoch advancement
+- protected latest instructions, pending controls and unresolved ToolResults during rollover
+- kept compacted transcript slices derived while canonical messages and task state remain durable
+- added exact lexical transcript search across active and archived context
+- added epoch inspection and transcript-search commands
+
 ## 0.6.1 - Memory Core
 
 - added a human-readable canonical memory corpus with structured provenance, scope, confidence, expiry, tags and supersession metadata

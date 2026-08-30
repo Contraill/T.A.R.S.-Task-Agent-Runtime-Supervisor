@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def now_utc() -> str:
@@ -273,6 +273,22 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_context_projection_conversation_role
         ON context_projections(conversation_id, role_id, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS context_epochs (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        epoch INTEGER NOT NULL,
+        from_message_seq INTEGER NOT NULL,
+        through_message_seq INTEGER NOT NULL,
+        archived_messages_json TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id),
+        unresolved_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, epoch)
+    );
+    CREATE INDEX IF NOT EXISTS idx_context_epochs_task_epoch
+        ON context_epochs(task_id, epoch DESC);
+
     CREATE TABLE IF NOT EXISTS task_runs (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -404,7 +420,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,

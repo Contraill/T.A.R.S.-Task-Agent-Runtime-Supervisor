@@ -85,6 +85,16 @@ Status: implemented.
 - rebuildable SQLite/FTS5 lexical retrieval with explainable ranking signals
 - memory inspection, search, remember, forget, review and repair commands
 
+## v0.6.2 — context engine and context epochs
+
+Status: implemented.
+
+- actual runtime-profile context budgets with exact tokenizer support
+- soft, hard and emergency pressure watermarks
+- atomic task checkpoint, transcript archival and epoch advancement
+- protected latest instructions, controls and unresolved ToolResults
+- lexical search over active and archived transcript messages
+
 ## v0.6.x — identity, memory and context epochs
 
 - PromptCompiler and capability-aware system prompt
