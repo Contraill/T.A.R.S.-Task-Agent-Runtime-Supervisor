@@ -117,6 +117,9 @@ from .delegation import (accept as accept_child, cancel as cancel_child,
                          create_child, load_contract as load_child_contract)
 from .workspace_recovery import (WorkspaceRecovery, load as load_workspace_checkpoint,
                                  list_checkpoints as list_workspace_checkpoints)
+from .skills import SkillRegistry
+from .mcp import (MCPClient, list_servers as list_mcp_servers,
+                  register as register_mcp_server, set_enabled as set_mcp_enabled)
 
 console = Console()
 
@@ -345,6 +348,7 @@ def command_model_info(alias):
     console.print(f"license        : {model.license}")
     console.print(f"integrity      : {'verified' if model.integrity_verified else 'pending'}")
     console.print(f"compatibility  : {'compatible' if model.runtime_compatible else 'pending/unsupported'}")
+    console.print(f"thinking       : {'on/off toggle' if model.thinking_control == 'toggle' else 'unverified'}")
 
     try:
         cal = load_calibration(alias)
@@ -1285,6 +1289,65 @@ def command_task_handoff(task_id, role, reason):
     return 0
 
 
+def command_skill(args):
+    registry = SkillRegistry()
+    try:
+        if args.skill_command == "list":
+            data = [item.summary() | {"valid": item.valid, "errors": list(item.errors)}
+                    for item in registry.discover(project_path=args.project, role=args.role,
+                                                  include_invalid=args.invalid)]
+        elif args.skill_command == "show":
+            skill = registry.load(args.name, project_path=args.project, role=args.role)
+            data = skill.descriptor.summary() | {"instructions": skill.instructions,
+                                                 "resources": list(skill.resources)}
+        else:
+            data = registry.doctor(project_path=args.project, role=args.role)
+    except (KeyError, ValueError, OSError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data=data)
+    return 0
+
+
+def command_mcp(args):
+    try:
+        if args.mcp_command == "list":
+            data = [{"name": item.name, "transport": item.transport,
+                     "enabled": item.enabled, "tool_filter": item.tool_filter,
+                     "effect_policy": item.effect_policy} for item in list_mcp_servers()]
+        elif args.mcp_command == "register":
+            config = json.loads(args.config_json)
+            tool_filter = json.loads(args.filter_json)
+            effects = json.loads(args.effects_json)
+            item = register_mcp_server(args.name, args.transport, config,
+                                       tool_filter=tool_filter, effect_policy=effects)
+            data = {"name": item.name, "transport": item.transport,
+                    "enabled": item.enabled}
+        elif args.mcp_command in {"enable", "disable"}:
+            item = set_mcp_enabled(args.name, args.mcp_command == "enable")
+            data = {"name": item.name, "enabled": item.enabled}
+        else:
+            client = MCPClient(args.name, connection_approval_id=args.connect_approval)
+            try:
+                if args.mcp_command == "tools":
+                    data = client.discover_tools()
+                else:
+                    arguments = json.loads(args.arguments_json)
+                    result = client.call_tool(args.tool, arguments, target=args.target,
+                                              approval_id=args.approval)
+                    data = {"tool": result.tool, "state": result.state,
+                            "data": result.data, "error": result.error,
+                            "action_ids": list(result.action_ids),
+                            "evidence_ids": list(result.evidence_ids)}
+            finally:
+                client.close()
+    except (json.JSONDecodeError, KeyError, ValueError, RuntimeError, PermissionError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data=data)
+    return 0
+
+
 def command_task_handoffs(task_id=None, limit=50):
     rows = list_handoffs(task_id, limit=limit)
     table = Table(title="Handoffs" + (f" · {task_id}" if task_id else ""))
@@ -1630,6 +1693,42 @@ def build_parser():
     workspace_rollback.add_argument("--approval", required=True)
     workspace_rollback.add_argument("--task")
 
+    skill = sub.add_parser("skill", help="discover and validate procedural skills")
+    skill_sub = skill.add_subparsers(dest="skill_command", required=True)
+    for name in ("list", "doctor"):
+        item = skill_sub.add_parser(name)
+        item.add_argument("--project")
+        item.add_argument("--role")
+        if name == "list":
+            item.add_argument("--invalid", action="store_true")
+    skill_show = skill_sub.add_parser("show")
+    skill_show.add_argument("name")
+    skill_show.add_argument("--project")
+    skill_show.add_argument("--role")
+
+    mcp = sub.add_parser("mcp", help="manage guarded MCP interoperability")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_sub.add_parser("list")
+    mcp_register = mcp_sub.add_parser("register")
+    mcp_register.add_argument("name")
+    mcp_register.add_argument("transport", choices=["stdio", "streamable-http"])
+    mcp_register.add_argument("--config-json", required=True)
+    mcp_register.add_argument("--filter-json", default="{}")
+    mcp_register.add_argument("--effects-json", default="{}")
+    for name in ("enable", "disable"):
+        item = mcp_sub.add_parser(name)
+        item.add_argument("name")
+    mcp_tools = mcp_sub.add_parser("tools")
+    mcp_tools.add_argument("name")
+    mcp_tools.add_argument("--connect-approval")
+    mcp_call = mcp_sub.add_parser("call")
+    mcp_call.add_argument("name")
+    mcp_call.add_argument("tool")
+    mcp_call.add_argument("--arguments-json", default="{}")
+    mcp_call.add_argument("--target", default="")
+    mcp_call.add_argument("--approval")
+    mcp_call.add_argument("--connect-approval")
+
     model = sub.add_parser("model")
     model_sub = model.add_subparsers(dest="model_command", required=True)
     model_sub.add_parser("list")
@@ -1953,6 +2052,10 @@ def main():
         return command_evidence(args)
     if args.command == "workspace":
         return command_workspace(args)
+    if args.command == "skill":
+        return command_skill(args)
+    if args.command == "mcp":
+        return command_mcp(args)
     if args.command in {"start", "stop"}:
         return command_service(args.command)
     if args.command == "logs":

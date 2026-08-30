@@ -38,7 +38,7 @@ def test_temporary_multiturn_reads_identity_and_memory_without_writes(isolated_e
     memory_before = (tmp_path / "memory" / "profile" / f"{memory_entry.id}.md").read_bytes()
     prompts = []
 
-    def complete(cfg, role, messages, max_tokens):
+    def complete(cfg, role, messages, max_tokens, thinking):
         prompts.append(messages)
         users = [item for item in messages if item["role"] == "user"]
         return {"choices": [{"message": {"content": f"reply-{len(users)}"}}]}

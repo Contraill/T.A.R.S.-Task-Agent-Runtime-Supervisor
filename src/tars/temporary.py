@@ -26,7 +26,7 @@ class TemporarySession:
     def __post_init__(self):
         self.role_id = resolve_role_id(self.role_id)
 
-    def _messages(self, latest_text, *, requested_output_tokens=1024):
+    def _messages(self, latest_text, *, requested_output_tokens=None):
         hits = search_memory(latest_text, limit=5, initialize=False)
         memories = [
             f"[{hit.entry.id} · {hit.entry.source}] {hit.entry.content}" for hit in hits
@@ -56,7 +56,8 @@ class TemporarySession:
             raise RuntimeError("temporary conversation does not fit the active context budget")
         return messages
 
-    def send(self, text, *, requested_output_tokens=1024, complete=chat_completion):
+    def send(self, text, *, requested_output_tokens=None, complete=chat_completion,
+             thinking="auto"):
         if self.closed:
             raise RuntimeError("temporary session is closed")
         text = str(text).strip()
@@ -68,12 +69,17 @@ class TemporarySession:
                 self.cfg, self.role_id,
                 self._messages(text, requested_output_tokens=requested_output_tokens),
                 max_tokens=requested_output_tokens,
+                thinking=thinking,
             )
         except Exception:
             self.turns.pop()
             raise
         message = (response.get("choices") or [{}])[0].get("message") or {}
-        self.turns.append({"role": "assistant", "content": str(message.get("content") or "")})
+        content = str(message.get("content") or "")
+        finish = (response.get("choices") or [{}])[0].get("finish_reason")
+        if finish == "length" and not content:
+            return response
+        self.turns.append({"role": "assistant", "content": content})
         return response
 
     def close(self):

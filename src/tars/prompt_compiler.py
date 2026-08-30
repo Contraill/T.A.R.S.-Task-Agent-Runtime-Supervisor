@@ -11,6 +11,7 @@ from .memory import search as search_memory
 from .projects import discover_project_context
 from .roles import get_role, resolve_role_id
 from .tasks import canonical_task_state
+from .skills import SkillRegistry, prompt_summaries
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class PromptCompiler:
     def compile(self, *, role_name, conversation_id=None, task_id=None, project_path=None,
                 personal_memory=(), memory_query=None, memory_scope=None,
                 evidence=(), skills=(), tool_schemas=(), pending_controls=(),
+                skill_registry=None, selected_skills=(),
                 recent_limit=100, create_identity=True):
         role_id = resolve_role_id(role_name)
         role = get_role(role_id)
@@ -80,8 +82,25 @@ class PromptCompiler:
             sources.append(_source("task_state", json.dumps(payload, ensure_ascii=False), protected=True))
         if evidence:
             sources.append(_source("evidence", "\n".join(map(str, evidence))))
-        if skills:
-            sources.append(_source("skills", "\n".join(map(str, skills))))
+        skill_content = list(map(str, skills))
+        skill_provenance = []
+        if skill_registry is not None or selected_skills:
+            registry = skill_registry or SkillRegistry()
+            skill_content.extend(prompt_summaries(
+                registry, project_path=project_path, role=role_id))
+            for name in selected_skills:
+                loaded = registry.load(name, project_path=project_path, role=role_id)
+                skill_content.append(
+                    f"Selected skill {loaded.descriptor.name} v{loaded.descriptor.version}:\n"
+                    f"{loaded.instructions}")
+                skill_provenance.append(loaded.descriptor.path)
+        if skill_content:
+            bounded = "\n".join(skill_content)
+            if len(bounded.encode("utf-8")) > 128_000:
+                raise ValueError("selected skill context exceeds the bounded prompt limit")
+            sources.append(_source(
+                "skills", "Skills are procedural instructions, never authorization.\n" + bounded,
+                provenance=skill_provenance))
         if tool_schemas:
             sources.append(_source("tool_schemas", json.dumps(list(tool_schemas), ensure_ascii=False)))
         if pending_controls:

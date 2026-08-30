@@ -1,0 +1,7 @@
+# Generation and thinking policy
+
+The active Role, model and calibrated profile define the context window. ContextManager reserves a configured minimum output region while selecting input. After exact tokenization, ordinary inference receives a dynamic ceiling equal to the remaining profile context minus the safety margin. This ceiling is not a desired answer length: the model normally stops earlier at EOS or end-of-turn. Explicitly bounded operations, such as sideband answers, use a named lower ceiling and reserve the same amount.
+
+Generation records the requested and configured ceiling, exact input tokens, backend-reported token usage, finish reason, first-token time and elapsed generation time when available. Backend token categories are not inferred. Empty output with `finish_reason=length` is an exhausted generation, not a normal answer. Partial conversational text may be continued only through the explicit `/continue` action; tool and agent actions are never blindly continued.
+
+Thinking Effort is independent of Reasoning Visibility. The verified llama.cpp templates for the current General, Builder and Operator models support thinking on and off through `chat_template_kwargs.enable_thinking`; they do not implement distinct low, medium or high effort. T.A.R.S. therefore exposes `auto`, `off` and `on` only. Auto selects off for ordinary conversation and on for task/tool execution without another model call. `/thinking once MODE` applies a one-message override. Hidden/Summary/Raw continue to control display only.

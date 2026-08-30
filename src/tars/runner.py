@@ -198,7 +198,7 @@ def _apply_boundary_control(run: TaskRun) -> TaskRun:
     return run
 
 
-def run_task_epoch(cfg, run_id: str, *, on_stream=None, max_tokens=2048) -> dict:
+def run_task_epoch(cfg, run_id: str, *, on_stream=None, max_tokens=None) -> dict:
     """Execute one reasoning-only task epoch using real backend streaming.
 
     This is intentionally *not* the future ToolRegistry agent loop.  It produces one
@@ -246,7 +246,8 @@ def run_task_epoch(cfg, run_id: str, *, on_stream=None, max_tokens=2048) -> dict
     usage = None
     try:
         for event in chat_completion_stream(
-            cfg, task.owner_role, list(projection.messages), max_tokens=max_tokens
+            cfg, task.owner_role, list(projection.messages), max_tokens=max_tokens,
+            input_tokens=projection.token_count, operation="task", task_active=True
         ):
             content = event.get("content") or ""
             reasoning = event.get("reasoning") or ""
@@ -266,6 +267,8 @@ def run_task_epoch(cfg, run_id: str, *, on_stream=None, max_tokens=2048) -> dict
         raw_reasoning = "".join(reasoning_parts)
         if not final:
             final = f"[no final content · {finish_reason or 'unknown'}]"
+        if finish_reason == "length" and not "".join(content_parts):
+            raise RuntimeError("generation exhausted its context-bounded ceiling before final content")
 
         # Inference completion is a safe boundary.  A cancellation requested while
         # tokens were streaming is honored here before the generated output is

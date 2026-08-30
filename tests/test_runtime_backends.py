@@ -66,8 +66,9 @@ def test_backend_factory_rejects_cloud_provider_names():
 
 
 def test_runtime_dispatches_role_through_model_backend(monkeypatch):
-    role = SimpleNamespace(enabled=True, model="local", runtime_id="daily", display_name="General")
-    model = SimpleNamespace(alias="local", backend="llama.cpp")
+    role = SimpleNamespace(id="general", enabled=True, model="local", runtime_id="daily",
+                           display_name="General", execution="chat")
+    model = SimpleNamespace(alias="local", backend="llama.cpp", thinking_control="unknown")
 
     class Backend:
         def complete(self, request):
@@ -77,6 +78,9 @@ def test_runtime_dispatches_role_through_model_backend(monkeypatch):
     monkeypatch.setattr(runtime, "get_model", lambda alias: model)
     monkeypatch.setattr(runtime, "backend_binding_ready", lambda value: True)
     monkeypatch.setattr(runtime, "backend_for_model", lambda value, cfg: Backend())
+    monkeypatch.setattr(runtime, "count_chat_tokens", lambda *args, **kwargs: 10)
+    monkeypatch.setattr(runtime, "generation_budget", lambda *args, **kwargs: SimpleNamespace(
+        context_window=100, safety_margin=10, explicit_ceiling=None))
     result = runtime.chat_completion({}, "general", [{"role": "user", "content": "hi"}])
     assert result["model"] == "daily"
 

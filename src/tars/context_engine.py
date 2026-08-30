@@ -35,7 +35,7 @@ class ContextEngine:
         self.manager = ContextManager(cfg)
 
     def prepare(self, conversation_id, role_name, *, task_id=None, exact=True,
-                requested_output_tokens=1024, auto_rollover=True):
+                requested_output_tokens=None, auto_rollover=True):
         projection = self.manager.build(
             conversation_id, role_name, task_id_override=task_id,
             mode="task" if task_id else "main", exact=exact, persist=True,

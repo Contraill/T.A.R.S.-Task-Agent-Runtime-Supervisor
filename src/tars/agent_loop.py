@@ -132,7 +132,7 @@ class RuntimeModelAdapter:
         "\"evidence_ids\":[...]} to request verified completion. Model text is never authority."
     )
 
-    def __init__(self, cfg, *, complete=chat_completion, max_tokens=1024):
+    def __init__(self, cfg, *, complete=chat_completion, max_tokens=None):
         self.cfg = cfg
         self.complete = complete
         self.max_tokens = max_tokens
@@ -148,7 +148,10 @@ class RuntimeModelAdapter:
             messages.append({"role": "system", "content": "Pending controls:\n" +
                              json.dumps(controls, ensure_ascii=False)})
         response = self.complete(self.cfg, task.owner_role, messages,
-                                 max_tokens=self.max_tokens, temperature=0.1)
+                                 max_tokens=self.max_tokens,
+                                 input_tokens=projection.token_count,
+                                 temperature=0.1, operation="agent",
+                                 task_active=True, requires_tools=True)
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:

@@ -4,18 +4,17 @@ from dataclasses import dataclass
 import json
 import uuid
 
-from .calibration import get_profile
 from .checkpoints import latest_checkpoint
 from .conversation import list_messages
-from .registry import get_model
 from .roles import get_role, resolve_role_id
 from .runtime import count_chat_tokens
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import active_task, canonical_task_state, load_task
+from .generation import (DEFAULT_GENERATION_TOKENS, DEFAULT_SAFETY_MARGIN,
+                         generation_budget, generation_ceiling)
 
 
-DEFAULT_OUTPUT_RESERVE = 8192
-DEFAULT_SAFETY_MARGIN = 1024
+DEFAULT_OUTPUT_RESERVE = DEFAULT_GENERATION_TOKENS
 DEFAULT_HISTORY_LIMIT = 1000
 CHEAP_CHARS_PER_TOKEN = 3.0
 
@@ -65,6 +64,12 @@ class ContextProjection:
             return 0.0
         return max(0.0, min(1.0, self.token_count / self.usable_input))
 
+    @property
+    def generation_limit(self) -> int:
+        explicit = self.metadata.get("explicit_generation_ceiling")
+        remaining = self.context_window - self.token_count - self.safety_margin
+        return min(remaining, int(explicit)) if explicit is not None else remaining
+
 
 def _projection_from_row(row, messages=()) -> ContextProjection:
     return ContextProjection(
@@ -111,35 +116,23 @@ def _context_cfg(cfg) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def budget_for_role(cfg, role_name: str, *, requested_output_tokens: int = 1024) -> ContextBudget:
+def budget_for_role(cfg, role_name: str, *, requested_output_tokens: int | None = None) -> ContextBudget:
     role_id = resolve_role_id(role_name)
     role = get_role(role_id)
     if not role.enabled:
         raise RuntimeError(f"role {role.display_name!r} is disabled")
     if not role.model:
         raise RuntimeError(f"role {role.display_name!r} has no model binding")
-    profile = get_profile(role.model, role.profile)
-    model = get_model(role.model)
-
-    ccfg = _context_cfg(cfg)
-    configured_reserve = int(ccfg.get("output_reserve_tokens", DEFAULT_OUTPUT_RESERVE))
-    reserve = max(int(requested_output_tokens), configured_reserve)
-    safety = max(0, int(ccfg.get("safety_margin_tokens", DEFAULT_SAFETY_MARGIN)))
-    usable = int(profile.context) - reserve - safety
-    if usable <= 0:
-        raise ContextBudgetError(
-            f"invalid context budget for {role.display_name}: window={profile.context}, "
-            f"reserve={reserve}, safety={safety}"
-        )
+    plan = generation_budget(cfg, role_id, requested_tokens=requested_output_tokens)
     return ContextBudget(
         role_id=role_id,
         model_alias=role.model,
         runtime_id=role.runtime_id,
         profile_name=role.profile,
-        context_window=int(profile.context),
-        output_reserve=reserve,
-        safety_margin=safety,
-        usable_input=usable,
+        context_window=plan.context_window,
+        output_reserve=plan.output_reserve,
+        safety_margin=plan.safety_margin,
+        usable_input=plan.usable_input,
     )
 
 
@@ -299,7 +292,7 @@ class ContextManager:
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def budget(self, role_name: str, *, requested_output_tokens: int = 1024) -> ContextBudget:
+    def budget(self, role_name: str, *, requested_output_tokens: int | None = None) -> ContextBudget:
         return budget_for_role(
             self.cfg, role_name, requested_output_tokens=requested_output_tokens
         )
@@ -313,7 +306,7 @@ class ContextManager:
         sideband_question: str | None = None,
         task_id_override: str | None = None,
         task_instruction: str | None = None,
-        requested_output_tokens: int = 1024,
+        requested_output_tokens: int | None = None,
         exact: bool = True,
         persist: bool = True,
     ) -> ContextProjection:
@@ -453,7 +446,11 @@ class ContextManager:
                 "tokenizer": "llama.cpp-upstream" if is_exact else "cheap-estimate",
                 "exact_error": exact_error,
                 "history_limit": history_limit,
-                "requested_output_tokens": int(requested_output_tokens),
+                "requested_output_tokens": requested_output_tokens,
+                "explicit_generation_ceiling": requested_output_tokens,
+                "generation_limit": generation_ceiling(
+                    generation_budget(self.cfg, budget.role_id,
+                                      requested_tokens=requested_output_tokens), token_count),
             },
         )
         if persist:
@@ -465,7 +462,7 @@ class ContextManager:
         conversation_id: str,
         role_name: str,
         *,
-        requested_output_tokens: int = 1024,
+        requested_output_tokens: int | None = None,
     ) -> ContextProjection:
         return self.build(
             conversation_id,

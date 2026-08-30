@@ -114,6 +114,15 @@ def authorize_child_action(delegation_id, tool, effect, target=""):
     return True
 
 
+def child_inference_options(delegation_id, *, requested_tokens=None, thinking="auto"):
+    contract = load_contract(delegation_id)
+    ceiling = int(contract.budget["max_tokens"])
+    if requested_tokens is not None and int(requested_tokens) > ceiling:
+        raise PermissionError("child generation request exceeds delegated token budget")
+    return {"max_tokens": int(requested_tokens) if requested_tokens is not None else ceiling,
+            "thinking": str(thinking)}
+
+
 class ChildToolDispatcher:
     """Narrow a canonical dispatcher without copying or expanding its bindings."""
     def __init__(self, delegation_id, dispatcher):
@@ -247,6 +256,7 @@ def start(delegation_id, executor):
                 "goal": delegation.goal, "tools": list(contract.tool_allowlist),
                 "authority": contract.authority, "budget": contract.budget,
                 "workspace": contract.workspace, "completion": contract.completion,
+                "generation_limit": contract.budget["max_tokens"],
                 "cancel_event": cancel_event,
             }
             result = executor(context)

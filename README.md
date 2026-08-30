@@ -39,8 +39,10 @@ Implemented in the current reference build:
 - verified autonomous task loops with durable queued messages, interrupt and redirect controls
 - recoverable Git and bounded filesystem workspace checkpoints with explicit rollback previews
 - bounded child tasks with permission inheritance, lifecycle controls and parent acceptance
+- procedural Skills and policy-guarded MCP interoperability
+- dynamic context-bounded generation with truthful thinking on/off capability control
 
-The v0.5 runtime substrate, complete v0.6 continuity foundation and v0.7.0–v0.7.5 trusted execution, recovery and delegation foundations are implemented.
+The v0.5 runtime substrate, complete v0.6 continuity foundation and complete v0.7 trusted execution and agent foundation are implemented.
 
 ## Roles
 

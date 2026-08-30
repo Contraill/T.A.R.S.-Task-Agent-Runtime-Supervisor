@@ -24,6 +24,7 @@ def default_registry():
                 "backend": "llama.cpp",
                 "quant": "Q4_K_M",
                 "native_context": 262144,
+                "thinking_control": "toggle",
             },
             "kat-coder-v2.5-dev": {
                 "name": "KAT-Coder V2.5-Dev 35B-A3B",
@@ -32,6 +33,7 @@ def default_registry():
                 "backend": "llama.cpp",
                 "quant": "Q4_K_M",
                 "native_context": 262144,
+                "thinking_control": "toggle",
             },
             "agents-a1": {
                 "name": "Agents-A1 35B-A3B",
@@ -40,6 +42,7 @@ def default_registry():
                 "backend": "llama.cpp",
                 "quant": "Q4_K_M",
                 "native_context": 262144,
+                "thinking_control": "toggle",
             },
         },
     }
@@ -63,6 +66,8 @@ def serialize_registry(data):
         for key in ("source", "source_revision", "license", "artifact_sha256"):
             if key in model:
                 lines.append(f"{key} = {_quote(model[key])}")
+        if "thinking_control" in model:
+            lines.append(f"thinking_control = {_quote(model['thinking_control'])}")
         for key in ("size",):
             if key in model:
                 lines.append(f"{key} = {int(model[key])}")
@@ -123,6 +128,17 @@ def get_model(alias):
     if alias not in available:
         raise KeyError(f"unknown model alias: {alias}")
     return available[alias]
+
+
+def set_thinking_control(alias, control):
+    if control not in {"unknown", "toggle"}:
+        raise ValueError("thinking control must be unknown or toggle")
+    data = ensure_registry()
+    if alias not in data["models"]:
+        raise KeyError(f"unknown model alias: {alias}")
+    data["models"][alias]["thinking_control"] = control
+    save_registry(data)
+    return get_model(alias)
 
 
 def role_for_alias(alias):

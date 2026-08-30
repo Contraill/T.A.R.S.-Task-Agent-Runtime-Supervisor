@@ -41,6 +41,8 @@ from .themes import (
     set_logo,
     set_theme,
 )
+from .generation import SIDEBAND_GENERATION_TOKENS, generation_outcome
+from .thinking import capability_for_model, configured_policy
 
 
 STATIC_COMMANDS = [
@@ -59,6 +61,8 @@ STATIC_COMMANDS = [
     ("/models", "Show role/model bindings"),
     ("/progress quiet|normal|verbose", "Set progress event visibility"),
     ("/reasoning hidden|summary|raw", "Set reasoning visibility"),
+    ("/thinking [auto|off|on]", "Set model thinking policy; add 'once' for one message"),
+    ("/continue", "Explicitly continue a text response stopped at its generation ceiling"),
     ("/theme [name]", "Show or change UI color theme"),
     ("/logo [mode]", "Show or change HUD logo mode"),
     ("/new", "Clear conversation only; task state stays"),
@@ -75,6 +79,7 @@ class QueueItem:
     text: str = ""
     task_id: str | None = None
     run_id: str | None = None
+    thinking: str | None = None
 
 
 class CommandCompleter(Completer):
@@ -108,6 +113,13 @@ class CommandCompleter(Completer):
         if text.startswith("/reasoning "):
             prefix = text[len("/reasoning "):].lower()
             for value in ("hidden", "summary", "raw"):
+                if value.startswith(prefix):
+                    yield Completion(value, start_position=-len(prefix))
+            return
+
+        if text.startswith("/thinking "):
+            prefix = text[len("/thinking "):].lower()
+            for value in ("auto", "off", "on"):
                 if value.startswith(prefix):
                     yield Completion(value, start_position=-len(prefix))
             return
@@ -149,6 +161,8 @@ class CommandCompleter(Completer):
             ("/models", "role/model bindings"),
             ("/progress", "progress visibility"),
             ("/reasoning", "reasoning visibility"),
+            ("/thinking", "model thinking policy"),
+            ("/continue", "continue truncated text response"),
             ("/theme", "UI color theme"),
             ("/logo", "HUD logo mode"),
             ("/new", "new conversation"),
@@ -187,6 +201,9 @@ class ChatTUI:
         self.reasoning = cfg.get("policy", {}).get("reasoning", {}).get("default_visibility", "hidden")
         if self.reasoning not in {"hidden", "summary", "raw"}:
             self.reasoning = "hidden"
+        self.thinking = configured_policy(cfg, self.role_id)
+        self.thinking_once = None
+        self.last_generation_exhausted = False
         self.progress_mode = cfg.get("chat", {}).get("progress", "normal")
         if self.progress_mode not in {"quiet", "normal", "verbose"}:
             self.progress_mode = "normal"
@@ -497,7 +514,7 @@ class ChatTUI:
             ("class:dim", "  •  Activity "),
             ("class:accent", self.activity),
             ("", "\n "),
-            ("class:dim", f"Reasoning {self.reasoning.title()}  •  Progress {self.progress_mode.title()}  •  Trace Compact  •  Theme "),
+            ("class:dim", f"Reasoning {self.reasoning.title()}  •  Thinking {self.thinking.title()}  •  Progress {self.progress_mode.title()}  •  Trace Compact  •  Theme "),
             ("class:accent", self.theme.id),
             ("", "\n "),
             ("class:accent", task_text),
@@ -529,6 +546,10 @@ class ChatTUI:
                 ("/reasoning summary", "show genuine loop/checkpoint outputs, not hidden CoT"),
                 ("/reasoning raw", "stream genuine backend reasoning_content"),
             ]
+
+        if text.startswith("/thinking "):
+            return [(f"/thinking {value}", "model computation policy")
+                    for value in ("auto", "off", "on")]
 
         if text.startswith("/theme "):
             prefix = text[len("/theme "):].strip().lower()
@@ -751,7 +772,9 @@ class ChatTUI:
             if self.busy or self.queued:
                 self._append_system("Wait for the current TEMPORARY response before sending another turn.")
                 return
-            self._enqueue(QueueItem("temporary", self.role_id, value))
+            thinking = self.thinking_once or self.thinking
+            self.thinking_once = None
+            self._enqueue(QueueItem("temporary", self.role_id, value, thinking=thinking))
             return
         task = active_task()
         if self.busy and task is not None and is_task_loop_active(task.id):
@@ -762,7 +785,9 @@ class ChatTUI:
             self.conversation.id, "user", value, kind="message", include_in_context=True,
             related_task_id=task.id if task else None, metadata={"role_id": self.role_id},
         )
-        self._enqueue(QueueItem("main", self.role_id, value))
+        thinking = self.thinking_once or self.thinking
+        self.thinking_once = None
+        self._enqueue(QueueItem("main", self.role_id, value, thinking=thinking))
 
     async def _handle_command(self, value):
         parts = value.split(maxsplit=2)
@@ -865,6 +890,38 @@ class ChatTUI:
             self.reasoning = parts[1]
             self._append_system(f"Reasoning visibility: {self.reasoning}")
             self.app.invalidate()
+            return True
+
+        if command == "/thinking":
+            capability = capability_for_model(get_model(get_role(self.role_id).model))
+            if len(parts) == 1:
+                supported = ", ".join(("auto", *capability.modes))
+                self._append_system(
+                    f"Thinking policy: {self.thinking}. Supported: {supported}. "
+                    f"Mechanism: {capability.mechanism}.")
+                return True
+            once = parts[1] == "once"
+            mode = parts[2].casefold() if once and len(parts) == 3 else parts[1].casefold()
+            if mode != "auto" and mode not in capability.modes:
+                self._append_system(
+                    f"{mode.title()} thinking is not supported by the active model/backend.")
+                return True
+            if once:
+                self.thinking_once = mode
+                self._append_system(f"Thinking {mode.title()} for the next message only.")
+            else:
+                self.thinking = mode
+                self._append_system(f"Thinking policy: {mode}")
+            self.app.invalidate()
+            return True
+
+        if command == "/continue":
+            if not self.last_generation_exhausted:
+                self._append_system("No partial text response is awaiting continuation.")
+                return True
+            self.last_generation_exhausted = False
+            await self._handle_submission(
+                "Continue the preceding answer from where it stopped without repeating it.")
             return True
 
         if command == "/theme":
@@ -1067,7 +1124,9 @@ class ChatTUI:
             self.live_content += content
         self.app.invalidate()
 
-    async def _stream_completion(self, role_id, messages, *, max_tokens=1024, kind="main"):
+    async def _stream_completion(self, role_id, messages, *, max_tokens=None,
+                                 input_tokens=None, thinking="auto", kind="main",
+                                 task_active=False):
         self._reset_live_stream(role_id, kind)
         queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -1075,7 +1134,9 @@ class ChatTUI:
         def producer():
             try:
                 for event in chat_completion_stream(
-                    self.cfg, role_id, messages, max_tokens=max_tokens
+                    self.cfg, role_id, messages, max_tokens=max_tokens,
+                    input_tokens=input_tokens, thinking=thinking, operation=kind,
+                    task_active=task_active
                 ):
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
             except Exception as exc:
@@ -1086,6 +1147,7 @@ class ChatTUI:
         producer_task = asyncio.create_task(asyncio.to_thread(producer))
         finish = None
         usage = None
+        generation = None
         while True:
             typ, payload = await queue.get()
             if typ == "event":
@@ -1094,13 +1156,15 @@ class ChatTUI:
                     finish = payload.get("finish_reason")
                 if payload.get("usage"):
                     usage = payload.get("usage")
+                if payload.get("generation"):
+                    generation = payload.get("generation")
             elif typ == "error":
                 await producer_task
                 raise payload
             else:
                 break
         await producer_task
-        return self.live_content, self.live_reasoning, finish or "unknown", usage
+        return self.live_content, self.live_reasoning, finish or "unknown", usage, generation
 
     async def _run_task_stream(self, item):
         self._reset_live_stream(item.role_id, f"task epoch · {item.task_id[-8:]}")
@@ -1178,13 +1242,15 @@ class ChatTUI:
                 elif item.kind == "temporary":
                     if self.temporary is None:
                         raise RuntimeError("temporary mode ended before queued inference")
-                    response = await asyncio.to_thread(self.temporary.send, item.text)
+                    response = await asyncio.to_thread(
+                        self.temporary.send, item.text, thinking=item.thinking or "auto")
                     content, raw, finish = self._response_parts(response)
                     if self.reasoning == "raw" and raw:
                         self._append(f"{role_name} · raw", raw[-16000:])
-                    self._append_assistant(
-                        item.role_id, content or f"[no final content · {finish}]"
-                    )
+                    if finish == "length" and not content:
+                        self._append_system("Generation exhausted its ceiling before final content.")
+                    else:
+                        self._append_assistant(item.role_id, content or f"[no final content · {finish}]")
 
                 elif item.kind == "sideband":
                     task = active_task()
@@ -1198,23 +1264,32 @@ class ChatTUI:
                         item.role_id,
                         mode="sideband",
                         sideband_question=item.text,
-                        requested_output_tokens=512,
+                        requested_output_tokens=SIDEBAND_GENERATION_TOKENS,
                         exact=True,
                     )
-                    content, raw, finish, usage = await self._stream_completion(
-                        item.role_id, list(projection.messages), max_tokens=512, kind="sideband"
+                    content, raw, finish, usage, generation = await self._stream_completion(
+                        item.role_id, list(projection.messages),
+                        max_tokens=SIDEBAND_GENERATION_TOKENS,
+                        input_tokens=projection.token_count,
+                        thinking=item.thinking or self.thinking, kind="sideband"
                     )
                     if self.reasoning == "raw" and raw:
                         shown = raw[-16000:]
                         note = "\n[earlier raw reasoning omitted from display]" if self.live_reasoning_chars > len(shown) else ""
                         self._append(f"{role_name} · raw", shown + note)
+                    outcome = generation_outcome(content, finish)
                     sideband_final = content or f"[no final content · {finish}]"
-                    self._append_assistant(item.role_id, sideband_final, sideband=True)
+                    if outcome["state"] == "exhausted" and outcome["empty"]:
+                        self._append_system("Sideband generation exhausted its explicit ceiling before final content.")
+                    else:
+                        self._append_assistant(item.role_id, sideband_final, sideband=True)
                     add_message(
                         self.conversation.id, "assistant", sideband_final, kind="sideband",
                         include_in_context=False, related_task_id=task.id if task else None,
                         metadata={"role_id": item.role_id, "finish_reason": finish,
-                                  "isolated": True, "usage": usage or {}},
+                                  "generation_state": outcome["state"],
+                                  "isolated": True, "usage": usage or {},
+                                  "generation": generation or {}},
                     )
                     self._append_system("Sideband complete. Main conversation context unchanged.")
 
@@ -1225,33 +1300,48 @@ class ChatTUI:
                         self.conversation.id,
                         item.role_id,
                         mode="main",
-                        requested_output_tokens=1024,
+                        requested_output_tokens=None,
                         exact=True,
                     )
                     if projection.omitted_messages:
                         self._append_system(
                             f"ContextManager omitted {projection.omitted_messages} older messages for this inference; canonical state was preserved."
                         )
-                    content, raw, finish, usage = await self._stream_completion(
-                        item.role_id, list(projection.messages), max_tokens=1024, kind="chat"
+                    task = active_task()
+                    content, raw, finish, usage, generation = await self._stream_completion(
+                        item.role_id, list(projection.messages),
+                        input_tokens=projection.token_count,
+                        thinking=item.thinking or self.thinking, kind="chat",
+                        task_active=task is not None
                     )
                     if self.reasoning == "raw" and raw:
                         shown = raw[-16000:]
                         note = "\n[earlier raw reasoning omitted from display]" if self.live_reasoning_chars > len(shown) else ""
                         self._append(f"{role_name} · raw", shown + note)
+                    outcome = generation_outcome(content, finish)
+                    self.last_generation_exhausted = (
+                        outcome["state"] == "exhausted" and bool(content))
                     final = content or f"[no final content · {finish}]"
-                    self._append_assistant(item.role_id, final)
-                    task = active_task()
+                    if outcome["state"] == "exhausted" and outcome["empty"]:
+                        self._append_system("Generation exhausted its context-bounded ceiling before final content.")
+                    else:
+                        self._append_assistant(item.role_id, final)
+                        if outcome["state"] == "exhausted":
+                            self._append_system(
+                                "Response reached its generation ceiling. Use /continue to continue the text explicitly.")
                     add_message(
                         self.conversation.id, "assistant", final, kind="message",
-                        include_in_context=True, related_task_id=task.id if task else None,
+                        include_in_context=not (outcome["state"] == "exhausted" and outcome["empty"]),
+                        related_task_id=task.id if task else None,
                         metadata={
                             "role_id": item.role_id,
                             "finish_reason": finish,
+                            "generation_state": outcome["state"],
                             "context_projection_id": projection.id,
                             "prompt_tokens": projection.token_count,
                             "prompt_tokens_exact": projection.exact,
                             "usage": usage or {},
+                            "generation": generation or {},
                             "reasoning_chars": len(raw),
                         },
                     )

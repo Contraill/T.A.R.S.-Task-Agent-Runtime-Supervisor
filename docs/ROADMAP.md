@@ -209,7 +209,20 @@ Status: implemented.
 
 See [DELEGATION.md](DELEGATION.md) for contracts, scheduling and acceptance semantics.
 
-- v0.7.6: skills and guarded MCP interoperability
+### v0.7.6 — skills and guarded MCP interoperability
+
+Status: implemented.
+
+- global, project and Role skill scopes with deterministic override order
+- metadata-only discovery followed by explicit bounded instruction loading
+- validation, version metadata and doctor reporting; skill text never grants authority
+- stdio and streamable HTTP MCP transports with registry, enable/disable and filtering
+- stable server-qualified tool names, progressive schema disclosure and conservative effects
+- ScopeGuard, ApprovalBroker, ActionJournal and EvidenceRecord integration for MCP calls
+- minimal controlled MCP server surface with real ToolResult enforcement
+- dynamic profile/context-bounded generation ceilings and truthful on/off thinking capability
+
+See [SKILLS_MCP.md](SKILLS_MCP.md) and [GENERATION.md](GENERATION.md) for support and policy details.
 
 ## v0.8.x — future work, remote use and portability
 

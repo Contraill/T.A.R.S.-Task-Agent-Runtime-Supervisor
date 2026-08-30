@@ -17,6 +17,7 @@ class ModelRecord:
     size: int = 0
     integrity_verified: bool = False
     runtime_compatible: bool = False
+    thinking_control: str = "unknown"
 
     @classmethod
     def from_dict(cls, alias, data):
@@ -34,6 +35,7 @@ class ModelRecord:
             size=int(data.get("size", 0)),
             integrity_verified=bool(data.get("integrity_verified", False)),
             runtime_compatible=bool(data.get("runtime_compatible", False)),
+            thinking_control=str(data.get("thinking_control", "unknown")),
         )
 
 

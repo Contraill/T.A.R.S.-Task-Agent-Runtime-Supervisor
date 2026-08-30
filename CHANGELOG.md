@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.6 - Skills, MCP and Generation Policy
+
+- added deterministic global, project and Role skill discovery with progressive disclosure and validation
+- added guarded MCP stdio and streamable HTTP clients, registry, filtering, namespaced schemas and evidence
+- added a minimal policy-controlled MCP server surface for state health inspection
+- unified context reservation with dynamic context-bounded generation ceilings across chat, Temporary, task and agent paths
+- added truthful generation-exhaustion metadata and explicit text continuation
+- added model-capability-based thinking `auto`, `off` and `on` controls independent of reasoning visibility
+
 ## 0.7.5 - Delegation and Subagents
 
 - added durable child contracts with bounded tools, authority, budgets, workspaces and completion evidence

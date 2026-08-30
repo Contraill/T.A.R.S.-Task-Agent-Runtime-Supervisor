@@ -19,6 +19,9 @@ from .runtime import chat_completion, runtime_models
 from .conversation import create_conversation, add_message
 from .tasks import active_task, append_event, list_tasks, load_task
 from .temporary import TEMPORARY_NOTICE, TemporarySession
+from .generation import SIDEBAND_GENERATION_TOKENS, generation_outcome
+from .thinking import capability_for_model, configured_policy
+from .registry import get_model
 
 console = Console()
 
@@ -251,6 +254,7 @@ def run_chat(cfg, *, initial_role=None):
     ).get("default_visibility", "hidden")
     if reasoning not in {"hidden", "raw"}:
         reasoning = "hidden"
+    thinking = configured_policy(cfg, role_id)
 
     progress_mode = cfg.get("chat", {}).get("progress", "normal")
     if progress_mode not in {"quiet", "normal", "verbose"}:
@@ -409,7 +413,8 @@ def run_chat(cfg, *, initial_role=None):
                                 cfg,
                                 role_id,
                                 _sideband_messages(messages, question),
-                                max_tokens=512,
+                                max_tokens=SIDEBAND_GENERATION_TOKENS,
+                                thinking=thinking,
                             )
                     except Exception as exc:
                         console.print(
@@ -438,6 +443,21 @@ def run_chat(cfg, *, initial_role=None):
                     )
                     continue
 
+                if command == "/thinking":
+                    capability = capability_for_model(get_model(get_role(role_id).model))
+                    if len(parts) == 1:
+                        console.print(
+                            f"Thinking: {thinking}. Supported: auto, {', '.join(capability.modes)}")
+                        continue
+                    mode = parts[1]
+                    if mode != "auto" and mode not in capability.modes:
+                        console.print(
+                            f"{mode.title()} thinking is not supported by the active model/backend.")
+                        continue
+                    thinking = mode
+                    console.print(f"Thinking policy: {thinking}")
+                    continue
+
                 if command == "/progress":
                     if len(parts) != 2 or parts[1] not in {"quiet", "normal", "verbose"}:
                         console.print("Usage: /progress quiet|normal|verbose")
@@ -456,7 +476,7 @@ def run_chat(cfg, *, initial_role=None):
             if temporary is not None:
                 try:
                     with console.status("[bold red]TEMPORARY response…[/bold red]", spinner="dots"):
-                        response = temporary.send(value)
+                        response = temporary.send(value, thinking=thinking)
                 except Exception as exc:
                     console.print(Panel(str(exc), title="TEMPORARY runtime error", border_style="red"))
                     continue
@@ -470,7 +490,9 @@ def run_chat(cfg, *, initial_role=None):
                     f"[cyan]{get_role(role_id).display_name} is thinking…[/cyan]",
                     spinner="dots",
                 ):
-                    response = chat_completion(cfg, role_id, messages)
+                    response = chat_completion(
+                        cfg, role_id, messages, thinking=thinking,
+                        task_active=active_task() is not None)
             except Exception as exc:
                 messages.pop()
                 console.print(
@@ -483,12 +505,18 @@ def run_chat(cfg, *, initial_role=None):
                 continue
 
             content = _print_response(response, reasoning)
-            messages.append({"role": "assistant", "content": content})
+            choice = (response.get("choices") or [{}])[0]
+            outcome = generation_outcome(content, choice.get("finish_reason"))
+            if not (outcome["state"] == "exhausted" and outcome["empty"]):
+                messages.append({"role": "assistant", "content": content})
             task = active_task()
             add_message(
                 conversation.id, "assistant", content or "[no final content]", kind="message",
-                include_in_context=True, related_task_id=task.id if task else None,
-                metadata={"role_id": role_id},
+                include_in_context=not (outcome["state"] == "exhausted" and outcome["empty"]),
+                related_task_id=task.id if task else None,
+                metadata={"role_id": role_id, "finish_reason": choice.get("finish_reason"),
+                          "generation_state": outcome["state"],
+                          "generation": response.get("_tars_generation", {})},
             )
 
     finally:

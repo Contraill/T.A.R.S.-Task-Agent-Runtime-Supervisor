@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 from urllib.parse import quote
 import urllib.request
+import time
 
 from .config import runtime_base_url
 from .runtime_backends import InferenceRequest, backend_binding_ready, backend_for_model
 from .registry import get_model
 from .roles import get_role
+from .generation import generation_budget, generation_ceiling
+from .thinking import capability_for_model, decide as decide_thinking
 
 
 def get_json(url, timeout=5):
@@ -42,12 +45,17 @@ def upstream_post_json(cfg, runtime_id, path, payload, *, timeout=600):
     )
 
 
-def apply_chat_template(cfg, runtime_id, messages):
+def apply_chat_template(cfg, runtime_id, messages, *, thinking_mode=None):
+    payload = {"messages": messages}
+    if thinking_mode in {"off", "on"}:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": thinking_mode == "on"
+        }
     response = upstream_post_json(
         cfg,
         runtime_id,
         "/apply-template",
-        {"messages": messages},
+        payload,
         timeout=1200,
     )
     prompt = response.get("prompt")
@@ -75,8 +83,10 @@ def tokenize_text(cfg, runtime_id, content):
     return tokens
 
 
-def count_chat_tokens(cfg, runtime_id, messages):
-    prompt = apply_chat_template(cfg, runtime_id, messages)
+def count_chat_tokens(cfg, runtime_id, messages, *, thinking_mode=None):
+    prompt = apply_chat_template(
+        cfg, runtime_id, messages, thinking_mode=thinking_mode
+    )
     return len(tokenize_text(cfg, runtime_id, prompt))
 
 
@@ -92,14 +102,71 @@ def _checked_role(role):
     return role_record, model
 
 
-def chat_completion(cfg, role, messages, *, max_tokens=1024, temperature=0.2):
+def _inference_request(cfg, role, messages, *, max_tokens=None, input_tokens=None,
+                       temperature=0.2, thinking="auto", operation="chat",
+                       task_active=False, requires_tools=False, complex_task=False):
     role_record, model = _checked_role(role)
     backend = backend_for_model(model, cfg)
-    request = InferenceRequest(role_record.runtime_id, tuple(messages), max_tokens, temperature)
-    return backend.complete(request)
+    thinking_decision = decide_thinking(
+        cfg, role_record.id, capability_for_model(model), requested=thinking,
+        operation=operation, task_active=task_active, requires_tools=requires_tools,
+        complex_task=complex_task)
+    # Thinking controls can alter the rendered chat template. Count the exact
+    # template used by inference so the dynamic ceiling is based on the real
+    # prompt, even when a context projection supplied an earlier estimate.
+    tokens = count_chat_tokens(
+        cfg, role_record.runtime_id, messages,
+        thinking_mode=thinking_decision.effective,
+    )
+    budget = generation_budget(cfg, role_record.id, requested_tokens=max_tokens)
+    ceiling = generation_ceiling(budget, tokens)
+    request = InferenceRequest(
+        role_record.runtime_id, tuple(messages), ceiling, temperature,
+        thinking_decision.effective, max_tokens, tokens)
+    metadata = {"requested_generation_limit": max_tokens,
+                "configured_generation_limit": ceiling, "input_tokens": tokens,
+                "thinking_policy": thinking_decision.requested,
+                "thinking_effective": thinking_decision.effective,
+                "thinking_mechanism": thinking_decision.mechanism}
+    return backend, request, metadata
 
 
-def chat_completion_stream(cfg, role, messages, *, max_tokens=1024, temperature=0.2):
+def _reported_usage(usage):
+    result = {}
+    for key in ("prompt_tokens", "completion_tokens"):
+        if key in usage:
+            result[key] = usage[key]
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict) and "reasoning_tokens" in details:
+        result["reasoning_tokens"] = details["reasoning_tokens"]
+    return result
+
+
+def chat_completion(cfg, role, messages, *, max_tokens=None, input_tokens=None,
+                    temperature=0.2, thinking="auto", operation="chat",
+                    task_active=False, requires_tools=False, complex_task=False):
+    overall_started = time.monotonic()
+    backend, request, metadata = _inference_request(
+        cfg, role, messages, max_tokens=max_tokens, input_tokens=input_tokens,
+        temperature=temperature, thinking=thinking, operation=operation,
+        task_active=task_active, requires_tools=requires_tools,
+        complex_task=complex_task)
+    started = time.monotonic()
+    response = backend.complete(request)
+    choice = (response.get("choices") or [{}])[0]
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    response["_tars_generation"] = metadata | _reported_usage(usage) | {
+        "finish_reason": choice.get("finish_reason"),
+        "elapsed_seconds": time.monotonic() - started,
+        "preparation_seconds": started - overall_started,
+    }
+    return response
+
+
+def chat_completion_stream(cfg, role, messages, *, max_tokens=None, input_tokens=None,
+                           temperature=0.2, thinking="auto", operation="chat",
+                           task_active=False, requires_tools=False,
+                           complex_task=False):
     """Yield normalized streaming events.
 
     Event shape:
@@ -109,15 +176,33 @@ def chat_completion_stream(cfg, role, messages, *, max_tokens=1024, temperature=
     `reasoning` is populated only from backend-emitted reasoning_content (or the
     equivalent reasoning field).  T.A.R.S. never synthesizes Raw reasoning.
     """
-    role_record, model = _checked_role(role)
-    backend = backend_for_model(model, cfg)
-    request = InferenceRequest(role_record.runtime_id, tuple(messages), max_tokens, temperature)
+    overall_started = time.monotonic()
+    backend, request, metadata = _inference_request(
+        cfg, role, messages, max_tokens=max_tokens, input_tokens=input_tokens,
+        temperature=temperature, thinking=thinking, operation=operation,
+        task_active=task_active, requires_tools=requires_tools,
+        complex_task=complex_task)
+    started = time.monotonic()
+    first_token = None
+    last_finish = None
     for event in backend.stream(request):
+        if first_token is None and (event.content or event.reasoning):
+            first_token = time.monotonic() - started
+        usage = event.usage or {}
+        if event.finish_reason is not None:
+            last_finish = event.finish_reason
+        generation = metadata | _reported_usage(usage) | {
+            "finish_reason": last_finish,
+            "elapsed_seconds": time.monotonic() - started,
+            "preparation_seconds": started - overall_started,
+            "first_token_seconds": first_token,
+        }
         yield {
             "content": event.content,
             "reasoning": event.reasoning,
             "tool_calls": list(event.tool_calls),
             "finish_reason": event.finish_reason,
             "usage": event.usage,
+            "generation": generation,
             "raw": event.raw,
         }

@@ -26,6 +26,8 @@ class RuntimeCapabilities:
     explicit_load: bool
     explicit_unload: bool
     on_demand: bool
+    thinking_modes: tuple[str, ...] = ()
+    thinking_mechanism: str = "model-dependent"
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,8 @@ class ModelCapabilities:
     output_modalities: tuple[str, ...] = ("text",)
     reasoning: bool | None = None
     tool_calls: bool | None = None
+    thinking_modes: tuple[str, ...] = ()
+    thinking_mechanism: str = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,9 @@ class InferenceRequest:
     messages: tuple[dict, ...]
     max_tokens: int = 1024
     temperature: float = 0.2
+    thinking_mode: str | None = None
+    requested_generation_limit: int | None = None
+    input_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -140,10 +147,11 @@ class LlamaCppBackend:
     identity = "llama.cpp"
     support = "reference-tested"
 
-    def __init__(self, cfg, *, transport: Transport | None = None):
+    def __init__(self, cfg, *, transport: Transport | None = None, model_record=None):
         self.cfg = cfg
         self.base_url = runtime_base_url(cfg)
         self.transport = transport or UrllibTransport()
+        self.model_record = model_record
 
     def _models(self):
         return self.transport.json("GET", self.base_url + "/v1/models", timeout=5).get("data", [])
@@ -158,12 +166,16 @@ class LlamaCppBackend:
         return BackendStatus(self.identity, True, True, "healthy", self.support)
 
     def capabilities(self):
-        return RuntimeCapabilities(True, True, True, False, False, True)
+        return RuntimeCapabilities(True, True, True, False, False, True,
+                                   ("off", "on"),
+                                   "chat_template_kwargs.enable_thinking when model metadata is verified")
 
     def model_capabilities(self, model):
         row = next((item for item in self._models() if item.get("id") == model), {})
         architecture = row.get("architecture") or {}
         capabilities = row.get("capabilities") or {}
+        toggle = (self.model_record is not None and
+                  getattr(self.model_record, "thinking_control", "unknown") == "toggle")
         return ModelCapabilities(
             model=model,
             context=int(row.get("context_length") or (row.get("meta") or {}).get("n_ctx") or 0),
@@ -171,6 +183,9 @@ class LlamaCppBackend:
             output_modalities=tuple(architecture.get("output_modalities") or ("text",)),
             reasoning=True if row.get("reasoning") is True else None,
             tool_calls=bool(capabilities.get("function_calling")) if capabilities else None,
+            thinking_modes=("off", "on") if toggle else (),
+            thinking_mechanism=("llama.cpp chat_template_kwargs.enable_thinking"
+                                if toggle else "unverified"),
         )
 
     def load(self, model):
@@ -185,6 +200,9 @@ class LlamaCppBackend:
     def _payload(request: InferenceRequest, *, stream=False):
         payload = {"model": request.model, "messages": list(request.messages),
                    "max_tokens": request.max_tokens, "temperature": request.temperature}
+        if request.thinking_mode is not None:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": request.thinking_mode == "on"}
         if stream:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
@@ -264,7 +282,12 @@ def backend_for_name(name: str, cfg, *, transport=None) -> RuntimeBackend:
 
 
 def backend_for_model(model, cfg, *, transport=None) -> RuntimeBackend:
-    return backend_for_name(model.backend, cfg, transport=transport)
+    backend_type = BACKEND_TYPES.get(model.backend)
+    if backend_type is None:
+        raise KeyError(f"unknown runtime backend: {model.backend}")
+    if backend_type is LlamaCppBackend:
+        return backend_type(cfg, transport=transport, model_record=model)
+    return backend_type(cfg, transport=transport)
 
 
 def backend_binding_ready(model) -> bool:

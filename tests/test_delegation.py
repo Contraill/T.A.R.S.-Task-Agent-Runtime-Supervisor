@@ -100,6 +100,18 @@ def test_child_run_join_and_parent_evidence_acceptance(delegated):
         "requested": False, "state": "accepted", "cancelled": False}
 
 
+def test_child_thinking_cannot_bypass_generation_budget(delegated):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": True})
+    assert delegation.child_inference_options(
+        contract.delegation_id, requested_tokens=80, thinking="on") == {
+            "max_tokens": 80, "thinking": "on"}
+    with pytest.raises(PermissionError, match="token budget"):
+        delegation.child_inference_options(
+            contract.delegation_id, requested_tokens=101, thinking="off")
+
+
 def test_child_memory_is_staged_until_parent_acceptance(delegated):
     _, _, create = delegated
     contract = create()
