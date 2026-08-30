@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- replaced the TUI's joined-line transcript with structured user, assistant, system, tool and error entries
+- stream ordinary assistant content directly into the selectable Conversation viewer using buffered updates
+- added rail-based message hierarchy, OS/configured display names, scroll follow control and new-output indication
+- added mouse and keyboard transcript navigation plus selection-only clipboard copy
+
 ## 0.7.6 - Skills, MCP and Generation Policy
 
 - added deterministic global, project and Role skill discovery with progressive disclosure and validation

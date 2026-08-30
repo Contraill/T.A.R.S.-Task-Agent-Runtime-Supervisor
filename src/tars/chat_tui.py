@@ -43,6 +43,7 @@ from .themes import (
 )
 from .generation import SIDEBAND_GENERATION_TOKENS, generation_outcome
 from .thinking import capability_for_model, configured_policy
+from .transcript import EntryKind, TranscriptModel, configured_display_name
 
 
 STATIC_COMMANDS = [
@@ -212,7 +213,8 @@ class ChatTUI:
         self.logo_mode = current_logo()
 
         self.context_manager = ContextManager(cfg)
-        self.log_lines: list[str] = []
+        self.display_name = configured_display_name(cfg)
+        self.transcript = TranscriptModel(self.display_name)
         self.queue: asyncio.Queue | None = None
         self.busy = False
         self.activity = "Ready"
@@ -226,6 +228,11 @@ class ChatTUI:
         self.live_stream_role = ""
         self.live_stream_started = None
         self.live_reasoning_chars = 0
+        self._stream_entry = None
+        self._stream_dirty = False
+        self._stream_flush_handle = None
+        self._follow_output = True
+        self._new_output_below = False
         self._event_cursor: dict[str, int] = {}
         self.temporary: TemporarySession | None = None
 
@@ -236,7 +243,7 @@ class ChatTUI:
         self.output = TextArea(
             text="",
             read_only=True,
-            focusable=False,
+            focusable=True,
             scrollbar=True,
             wrap_lines=True,
             height=Dimension(weight=1),
@@ -245,7 +252,7 @@ class ChatTUI:
         self.input = TextArea(
             height=1,
             multiline=False,
-            prompt=FormattedText([("class:prompt", "You › ")]),
+            prompt=FormattedText([("class:prompt", f"{self.display_name} › ")]),
             history=history,
             completer=CommandCompleter(),
             complete_while_typing=True,
@@ -286,7 +293,7 @@ class ChatTUI:
                 Window(self.live_control, height=Dimension(preferred=5, max=7), wrap_lines=True),
                 title="Live Model Stream",
             ),
-            filter=Condition(lambda: self.busy),
+            filter=Condition(lambda: self.busy and self.reasoning == "raw"),
         )
 
         footer = Window(self.footer_control, height=1)
@@ -304,12 +311,48 @@ class ChatTUI:
 
         @kb.add("c-c")
         def _ctrl_c(event):
+            if event.current_buffer is self.output.buffer and self.output.buffer.selection_state:
+                data = self.output.buffer.copy_selection()
+                event.app.clipboard.set_data(data)
+                self.activity = "Transcript selection copied"
+                event.app.invalidate()
+                return
             if self.input.text:
                 self.input.buffer.reset()
                 self.activity = "Input cleared"
             else:
                 self.activity = "Ready"
             event.app.invalidate()
+
+        @kb.add("pageup")
+        def _page_up(event):
+            self._scroll_transcript(-max(1, self.output.window.render_info.window_height - 2)
+                                    if self.output.window.render_info else -10)
+            event.app.invalidate()
+
+        @kb.add("pagedown")
+        def _page_down(event):
+            self._scroll_transcript(max(1, self.output.window.render_info.window_height - 2)
+                                    if self.output.window.render_info else 10)
+            event.app.invalidate()
+
+        @kb.add("home")
+        def _home(event):
+            if event.current_buffer is self.output.buffer or not self.input.text:
+                self.output.buffer.cursor_position = 0
+                self.output.window.vertical_scroll = 0
+                self._follow_output = False
+                event.app.invalidate()
+            else:
+                event.current_buffer.cursor_position = 0
+
+        @kb.add("end")
+        def _end(event):
+            if event.current_buffer is self.output.buffer or not self.input.text:
+                self._resume_follow()
+                event.app.invalidate()
+            else:
+                event.current_buffer.cursor_position = len(event.current_buffer.text)
 
         @kb.add("c-d")
         def _ctrl_d(event):
@@ -614,41 +657,73 @@ class ChatTUI:
 
     def _footer_fragments(self):
         queue_text = f" · queued {self.queued}" if self.queued else ""
+        below = " · ↓ newer output" if self._new_output_below else ""
         return FormattedText([
-            ("class:footer", f" Enter send · / commands · Tab complete · ↑↓ history · Ctrl-C clear · Ctrl-D exit · {self.activity}{queue_text}"),
+            ("class:footer", f" Enter send · PgUp/PgDn scroll · End follow · select + Ctrl-C copy · Ctrl-D exit · {self.activity}{queue_text}{below}"),
         ])
 
-    def _render_output(self):
-        text = "\n".join(self.log_lines)
+    def _at_output_bottom(self):
+        info = self.output.window.render_info
+        if info is None:
+            return self._follow_output
+        return info.vertical_scroll + info.window_height >= info.content_height
+
+    def _scroll_transcript(self, amount):
+        info = self.output.window.render_info
+        maximum = max(0, info.content_height - info.window_height) if info else 0
+        self.output.window.vertical_scroll = max(
+            0, min(maximum, self.output.window.vertical_scroll + amount))
+        self._follow_output = self.output.window.vertical_scroll >= maximum
+        if self._follow_output:
+            self._new_output_below = False
+
+    def _resume_follow(self):
+        self._follow_output = True
+        self._new_output_below = False
+        self.output.buffer.cursor_position = len(self.output.buffer.text)
+        self.output.window.vertical_scroll = 10 ** 9
+
+    def _render_output(self, *, streamed=False):
+        was_bottom = self._at_output_bottom() and self._follow_output
+        text = self.transcript.render()
+        buffer = self.output.buffer
+        cursor = buffer.cursor_position
+        selection = buffer.selection_state
         self.output.buffer.set_document(
-            Document(text=text, cursor_position=len(text)),
+            Document(text=text, cursor_position=(len(text) if was_bottom else min(cursor, len(text)))),
             bypass_readonly=True,
         )
+        buffer.selection_state = selection
+        if was_bottom:
+            self._resume_follow()
+        elif streamed:
+            self._follow_output = False
+            self._new_output_below = True
         self.app.invalidate()
 
     def _append(self, prefix, text, *, blank=True):
-        if blank and self.log_lines:
-            self.log_lines.append("")
-        clean = str(text).rstrip()
-        if "\n" in clean:
-            lines = clean.splitlines()
-            self.log_lines.append(f"{prefix} {lines[0]}")
-            indent = " " * (len(prefix) + 1)
-            self.log_lines.extend(indent + line for line in lines[1:])
-        else:
-            self.log_lines.append(f"{prefix} {clean}")
+        clean_prefix = str(prefix).strip().rstrip("·›")
+        kind = EntryKind.ERROR if "error" in clean_prefix.casefold() else EntryKind.SYSTEM
+        if "tool" in clean_prefix.casefold():
+            kind = EntryKind.TOOL
+        elif "reasoning" in clean_prefix.casefold() or "raw" in clean_prefix.casefold():
+            kind = EntryKind.REASONING
+        self.transcript.append(kind, text, label=clean_prefix)
         self._render_output()
 
     def _append_system(self, text):
-        self._append("T.A.R.S. ·", text, blank=False)
+        self.transcript.append(EntryKind.SYSTEM, text)
+        self._render_output()
 
     def _append_user(self, text):
-        self._append("You ›", text)
+        self.transcript.append(EntryKind.USER, text)
+        self._render_output()
 
     def _append_assistant(self, role_id, text, sideband=False):
         role = get_role(role_id).display_name
-        prefix = f"{role} {'· sideband' if sideband else '›'}"
-        self._append(prefix, text or "[no final content]")
+        self.transcript.append(EntryKind.ASSISTANT, text or "[no final content]",
+                               label=role, detail="sideband" if sideband else "")
+        self._render_output()
 
     # ---------- status ----------
     @staticmethod
@@ -1110,7 +1185,36 @@ class ChatTUI:
         self.live_stream_kind = kind
         self.live_stream_role = get_role(role_id).display_name
         self.live_stream_started = time.monotonic()
+        self._stream_entry = self.transcript.start_assistant(
+            get_role(role_id).display_name,
+            detail="sideband" if kind == "sideband" else "")
+        self._render_output(streamed=True)
         self.app.invalidate()
+
+    def _flush_stream(self):
+        self._stream_flush_handle = None
+        if self._stream_dirty:
+            self._stream_dirty = False
+            self._render_output(streamed=True)
+
+    def _finish_stream(self, fallback="[no final content]"):
+        if self._stream_flush_handle is not None:
+            self._stream_flush_handle.cancel()
+            self._stream_flush_handle = None
+        self._flush_stream()
+        if self._stream_entry is not None:
+            self.transcript.finish(self._stream_entry, fallback=fallback)
+            self._stream_entry = None
+            self._render_output(streamed=True)
+
+    def _discard_stream(self):
+        if self._stream_flush_handle is not None:
+            self._stream_flush_handle.cancel()
+            self._stream_flush_handle = None
+        if self._stream_entry is not None:
+            self.transcript.discard(self._stream_entry)
+            self._stream_entry = None
+            self._render_output()
 
     def _consume_stream_event(self, event):
         reasoning = event.get("reasoning") or ""
@@ -1122,6 +1226,12 @@ class ChatTUI:
                 self.live_reasoning = self.live_reasoning[-32000:]
         if content:
             self.live_content += content
+            if self._stream_entry is not None:
+                self.transcript.stream(self._stream_entry, content)
+                self._stream_dirty = True
+                if self._stream_flush_handle is None:
+                    self._stream_flush_handle = asyncio.get_running_loop().call_later(
+                        0.04, self._flush_stream)
         self.app.invalidate()
 
     async def _stream_completion(self, role_id, messages, *, max_tokens=None,
@@ -1224,6 +1334,9 @@ class ChatTUI:
             try:
                 if item.kind == "task":
                     result = await self._run_task_stream(item)
+                    # Task epochs are reasoning/control work and their generated
+                    # draft is not promoted as a canonical assistant message.
+                    self._discard_stream()
                     if result and self.reasoning == "raw" and result.get("reasoning"):
                         raw = result["reasoning"]
                         shown = raw[-16000:]
@@ -1273,6 +1386,7 @@ class ChatTUI:
                         input_tokens=projection.token_count,
                         thinking=item.thinking or self.thinking, kind="sideband"
                     )
+                    self._finish_stream(fallback=f"[no final content · {finish}]")
                     if self.reasoning == "raw" and raw:
                         shown = raw[-16000:]
                         note = "\n[earlier raw reasoning omitted from display]" if self.live_reasoning_chars > len(shown) else ""
@@ -1281,8 +1395,6 @@ class ChatTUI:
                     sideband_final = content or f"[no final content · {finish}]"
                     if outcome["state"] == "exhausted" and outcome["empty"]:
                         self._append_system("Sideband generation exhausted its explicit ceiling before final content.")
-                    else:
-                        self._append_assistant(item.role_id, sideband_final, sideband=True)
                     add_message(
                         self.conversation.id, "assistant", sideband_final, kind="sideband",
                         include_in_context=False, related_task_id=task.id if task else None,
@@ -1314,6 +1426,7 @@ class ChatTUI:
                         thinking=item.thinking or self.thinking, kind="chat",
                         task_active=task is not None
                     )
+                    self._finish_stream(fallback=f"[no final content · {finish}]")
                     if self.reasoning == "raw" and raw:
                         shown = raw[-16000:]
                         note = "\n[earlier raw reasoning omitted from display]" if self.live_reasoning_chars > len(shown) else ""
@@ -1325,7 +1438,6 @@ class ChatTUI:
                     if outcome["state"] == "exhausted" and outcome["empty"]:
                         self._append_system("Generation exhausted its context-bounded ceiling before final content.")
                     else:
-                        self._append_assistant(item.role_id, final)
                         if outcome["state"] == "exhausted":
                             self._append_system(
                                 "Response reached its generation ceiling. Use /continue to continue the text explicitly.")
@@ -1347,6 +1459,7 @@ class ChatTUI:
                     )
 
             except Exception as exc:
+                self._discard_stream()
                 self._append("Runtime error ·", str(exc))
             finally:
                 self.busy = False

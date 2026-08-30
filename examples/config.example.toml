@@ -7,6 +7,10 @@ state = "~/.local/state/tars"
 cache = "~/.cache/tars"
 workspace = "~/TARS-Workspace"
 
+[ui]
+# Optional. Defaults to the local operating-system username.
+# display_name = "Local User"
+
 [runtime]
 backend = "llama.cpp"
 manager = "llama-swap"
