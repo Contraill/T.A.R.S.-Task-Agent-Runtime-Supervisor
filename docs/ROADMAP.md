@@ -288,9 +288,19 @@ Status: implemented.
 
 See [EXTENSIONS.md](EXTENSIONS.md) for contracts and trust behavior.
 
+### v0.8.5 — SecretStore
+
+Status: implemented.
+
+- provider-based secret references with optional per-consumer scopes
+- environment and injected external-manager adapters without plaintext persistence
+- authoritative resolution in execution/SSH, MCP, web-service and Core client paths
+- response and process-output redaction at credential-bearing boundaries
+
+See [SECRETS.md](SECRETS.md) for reference and consumer behavior.
+
 ### Remaining v0.8.x work
 
-- SecretStore
 - versioned backup/restore/migration
 
 Normal portable bundles exclude model weights and include calibration history. Restore performs environment recognition, then Welcome Back.

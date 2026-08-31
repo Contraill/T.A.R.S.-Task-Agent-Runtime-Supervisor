@@ -17,6 +17,7 @@ from .policy import ScopeRequest, normalize_network_target, redact
 from .state_store import (connect, ensure_state_store, json_dumps, json_loads,
                           now_utc, transaction)
 from .tool_core import ToolResult, ToolRuntime
+from .secret_store import SecretStore, parse_reference
 
 
 PROTOCOL_VERSION = "2025-03-26"
@@ -58,15 +59,15 @@ def register(name, transport, config, *, enabled=True, tool_filter=None,
             r"(?i)^--?(?:api[-_]?key|authorization|password|secret|token)(?:=|$)")
         if any(sensitive.search(str(value)) for value in config["argv"]):
             raise ValueError("MCP credentials must be injected through secret references, not argv")
-        if config.get("env") and not all(str(value).startswith("env:")
-                                         for value in config["env"].values()):
-            raise ValueError("MCP environment values must be secret references")
+        if config.get("env"):
+            for value in config["env"].values():
+                parse_reference(value)
     else:
         if not str(config.get("url", "")).startswith(("http://", "https://")):
             raise ValueError("streamable HTTP MCP config requires an HTTP(S) URL")
         config["url"] = normalize_network_target(config["url"], resolve_dns=True)[0]
-        if config.get("authorization_ref") and not str(config["authorization_ref"]).startswith("env:"):
-            raise ValueError("MCP authorization must use a secret reference")
+        if config.get("authorization_ref"):
+            parse_reference(config["authorization_ref"])
     effects = dict(effect_policy or {})
     if any(value not in VALID_EFFECTS for value in effects.values()):
         raise ValueError("invalid MCP effect policy")
@@ -114,15 +115,6 @@ def set_enabled(name, enabled):
     return load_server(name)
 
 
-def _secret(reference):
-    if not str(reference).startswith("env:"):
-        raise ValueError("only env: secret references are supported")
-    name = str(reference)[4:]
-    if not name or name not in os.environ:
-        raise RuntimeError(f"secret reference is unavailable: env:{name}")
-    return os.environ[name]
-
-
 def _redact_secret_values(value, secrets):
     if isinstance(value, dict):
         return {key: _redact_secret_values(item, secrets) for key, item in value.items()}
@@ -138,9 +130,11 @@ def _redact_secret_values(value, secrets):
 
 
 class StdioTransport:
-    def __init__(self, config, *, popen=subprocess.Popen):
+    def __init__(self, config, *, popen=subprocess.Popen, secret_store=None,
+                 consumer="mcp:stdio"):
+        store = secret_store or SecretStore()
         env = os.environ.copy()
-        resolved = {key: _secret(value) for key, value in config.get("env", {}).items()}
+        resolved = store.resolve_many(config.get("env", {}), consumer=consumer)
         env.update(resolved)
         self.secret_values = tuple(resolved.values())
         self.process = popen(config["argv"], cwd=config.get("cwd") or None, env=env,
@@ -176,10 +170,13 @@ class StreamableHTTPTransport:
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             return None
 
-    def __init__(self, config, *, opener=None):
+    def __init__(self, config, *, opener=None, secret_store=None,
+                 consumer="mcp:http"):
         self.url = config["url"]
         self.timeout = float(config.get("timeout", 30))
         self.authorization_ref = config.get("authorization_ref")
+        self.secret_store = secret_store or SecretStore()
+        self.consumer = consumer
         self.opener = opener or urllib.request.build_opener(self._NoRedirect).open
         self.session_id = None
         self.secret_values = ()
@@ -187,9 +184,10 @@ class StreamableHTTPTransport:
     def request(self, payload):
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         if self.authorization_ref:
-            secret = _secret(self.authorization_ref)
-            self.secret_values = (secret,)
-            headers["Authorization"] = "Bearer " + secret
+            with self.secret_store.resolve(
+                    self.authorization_ref, consumer=self.consumer) as secret:
+                self.secret_values = (secret,)
+                headers["Authorization"] = "Bearer " + secret
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         current, approved_host = normalize_network_target(self.url, resolve_dns=True)
@@ -248,7 +246,7 @@ def _included(name, filters):
 
 class MCPClient:
     def __init__(self, server, *, transport=None, runtime=None,
-                 connection_approval_id=None):
+                 connection_approval_id=None, secret_store=None):
         self.server = load_server(server) if isinstance(server, str) else server
         if not self.server.enabled:
             raise RuntimeError(f"MCP server is disabled: {self.server.name}")
@@ -264,7 +262,9 @@ class MCPClient:
                 (("connect", request),), {"connect": connection_approval_id})
             transport_cls = StdioTransport if self.server.transport == "stdio" else StreamableHTTPTransport
             try:
-                transport = transport_cls(self.server.config)
+                transport = transport_cls(
+                    self.server.config, secret_store=secret_store,
+                    consumer=f"mcp:{self.server.name}")
             except Exception as exc:
                 self.runtime.finish(actions, state="failed", result={"error": str(exc)})
                 self.state = "error"

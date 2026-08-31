@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 
 from .http_tools import HTTPTools
 from .tool_core import ToolResult
+from .secret_store import SecretStore, parse_reference
 
 
 class TavilyResearch:
@@ -17,12 +17,14 @@ class TavilyResearch:
         "crawl": "https://api.tavily.com/crawl",
     }
 
-    def __init__(self, *, secret_ref="env:TAVILY_API_KEY", http=None):
+    def __init__(self, *, secret_ref="env:TAVILY_API_KEY", http=None, secret_store=None):
+        parse_reference(secret_ref)
         self.secret_ref = secret_ref
         self.http = http or HTTPTools()
+        self.secret_store = secret_store or SecretStore()
 
     def status(self):
-        available = self.secret_ref.startswith("env:") and self.secret_ref[4:] in os.environ
+        available = self.secret_store.available(self.secret_ref, consumer="web:tavily")
         return {"backend": self.identity, "available": available, "support": self.support,
                 "secret_ref": self.secret_ref,
                 "message": "available" if available else "Tavily credential unavailable"}
@@ -34,14 +36,14 @@ class TavilyResearch:
         if not status["available"]:
             return ToolResult(f"web.{capability}", "unavailable", status,
                               error=status["message"])
-        api_key = os.environ[self.secret_ref[4:]]
-        body = json.dumps({"api_key": api_key, **payload}).encode()
-        response = self.http.request(
-            "POST", self.ENDPOINTS[capability],
-            headers={"Content-Type": "application/json"}, body=body,
-            approval_ids=approval_ids, task_id=task_id, session_id=session_id,
-            sensitive_values=(api_key,),
-        )
+        with self.secret_store.resolve(self.secret_ref, consumer="web:tavily") as api_key:
+            body = json.dumps({"api_key": api_key, **payload}).encode()
+            response = self.http.request(
+                "POST", self.ENDPOINTS[capability],
+                headers={"Content-Type": "application/json"}, body=body,
+                approval_ids=approval_ids, task_id=task_id, session_id=session_id,
+                sensitive_values=(api_key,),
+            )
         if not response.succeeded:
             return ToolResult(f"web.{capability}", "failed", response.data,
                               error=response.error, action_ids=response.action_ids,

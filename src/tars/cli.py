@@ -133,6 +133,7 @@ from .core_auth import (DEFAULT_PERMISSIONS, PERMISSIONS as CLIENT_PERMISSIONS,
 from .core_api import CoreAPI, CoreServerConfig, make_server
 from .runtime_routing import LocalRuntimeRouter
 from .extensions import ExtensionLoader
+from .secret_store import SecretStore
 
 console = Console()
 
@@ -1499,7 +1500,7 @@ def command_skill(args):
     return 0
 
 
-def command_mcp(args):
+def command_mcp(args, cfg=None):
     try:
         if args.mcp_command == "list":
             data = [{"name": item.name, "transport": item.transport,
@@ -1517,7 +1518,9 @@ def command_mcp(args):
             item = set_mcp_enabled(args.name, args.mcp_command == "enable")
             data = {"name": item.name, "enabled": item.enabled}
         else:
-            client = MCPClient(args.name, connection_approval_id=args.connect_approval)
+            client = MCPClient(
+                args.name, connection_approval_id=args.connect_approval,
+                secret_store=SecretStore.from_config(cfg))
             try:
                 if args.mcp_command == "tools":
                     data = client.discover_tools()
@@ -2311,7 +2314,7 @@ def main():
     if args.command == "skill":
         return command_skill(args)
     if args.command == "mcp":
-        return command_mcp(args)
+        return command_mcp(args, cfg)
     if args.command in {"start", "stop"}:
         return command_service(args.command)
     if args.command == "logs":

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.5 - SecretStore
+
+- added provider-based secret references with explicit consumer scope enforcement
+- routed subprocess, SSH, MCP, Tavily and remote Core client credentials through SecretStore
+- retained reference-only durable configuration and last-moment scoped resolution
+- added integration coverage proving real consumer paths resolve credentials without persisting them
+
 ## 0.8.4 - Extension Boundaries
 
 - added a versioned provider contract and metadata-only discovery for runtime and tool extensions

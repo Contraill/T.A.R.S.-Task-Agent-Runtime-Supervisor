@@ -14,6 +14,7 @@ from .config import STATE_ROOT
 from .execution_backends import ExecutionRequest, GuardedExecutor, HostBackend, ResourceLimits
 from .policy import ScopeRequest, canonical_path
 from .tool_core import ToolResult, ToolRuntime
+from .secret_store import SecretStore
 
 
 @dataclass
@@ -36,9 +37,10 @@ def _stamp():
 
 
 class ProcessManager:
-    def __init__(self, *, log_root=None, runtime=None):
+    def __init__(self, *, log_root=None, runtime=None, secret_store=None):
         self.log_root = Path(log_root or (STATE_ROOT / "process-logs"))
         self.runtime = runtime or ToolRuntime()
+        self.secret_store = secret_store or SecretStore()
         self._processes = {}
         self._handles = {}
         self._lock = threading.Lock()
@@ -68,10 +70,9 @@ class ProcessManager:
         argv = ["/bin/bash", "-lc", request.argv[0]] if request.shell else list(request.argv)
         environment = os.environ.copy()
         try:
-            for name, reference in request.environment_refs.items():
-                if not reference.startswith("env:") or reference[4:] not in os.environ:
-                    raise KeyError(f"unavailable environment reference: {reference}")
-                environment[name] = os.environ[reference[4:]]
+            resolved = self.secret_store.resolve_many(
+                request.environment_refs, consumer="execution:background")
+            environment.update(resolved)
             secrets = tuple(environment[name].encode() for name in request.environment_refs)
             process = subprocess.Popen(
                 argv, cwd=cwd, env=environment, stdin=subprocess.PIPE,

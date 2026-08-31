@@ -3,13 +3,27 @@ from __future__ import annotations
 import json
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from .secret_store import SecretStore, parse_reference
 
 
 class CoreClient:
-    def __init__(self, base_url: str, token: str, *, transport=None):
+    def __init__(self, base_url: str, token: str | None = None, *, token_ref=None,
+                 secret_store=None, transport=None):
+        if bool(token) == bool(token_ref):
+            raise ValueError("provide exactly one Core token or token reference")
+        if token_ref:
+            parse_reference(token_ref)
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        self._token = token
+        self.token_ref = token_ref
+        self.secret_store = secret_store or SecretStore()
         self.transport = transport or urlopen
+
+    def _authorization(self):
+        if self._token is not None:
+            return "Bearer " + self._token
+        with self.secret_store.resolve(self.token_ref, consumer="core:client") as token:
+            return "Bearer " + token
 
     @classmethod
     def pair(cls, base_url: str, code: str, name: str, *, metadata=None, transport=None):
@@ -27,7 +41,7 @@ class CoreClient:
         data = None if body is None else json.dumps(body).encode()
         request = Request(
             self.base_url + path, data=data, method=method,
-            headers={"Authorization": f"Bearer {self.token}",
+            headers={"Authorization": self._authorization(),
                      "Content-Type": "application/json", "Accept": "application/json"})
         try:
             with self.transport(request, timeout=30) as response:
@@ -72,7 +86,7 @@ class CoreClient:
     def stream_events(self, task_id, *, after=0, follow=True):
         request = Request(
             self.base_url + f"/v1/tasks/{task_id}/events?after={int(after)}&follow={1 if follow else 0}",
-            headers={"Authorization": f"Bearer {self.token}",
+            headers={"Authorization": self._authorization(),
                      "Accept": "text/event-stream"})
         with self.transport(request, timeout=None) as response:
             data = []

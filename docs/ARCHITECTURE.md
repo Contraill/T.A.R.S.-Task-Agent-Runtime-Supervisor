@@ -34,6 +34,8 @@ Memory           ScopeGuard
 
 **Core is stable; edges are replaceable.** Built-ins are identified separately from explicitly trusted in-process extensions. Runtime extensions still pass local routing and lifecycle checks; tool extensions still pass deterministic policy, audit and ToolResult checks. MCP is preferred when an integration does not require a native in-process contract.
 
+**Secrets are references at rest.** SecretStore resolves provider references only at a named consumer boundary. Execution, SSH, MCP, web-service and remote Core client paths receive scoped values at the last responsible moment; values do not enter prompts or durable configuration.
+
 **One task has one owner.** Delegation does not change ownership. Handoff does, and must be transactional.
 
 **Security is deterministic.** ScopeGuard and the tool executor decide what can run. The model does not grant itself permission.

@@ -14,6 +14,7 @@ import uuid
 from .action_journal import begin_action, finish_action, record_denied
 from .approvals import ApprovalBroker
 from .policy import ScopeGuard, ScopeRequest, canonical_path, normalize_network_target, redact
+from .secret_store import SecretStore, parse_reference
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,10 @@ class SSHExecutionTarget:
     allowed_commands: tuple[str, ...] = ()
     allowed_paths: tuple[str, ...] = ()
 
+    def __post_init__(self):
+        if self.credential_ref:
+            parse_reference(self.credential_ref)
+
 
 @dataclass(frozen=True)
 class ExecutionRequest:
@@ -77,6 +82,8 @@ class ExecutionRequest:
             raise ValueError("execution limits must be positive")
         if self.workspace_mode not in {"ephemeral", "read_only", "read_write"}:
             raise ValueError("invalid container workspace mode")
+        for reference in self.environment_refs.values():
+            parse_reference(reference)
 
 
 @dataclass(frozen=True)
@@ -136,25 +143,21 @@ def _stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _environment(refs):
+def _environment(refs, *, secret_store=None, consumer="execution:host"):
+    store = secret_store or SecretStore()
     result = os.environ.copy()
     for name, reference in refs.items():
         if not name or not name.replace("_", "a").isalnum() or name[0].isdigit():
             raise ValueError(f"invalid environment name: {name}")
-        if not reference.startswith("env:") or not reference[4:]:
-            raise ValueError("environment values must use env:NAME references")
-        source = reference[4:]
-        if source not in os.environ:
-            raise KeyError(f"unavailable environment reference: {reference}")
-        result[name] = os.environ[source]
+        parse_reference(reference)
+        with store.resolve(reference, consumer=consumer) as value:
+            result[name] = value
     return result
 
 
-def _secret_values(refs):
-    return tuple(
-        os.environ[reference[4:]] for reference in refs.values()
-        if reference.startswith("env:") and reference[4:] in os.environ
-    )
+def _secret_values(refs, *, secret_store=None, consumer="execution:host"):
+    return tuple((secret_store or SecretStore()).resolve_many(
+        refs, consumer=consumer).values())
 
 
 def _mask_text(value, secrets):
@@ -180,8 +183,9 @@ class HostBackend:
     identity = "host"
     support = "reference-tested"
 
-    def __init__(self, *, runner: Runner = subprocess.run):
+    def __init__(self, *, runner: Runner = subprocess.run, secret_store=None):
         self.runner = runner
+        self.secret_store = secret_store or SecretStore()
 
     def status(self):
         return ExecutionStatus(self.identity, True, self.support, "available")
@@ -195,7 +199,9 @@ class HostBackend:
         started = _stamp()
         try:
             proc = self.runner(
-                list(argv), cwd=cwd, env=_environment(request.environment_refs),
+                list(argv), cwd=cwd, env=_environment(
+                    request.environment_refs, secret_store=self.secret_store,
+                    consumer="execution:host"),
                 capture_output=True, text=True, timeout=request.limits.timeout,
                 check=False,
             )
@@ -210,9 +216,11 @@ class ContainerBackend:
     identity = "container"
     support = "tested"
 
-    def __init__(self, *, runtime=None, runner: Runner = subprocess.run, rootless_verified=None):
+    def __init__(self, *, runtime=None, runner: Runner = subprocess.run, rootless_verified=None,
+                 secret_store=None):
         self.runtime = runtime or shutil.which("podman") or shutil.which("docker")
         self.runner = runner
+        self.secret_store = secret_store or SecretStore()
         self.rootless_verified = (
             rootless_verified if rootless_verified is not None
             else bool(self.runtime and Path(self.runtime).name == "podman" and os.geteuid() != 0)
@@ -289,7 +297,8 @@ class ContainerBackend:
                     raise PermissionError("mount outside workspace requires sandbox-escape approval")
             mode = "ro" if mount.read_only else "rw"
             command += ["--volume", f"{source}:{destination}:{mode}"]
-        runtime_env = _environment(request.environment_refs)
+        runtime_env = _environment(request.environment_refs, secret_store=self.secret_store,
+                                   consumer="execution:container")
         for name in request.environment_refs:
             command += ["--env", name]
         command.append(request.image)
@@ -325,10 +334,12 @@ class SSHBackend:
     identity = "ssh"
     support = "experimental"
 
-    def __init__(self, targets=(), *, ssh_binary=None, runner: Runner = subprocess.run):
+    def __init__(self, targets=(), *, ssh_binary=None, runner: Runner = subprocess.run,
+                 secret_store=None):
         self.targets = {target.name: target for target in targets}
         self.ssh_binary = ssh_binary or shutil.which("ssh")
         self.runner = runner
+        self.secret_store = secret_store or SecretStore()
 
     def status(self):
         if not self.ssh_binary:
@@ -359,12 +370,9 @@ class SSHBackend:
                    "-o", f"ConnectTimeout={max(1, min(int(request.limits.timeout), 30))}",
                    "-p", str(target.port)]
         if target.credential_ref:
-            if not target.credential_ref.startswith("env:"):
-                raise ValueError("SSH credentials must use an env: reference")
-            identity = os.environ.get(target.credential_ref[4:])
-            if not identity:
-                raise KeyError(f"unavailable SSH credential reference: {target.credential_ref}")
-            command += ["-i", identity]
+            with self.secret_store.resolve(
+                    target.credential_ref, consumer=f"ssh:{target.name}") as identity:
+                command += ["-i", identity]
         remote = shlex.join(request.argv)
         if request.cwd:
             remote = f"cd -- {shlex.quote(request.cwd)} && exec {remote}"
@@ -507,7 +515,10 @@ class GuardedExecutor:
             ) if backend_name == "container" else backend.execute(
                 request, authorization=authorization,
             )
-            secrets = _secret_values(request.environment_refs)
+            secret_store = getattr(backend, "secret_store", None)
+            secrets = _secret_values(
+                request.environment_refs, secret_store=secret_store,
+                consumer=f"execution:{backend_name}")
             if secrets:
                 result = replace(
                     result, stdout=_mask_text(result.stdout, secrets),
