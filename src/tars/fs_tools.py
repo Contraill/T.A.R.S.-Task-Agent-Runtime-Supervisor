@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
-import shutil
 
 from .policy import ScopeRequest, canonical_path
+from .secure_paths import AnchoredRoot, select_anchor
 from .tool_core import ToolResult, ToolRuntime
 
 
@@ -13,6 +14,7 @@ class FilesystemTools:
         self.roots = tuple(canonical_path(root) for root in roots)
         if not self.roots:
             raise ValueError("filesystem tools require at least one scope root")
+        self._anchors = tuple(AnchoredRoot(root) for root in self.roots)
         self.runtime = runtime or ToolRuntime()
 
     def _request(self, tool, effect, target, *, arguments=None, task_id=None, session_id=None,
@@ -118,7 +120,8 @@ class FilesystemTools:
         )
         actions = self.runtime.authorize((("write", request),), {"write": approval_id})
         try:
-            result = operation(Path(canonical_path(target)))
+            anchor, parts, display = select_anchor(self._anchors, target)
+            result = operation(anchor, parts, display)
         except Exception as exc:
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
@@ -129,19 +132,16 @@ class FilesystemTools:
                           action_ids=tuple(a.id for a in actions), evidence_ids=(evidence.id,))
 
     def mkdir(self, path, *, parents=False, approval_id=None, task_id=None, session_id=None):
-        def operation(target):
-            target.mkdir(parents=parents, exist_ok=False)
+        def operation(anchor, parts, target):
+            anchor.mkdir(parts, parents=parents)
             return {"path": str(target), "created": True}
         return self._mutate("fs.mkdir", path, operation, arguments={"parents": parents},
                             approval_id=approval_id, task_id=task_id, session_id=session_id)
 
     def write(self, path, content, *, create=True, approval_id=None, task_id=None, session_id=None):
         payload = content.encode("utf-8")
-        def operation(target):
-            if not create and not target.exists():
-                raise FileNotFoundError(target)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(payload)
+        def operation(anchor, parts, target):
+            anchor.atomic_write(parts, payload, require_existing=not create)
             return {"path": str(target), "bytes": len(payload),
                     "sha256": hashlib.sha256(payload).hexdigest()}
         return self._mutate("fs.write", path, operation,
@@ -149,8 +149,13 @@ class FilesystemTools:
                             approval_id=approval_id, task_id=task_id, session_id=session_id)
 
     def patch(self, path, replacements, *, approval_id=None, task_id=None, session_id=None):
-        def operation(target):
-            original = target.read_text()
+        def operation(anchor, parts, target):
+            fd = anchor.open(parts, os.O_RDONLY)
+            try:
+                with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                    original = handle.read()
+            except Exception:
+                raise
             updated = original
             applied = []
             for old, new in replacements:
@@ -159,7 +164,7 @@ class FilesystemTools:
                     raise ValueError(f"patch context must match exactly once; matched {count}")
                 updated = updated.replace(old, new, 1)
                 applied.append(hashlib.sha256(old.encode()).hexdigest())
-            target.write_text(updated)
+            anchor.atomic_write(parts, updated.encode(), require_existing=True)
             return {"path": str(target), "replacements": len(applied),
                     "before_sha256": hashlib.sha256(original.encode()).hexdigest(),
                     "after_sha256": hashlib.sha256(updated.encode()).hexdigest()}
@@ -178,12 +183,9 @@ class FilesystemTools:
         )
         actions = self.runtime.authorize(requests, approval_ids)
         try:
-            src, dst = Path(canonical_path(source)), Path(canonical_path(destination))
-            if src.is_dir():
-                shutil.copytree(src, dst)
-            else:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+            source_anchor, source_parts, src = select_anchor(self._anchors, source)
+            destination_anchor, destination_parts, dst = select_anchor(self._anchors, destination)
+            source_anchor.copy_to(source_parts, destination_anchor, destination_parts)
             result = {"source": str(src), "destination": str(dst)}
         except Exception as exc:
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
@@ -199,9 +201,9 @@ class FilesystemTools:
         )
         actions = self.runtime.authorize(requests, approval_ids)
         try:
-            src, dst = Path(canonical_path(source)), Path(canonical_path(destination))
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
+            source_anchor, source_parts, src = select_anchor(self._anchors, source)
+            destination_anchor, destination_parts, dst = select_anchor(self._anchors, destination)
+            source_anchor.rename(source_parts, destination_anchor, destination_parts)
             result = {"source": str(src), "destination": str(dst)}
         except Exception as exc:
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
@@ -211,14 +213,8 @@ class FilesystemTools:
                           action_ids=tuple(a.id for a in actions))
 
     def delete(self, path, *, recursive=False, approval_id=None, task_id=None, session_id=None):
-        def operation(target):
-            if target.is_dir() and not target.is_symlink():
-                if not recursive:
-                    target.rmdir()
-                else:
-                    shutil.rmtree(target)
-            else:
-                target.unlink()
+        def operation(anchor, parts, target):
+            anchor.delete(parts, recursive=recursive)
             return {"path": str(target), "deleted": True, "recursive": recursive}
         return self._mutate("fs.delete", path, operation,
                             arguments={"recursive": recursive}, destructive=True,

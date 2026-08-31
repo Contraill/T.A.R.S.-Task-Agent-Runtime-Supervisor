@@ -71,6 +71,26 @@ def test_copy_move_delete_are_multi_scope_and_destructive(filesystem):
     assert tools.delete(moved, approval_id=delete).succeeded and not moved.exists()
 
 
+def test_directory_copy_is_anchored_and_does_not_follow_symlinks(filesystem, tmp_path):
+    tools, root = filesystem
+    source = root / "tree"
+    source.mkdir()
+    (source / "nested").mkdir()
+    (source / "nested" / "value.txt").write_text("payload")
+    destination = root / "copy"
+    approval = _approval("fs.copy", "write", destination, (root,))
+    assert tools.copy(source, destination, approval_ids={"write": approval}).succeeded
+    assert (destination / "nested" / "value.txt").read_text() == "payload"
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside")
+    (source / "escape").symlink_to(outside)
+    rejected = root / "rejected"
+    approval = _approval("fs.copy", "write", rejected, (root,))
+    with pytest.raises(ValueError, match="symbolic links"):
+        tools.copy(source, rejected, approval_ids={"write": approval})
+
+
 def test_filesystem_escape_is_denied_before_mutation(filesystem, tmp_path):
     tools, root = filesystem
     outside = tmp_path / "outside"
@@ -79,3 +99,26 @@ def test_filesystem_escape_is_denied_before_mutation(filesystem, tmp_path):
     with pytest.raises(PermissionError, match="outside"):
         tools.write(root / "escape" / "bad", "no")
     assert not (outside / "bad").exists()
+
+
+def test_filesystem_symlink_swap_after_authorization_cannot_escape(filesystem, tmp_path,
+                                                                    monkeypatch):
+    tools, root = filesystem
+    inside = root / "inside"
+    inside.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = inside / "payload.txt"
+    approval = _approval("fs.write", "write", target, (root,))
+    authorize = tools.runtime.authorize
+
+    def swap_after_authorization(*args, **kwargs):
+        actions = authorize(*args, **kwargs)
+        inside.rename(root / "displaced")
+        inside.symlink_to(outside, target_is_directory=True)
+        return actions
+
+    monkeypatch.setattr(tools.runtime, "authorize", swap_after_authorization)
+    with pytest.raises(OSError):
+        tools.write(target, "secret", approval_id=approval)
+    assert not (outside / "payload.txt").exists()

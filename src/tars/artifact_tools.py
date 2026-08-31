@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
@@ -10,26 +11,19 @@ import tarfile
 import zipfile
 
 from .policy import ScopeRequest, canonical_path
+from .secure_paths import AnchoredRoot, select_anchor
 from .tool_core import ToolResult, ToolRuntime
 from .evidence import verify_artifact
 
 
-def _inside(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _member_path(root: Path, name: str) -> Path:
+def _member_parts(name: str) -> tuple[str, ...]:
     pure = PurePosixPath(name.replace("\\", "/"))
-    if pure.is_absolute() or ".." in pure.parts:
+    if pure.is_absolute() or not pure.parts or ".." in pure.parts:
         raise ValueError(f"unsafe archive member: {name}")
-    target = (root / Path(*pure.parts)).resolve(strict=False)
-    if not _inside(target, root):
-        raise ValueError(f"archive member escapes destination: {name}")
-    return target
+    parts = tuple(part for part in pure.parts if part not in ("", "."))
+    if not parts:
+        raise ValueError(f"unsafe archive member: {name}")
+    return parts
 
 
 class ArtifactRuntime:
@@ -37,6 +31,7 @@ class ArtifactRuntime:
         self.roots = tuple(canonical_path(root) for root in roots)
         if not self.roots:
             raise ValueError("artifact tools require at least one scope root")
+        self.anchors = tuple(AnchoredRoot(root) for root in self.roots)
         self.runtime = runtime or ToolRuntime()
 
     def authorize(self, tool, reads=(), writes=(), *, approval_ids=None, destructive=False,
@@ -175,43 +170,60 @@ class ArchiveTools:
         )
         source, root = reads[0], writes[0]
         try:
-            kind = self._kind(source)
-            root.mkdir(parents=True, exist_ok=True)
+            source_anchor, source_parts, _ = select_anchor(self.artifacts.anchors, path)
+            destination_anchor, root_parts, root = select_anchor(
+                self.artifacts.anchors, destination
+            )
+            destination_anchor.makedirs(root_parts)
             extracted = []
+            source_fd = source_anchor.open(source_parts, os.O_RDONLY)
+            source_handle = os.fdopen(source_fd, "rb")
+            kind = "zip" if zipfile.is_zipfile(source_handle) else "tar"
+            source_handle.seek(0)
             if kind == "zip":
-                with zipfile.ZipFile(source) as archive:
+                with source_handle, zipfile.ZipFile(source_handle) as archive:
                     members = archive.infolist()
                     for member in members:
-                        _member_path(root, member.filename)
+                        member_parts = _member_parts(member.filename)
                         mode = member.external_attr >> 16
                         if (mode & 0o170000) == 0o120000:
                             raise ValueError(f"archive symlink is not allowed: {member.filename}")
                     for member in members:
-                        target = _member_path(root, member.filename)
+                        member_parts = _member_parts(member.filename)
+                        target_parts = root_parts + member_parts
+                        target = root.joinpath(*member_parts)
                         if member.is_dir():
-                            target.mkdir(parents=True, exist_ok=True)
+                            destination_anchor.makedirs(target_parts)
                         else:
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            with archive.open(member) as src, target.open("wb") as dst:
+                            fd = destination_anchor.open(
+                                target_parts, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                create_parents=True,
+                            )
+                            with archive.open(member) as src, os.fdopen(fd, "wb") as dst:
                                 shutil.copyfileobj(src, dst)
                         extracted.append(str(target))
             else:
-                with tarfile.open(source) as archive:
+                with source_handle, tarfile.open(fileobj=source_handle) as archive:
                     members = archive.getmembers()
                     for member in members:
-                        _member_path(root, member.name)
+                        _member_parts(member.name)
                         if member.issym() or member.islnk() or member.isdev():
                             raise ValueError(f"unsafe archive member type: {member.name}")
                     for member in members:
-                        target = _member_path(root, member.name)
+                        member_parts = _member_parts(member.name)
+                        target_parts = root_parts + member_parts
+                        target = root.joinpath(*member_parts)
                         if member.isdir():
-                            target.mkdir(parents=True, exist_ok=True)
+                            destination_anchor.makedirs(target_parts)
                         elif member.isfile():
-                            target.parent.mkdir(parents=True, exist_ok=True)
                             source_handle = archive.extractfile(member)
                             if source_handle is None:
                                 raise ValueError(f"cannot extract archive member: {member.name}")
-                            with source_handle, target.open("wb") as destination_handle:
+                            fd = destination_anchor.open(
+                                target_parts, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                create_parents=True,
+                            )
+                            with source_handle, os.fdopen(fd, "wb") as destination_handle:
                                 shutil.copyfileobj(source_handle, destination_handle)
                         extracted.append(str(target))
             data = {"archive": str(source), "destination": str(root), "format": kind,

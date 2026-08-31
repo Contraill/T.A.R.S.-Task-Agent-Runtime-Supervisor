@@ -73,3 +73,19 @@ def test_git_push_requires_both_high_impact_and_network_approval(repository):
     policy.add_rule("network", "allow", target="example.com")
     with pytest.raises(PermissionError):
         tools.push()
+
+
+@pytest.mark.parametrize("ref", ["--help", "bad ref", "refs/../main", "main^{tree}"])
+def test_git_refs_cannot_inject_cli_options(repository, ref):
+    tools, _ = repository
+    with pytest.raises(ValueError):
+        tools.show(ref)
+    with pytest.raises(ValueError):
+        tools.branch(ref)
+
+
+@pytest.mark.parametrize("remote", ["--upload-pack=evil", "bad remote", "../origin"])
+def test_git_remote_names_cannot_inject_cli_options(repository, remote):
+    tools, _ = repository
+    with pytest.raises(ValueError):
+        tools.push(remote=remote)

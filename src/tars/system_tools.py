@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -10,6 +11,24 @@ from typing import Protocol
 
 from .policy import ScopeRequest
 from .tool_core import ToolResult, ToolRuntime
+
+
+_UNIT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}\Z")
+_PACKAGE_NAME = re.compile(r"[A-Za-z0-9@][A-Za-z0-9@._+:-]{0,254}\Z")
+
+
+def _unit_name(value):
+    value = str(value)
+    if not _UNIT_NAME.fullmatch(value):
+        raise ValueError(f"invalid service unit name: {value!r}")
+    return value
+
+
+def _package_name(value):
+    value = str(value)
+    if not _PACKAGE_NAME.fullmatch(value):
+        raise ValueError(f"invalid package name: {value!r}")
+    return value
 
 
 class ServiceTools:
@@ -22,6 +41,7 @@ class ServiceTools:
                            text=True, check=False)
 
     def status(self, unit, *, task_id=None, session_id=None):
+        unit = _unit_name(unit)
         request = ScopeRequest("service.status", "read", unit, task_id=task_id,
                                session_id=session_id)
         actions = self.runtime.authorize((("read", request),))
@@ -38,6 +58,7 @@ class ServiceTools:
     def mutate(self, operation, unit, *, approval_id=None, task_id=None, session_id=None):
         if operation not in {"start", "stop", "restart"}:
             raise ValueError(f"unsupported service operation: {operation}")
+        unit = _unit_name(unit)
         request = ScopeRequest(
             f"service.{operation}", "service", unit, {"operation": operation},
             task_id=task_id, session_id=session_id,
@@ -63,6 +84,7 @@ class ServiceTools:
                           action_ids=tuple(a.id for a in actions), evidence_ids=(evidence.id,))
 
     def logs(self, unit, *, lines=100, task_id=None, session_id=None):
+        unit = _unit_name(unit)
         request = ScopeRequest("service.logs", "read", unit, task_id=task_id,
                                session_id=session_id)
         actions = self.runtime.authorize((("read", request),))
@@ -126,14 +148,29 @@ class PacmanBackend:
         return ToolResult(tool, state, data, error=proc.stderr if proc.returncode else "",
                           action_ids=tuple(a.id for a in actions))
 
-    def search(self, query, **kwargs): return self._run("package.search", ["-Ss", query], **kwargs)
-    def info(self, package, **kwargs): return self._run("package.info", ["-Si", package], **kwargs)
-    def installed(self, package=None, **kwargs): return self._run("package.installed", ["-Q", *( [package] if package else [])], **kwargs)
+    def search(self, query, **kwargs):
+        query = str(query)
+        if not query or query.startswith("-") or any(ord(char) < 32 for char in query):
+            raise ValueError("invalid package search query")
+        return self._run("package.search", ["-Ss", query], **kwargs)
+
+    def info(self, package, **kwargs):
+        return self._run("package.info", ["-Si", _package_name(package)], **kwargs)
+
+    def installed(self, package=None, **kwargs):
+        arguments = ["-Q"] if package is None else ["-Q", _package_name(package)]
+        return self._run("package.installed", arguments, **kwargs)
     def orphans(self, **kwargs): return self._run("package.orphans", ["-Qdt"], **kwargs)
     def install(self, packages, *, approval_id=None, **kwargs):
+        packages = [_package_name(package) for package in packages]
+        if not packages:
+            raise ValueError("at least one package is required")
         return self._run("package.install", ["-Syu", "--needed", "--noconfirm", *packages],
                          mutation=True, approval_id=approval_id, **kwargs)
     def remove(self, packages, *, approval_id=None, **kwargs):
+        packages = [_package_name(package) for package in packages]
+        if not packages:
+            raise ValueError("at least one package is required")
         return self._run("package.remove", ["-Rns", "--noconfirm", *packages],
                          mutation=True, approval_id=approval_id, **kwargs)
     def upgrade(self, *, approval_id=None, **kwargs):

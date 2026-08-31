@@ -13,7 +13,7 @@ def terminal(monkeypatch, tmp_path):
     monkeypatch.setattr(state_store, "TASK_ROOT", tmp_path / "legacy")
     monkeypatch.setattr(state_store, "TASK_EVENTS_ROOT", tmp_path / "events")
     monkeypatch.setattr(state_store, "TASK_INDEX_PATH", tmp_path / "index")
-    policy.add_rule("execute", "allow", target="host")
+    policy.add_rule("sandbox_escape", "allow", target="host")
     manager = terminal_tools.ProcessManager(log_root=tmp_path / "logs")
     return terminal_tools.TerminalTools(
         executor=execution.GuardedExecutor({"host": execution.HostBackend()}),

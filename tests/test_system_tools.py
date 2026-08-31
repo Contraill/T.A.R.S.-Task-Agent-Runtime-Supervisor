@@ -87,6 +87,26 @@ def test_pacman_read_operations_and_unavailable_status(system_environment):
     assert not packages.status()["available"]
 
 
+@pytest.mark.parametrize("package", ["--root", "-S", "bad package", "bad\\npackage"])
+def test_package_names_cannot_inject_cli_options(system_environment, package):
+    runner = FakeRunner()
+    packages = system_tools.PacmanBackend(binary="/usr/bin/pacman", runner=runner)
+    with pytest.raises(ValueError):
+        packages.info(package)
+    with pytest.raises(ValueError):
+        packages.install([package])
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("unit", ["--system", "bad unit.service", "bad\\nunit.service"])
+def test_service_unit_names_cannot_inject_cli_options(system_environment, unit):
+    runner = FakeRunner()
+    tools = system_tools.ServiceTools(runner=runner)
+    with pytest.raises(ValueError):
+        tools.status(unit)
+    assert runner.calls == []
+
+
 def test_structured_system_inspection_is_guarded_and_evidenced(system_environment):
     tools = system_tools.SystemInspection()
     info = tools.info()

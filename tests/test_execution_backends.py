@@ -45,7 +45,7 @@ def _allow(effect, target):
 def test_host_backend_runs_direct_argv_through_guard_and_records_truth(isolated_execution):
     runner = FakeRunner(stdout="hello\n")
     backend = execution.HostBackend(runner=runner)
-    _allow("execute", "host")
+    _allow("sandbox_escape", "host")
     request = execution.ExecutionRequest(
         ("printf", "hello"), cwd=str(isolated_execution),
         allowed_paths=(str(isolated_execution),),
@@ -54,12 +54,14 @@ def test_host_backend_runs_direct_argv_through_guard_and_records_truth(isolated_
     assert result.succeeded and result.stdout == "hello\n"
     assert runner.calls[0][0] == ["printf", "hello"]
     assert "shell" not in runner.calls[0][1]
+    assert backend.status().support == "explicit-escape-hatch"
+    assert "unconfined" in backend.status().message
 
 
 def test_host_shell_is_explicit_and_environment_uses_references(monkeypatch, isolated_execution):
     runner = FakeRunner()
     backend = execution.HostBackend(runner=runner)
-    _allow("execute", "host")
+    _allow("sandbox_escape", "host")
     monkeypatch.setenv("TARS_TEST_SOURCE", "resolved-value")
     request = execution.ExecutionRequest(
         ("printf '%s' \"$VALUE\"",), cwd=str(isolated_execution), shell=True,
@@ -73,7 +75,7 @@ def test_host_shell_is_explicit_and_environment_uses_references(monkeypatch, iso
 
 def test_resolved_environment_values_are_redacted_from_results(monkeypatch, isolated_execution):
     runner = FakeRunner(stdout="value=resolved-secret")
-    _allow("execute", "host")
+    _allow("sandbox_escape", "host")
     monkeypatch.setenv("TARS_RESULT_SECRET", "resolved-secret")
     request = execution.ExecutionRequest(
         ("printenv", "VALUE"), cwd=str(isolated_execution),
@@ -235,16 +237,18 @@ def test_container_public_network_requires_destination_approval(isolated_executi
         ("fetch",), image="base", network=True, network_hosts=(host,),
     )
     network_request = policy.ScopeRequest(
-        "terminal.network", "network", host,
-        arguments={"backend": "container", "argv": ["fetch"]},
-        allowed_hosts=(host,),
+        "terminal.network.unrestricted", "network",
+        "https://public-internet.invalid/",
+        arguments={"backend": "container", "argv": ["fetch"],
+                   "declared_destinations": [host],
+                   "enforcement": "unrestricted-public-egress"},
     )
     decision = policy.ScopeGuard().evaluate(network_request)
     broker = approvals.ApprovalBroker()
     pending = broker.request(network_request, decision)
     broker.decide(pending.id, approve=True)
     result = execution.GuardedExecutor({"container": backend}, broker=broker).execute(
-        "container", request, approval_id={f"network:{host}": pending.id},
+        "container", request, approval_id={"network": pending.id},
     )
     assert result.succeeded
     command = runner.calls[0][0]

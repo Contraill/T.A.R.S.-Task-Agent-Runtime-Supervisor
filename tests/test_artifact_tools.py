@@ -68,6 +68,31 @@ def test_archive_extract_rejects_traversal_before_writing_outside(artifacts, kin
     assert not (artifacts.parent / "escape.txt").exists()
 
 
+def test_archive_destination_symlink_swap_after_authorization_cannot_escape(
+        artifacts, monkeypatch):
+    archive = artifacts / "bundle.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("payload.txt", "contained")
+    destination = artifacts / "output"
+    destination.mkdir()
+    outside = artifacts.parent / "outside"
+    outside.mkdir()
+    tools = artifact_tools.ArchiveTools((artifacts,))
+    approval = approve("archive.extract", destination, artifacts)
+    authorize = tools.artifacts.runtime.authorize
+
+    def swap_after_authorization(*args, **kwargs):
+        actions = authorize(*args, **kwargs)
+        destination.rename(artifacts / "displaced")
+        destination.symlink_to(outside, target_is_directory=True)
+        return actions
+
+    monkeypatch.setattr(tools.artifacts.runtime, "authorize", swap_after_authorization)
+    with pytest.raises(OSError):
+        tools.extract(archive, destination, approval_ids={"write-0": approval})
+    assert not (outside / "payload.txt").exists()
+
+
 def test_csv_range_write_read_and_document_edit(artifacts):
     sheet = artifacts / "data.csv"
     sheet.write_text("one,two\nthree,four\n")

@@ -56,8 +56,12 @@ class ProcessManager:
         execute_request = ScopeRequest(
             "terminal.run", "execute", "host",
             {"argv": list(request.argv), "cwd": cwd,
-             "environment_refs": request.environment_refs, "background": True},
+             "environment_refs": request.environment_refs, "background": True,
+             "authority_contract": {"filesystem": "unrestricted-host",
+                                    "network": "unrestricted-host",
+                                    "resource_limits": "none"}},
             task_id=task_id, session_id=session_id,
+            sandbox_escape=True,
         )
         actions = self.runtime.authorize(
             (("cwd", path_request), ("execute", execute_request)),

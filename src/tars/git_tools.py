@@ -2,10 +2,35 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import re
 import subprocess
 
 from .policy import ScopeRequest, canonical_path, normalize_network_target
 from .tool_core import ToolResult, ToolRuntime
+
+
+_REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}\Z")
+
+
+def _git_ref(value, *, label="Git ref"):
+    value = str(value)
+    forbidden = ("..", "@{", "\\", "~", "^", ":", "?", "*", "[", "]")
+    components = value.split("/")
+    if (
+        not value or value.startswith("-") or value.startswith("/") or value.endswith(("/", "."))
+        or any(ord(char) <= 32 or ord(char) == 127 for char in value)
+        or any(token in value for token in forbidden)
+        or any(not part or part.startswith(".") or part.endswith(".lock") for part in components)
+    ):
+        raise ValueError(f"invalid {label}: {value!r}")
+    return value
+
+
+def _remote_name(value):
+    value = str(value)
+    if not _REMOTE_NAME.fullmatch(value) or value.startswith("-") or ".." in value:
+        raise ValueError(f"invalid Git remote name: {value!r}")
+    return value
 
 
 class GitTools:
@@ -55,9 +80,17 @@ class GitTools:
     def status(self, **kwargs): return self._run("git.status", ["status", "--short", "--branch"], **kwargs)
     def diff(self, *, staged=False, **kwargs): return self._run("git.diff", ["diff", *( ["--cached"] if staged else [])], **kwargs)
     def log(self, *, limit=20, **kwargs): return self._run("git.log", ["log", f"-{int(limit)}", "--format=%H%x09%an%x09%ae%x09%s"], **kwargs)
-    def show(self, revision="HEAD", **kwargs): return self._run("git.show", ["show", "--stat", "--oneline", revision], **kwargs)
-    def branch(self, name, *, approval_id=None, **kwargs): return self._run("git.branch", ["branch", name], effect="write", approval_id=approval_id, **kwargs)
-    def switch(self, name, *, create=False, approval_id=None, **kwargs): return self._run("git.switch", ["switch", *( ["-c"] if create else []), name], effect="write", approval_id=approval_id, **kwargs)
+    def show(self, revision="HEAD", **kwargs):
+        return self._run("git.show", ["show", "--stat", "--oneline", _git_ref(revision)], **kwargs)
+
+    def branch(self, name, *, approval_id=None, **kwargs):
+        return self._run("git.branch", ["branch", _git_ref(name, label="branch name")],
+                         effect="write", approval_id=approval_id, **kwargs)
+
+    def switch(self, name, *, create=False, approval_id=None, **kwargs):
+        return self._run("git.switch", ["switch", *(["-c"] if create else []),
+                                        _git_ref(name, label="branch name")],
+                         effect="write", approval_id=approval_id, **kwargs)
 
     def commit(self, message, *, approval_id=None, **kwargs):
         result = self._run("git.commit", ["commit", "-m", message], effect="write",
@@ -94,10 +127,12 @@ class GitTools:
                           evidence_ids=(evidence.id,))
 
     def rollback(self, revision, *, approval_id=None, **kwargs):
-        return self._run("git.rollback", ["reset", "--hard", revision], effect="destructive",
+        return self._run("git.rollback", ["reset", "--hard", _git_ref(revision)], effect="destructive",
                          destructive=True, approval_id=approval_id, **kwargs)
 
     def push(self, remote="origin", branch="HEAD", *, approval_ids=None, **kwargs):
+        remote = _remote_name(remote)
+        branch = _git_ref(branch, label="branch name")
         remote_url = self._git(["remote", "get-url", remote])
         if remote_url.returncode != 0:
             return ToolResult("git.push", "failed", {"exit_code": remote_url.returncode},

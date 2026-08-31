@@ -181,14 +181,16 @@ def _completed(backend, target, request, started, proc=None, *, error="", timed_
 
 class HostBackend:
     identity = "host"
-    support = "reference-tested"
+    support = "explicit-escape-hatch"
 
     def __init__(self, *, runner: Runner = subprocess.run, secret_store=None):
         self.runner = runner
         self.secret_store = secret_store or SecretStore()
 
     def status(self):
-        return ExecutionStatus(self.identity, True, self.support, "available")
+        return ExecutionStatus(
+            self.identity, True, self.support,
+            "unconfined host execution; filesystem and network declarations are not enforced")
 
     def execute(self, request, *, authorization=None):
         _require_authorization(authorization)
@@ -403,7 +405,8 @@ class GuardedExecutor:
             backend = self.backends[backend_name]
         except KeyError as exc:
             raise KeyError(f"unknown execution backend: {backend_name}") from exc
-        escape = backend_name == "container" and backend.sandbox_escape(request)
+        escape = (backend_name == "host" or
+                  (backend_name == "container" and backend.sandbox_escape(request)))
         effect = "remote" if backend_name == "ssh" else "execute"
         target = request.target or backend_name
         if backend_name == "ssh":
@@ -411,10 +414,8 @@ class GuardedExecutor:
                 target = "https://" + backend.targets[request.target].host
             except KeyError as exc:
                 raise PermissionError("SSH target is not explicitly registered") from exc
-        path_target = (
-            request.workspace if backend_name == "container" and request.workspace_mode != "ephemeral"
-            else request.cwd if backend_name != "container" else None
-        )
+        path_target = (request.workspace if backend_name == "container"
+                       and request.workspace_mode != "ephemeral" else None)
         path_checks = []
         if path_target:
             path_effect = (
@@ -452,7 +453,16 @@ class GuardedExecutor:
                 "workspace": request.workspace,
                 "mounts": [mount.__dict__ for mount in request.mounts],
                 "image": request.image, "network": request.network,
+                "network_hosts": list(request.network_hosts),
                 "persistent": request.persistent,
+                "authority_contract": ({
+                    "filesystem": "unrestricted-host", "network": "unrestricted-host",
+                    "resource_limits": "timeout-only",
+                } if backend_name == "host" else {
+                    "filesystem": "container-mounts", "network": (
+                        "unrestricted-public-egress" if request.network else "disabled"),
+                    "resource_limits": "container-runtime",
+                }),
             },
             task_id=task_id, session_id=session_id, sandbox_escape=escape,
         )
@@ -483,31 +493,32 @@ class GuardedExecutor:
                 finish_action(actions[0].id, state="cancelled",
                               result={"error": "network destinations are required"})
                 raise PermissionError("network-enabled execution requires explicit destinations")
-            for host in request.network_hosts:
-                network_request = ScopeRequest(
-                    "terminal.network", "network", host,
-                    arguments={"backend": backend_name, "argv": list(request.argv)},
-                    task_id=task_id, session_id=session_id,
-                    allowed_hosts=request.network_hosts,
-                )
-                network_decision = self.guard.evaluate(network_request)
-                if network_decision.action != "deny":
-                    try:
-                        normalize_network_target(host, resolve_dns=True)
-                    except ValueError as exc:
-                        network_decision = replace(
-                            network_decision, action="deny", reason=str(exc),
-                        )
-                try:
-                    actions.append(begin_action(
-                        network_request, network_decision,
-                        approval_id=approval_map.get(f"network:{host}"), broker=self.broker,
-                    ))
-                except Exception:
-                    for active in actions:
-                        finish_action(active.id, state="cancelled",
-                                      result={"error": "network authorization failed"})
-                    raise
+            try:
+                for host in request.network_hosts:
+                    normalize_network_target(host, resolve_dns=True)
+            except ValueError as exc:
+                for active in actions:
+                    finish_action(active.id, state="cancelled", result={"error": str(exc)})
+                raise PermissionError(str(exc)) from exc
+            network_request = ScopeRequest(
+                "terminal.network.unrestricted", "network",
+                "https://public-internet.invalid/",
+                arguments={"backend": backend_name, "argv": list(request.argv),
+                           "declared_destinations": list(request.network_hosts),
+                           "enforcement": "unrestricted-public-egress"},
+                task_id=task_id, session_id=session_id,
+            )
+            network_decision = self.guard.evaluate(network_request)
+            try:
+                actions.append(begin_action(
+                    network_request, network_decision,
+                    approval_id=approval_map.get("network"), broker=self.broker,
+                ))
+            except Exception:
+                for active in actions:
+                    finish_action(active.id, state="cancelled",
+                                  result={"error": "network authorization failed"})
+                raise
         try:
             authorization = _ExecutionAuthorization(action.id for action in actions)
             result = backend.execute(
