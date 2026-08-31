@@ -132,6 +132,7 @@ from .core_auth import (DEFAULT_PERMISSIONS, PERMISSIONS as CLIENT_PERMISSIONS,
                         revoke as revoke_core_client)
 from .core_api import CoreAPI, CoreServerConfig, make_server
 from .runtime_routing import LocalRuntimeRouter
+from .extensions import ExtensionLoader
 
 console = Console()
 
@@ -618,6 +619,18 @@ def command_backend_status(cfg, name):
         return 2
     console.print_json(data=backend.diagnostics())
     return 0 if backend.status().healthy else 1
+
+
+def command_extension_list(cfg):
+    table = Table(title="Extension Boundaries")
+    for column in ("Kind", "Name", "Provenance", "Enabled", "Trusted", "Distribution"):
+        table.add_column(column)
+    for item in ExtensionLoader(cfg).discover():
+        table.add_row(item.kind, item.name, item.provenance,
+                      "yes" if item.enabled else "no", "yes" if item.trusted else "no",
+                      item.distribution or "-")
+    console.print(table)
+    return 0
 
 
 def command_memory(args):
@@ -2110,10 +2123,15 @@ def build_parser():
     client_pair = client_sub.add_parser("pair")
     client_pair.add_argument("--permission", action="append",
                              choices=sorted(CLIENT_PERMISSIONS))
+
     client_pair.add_argument("--principal", default="local-owner")
     client_pair.add_argument("--ttl", type=int, default=300)
     client_revoke = client_sub.add_parser("revoke")
     client_revoke.add_argument("client_id")
+
+    extension = sub.add_parser("extension", help="inspect built-in and third-party boundaries")
+    extension_sub = extension.add_subparsers(dest="extension_command", required=True)
+    extension_sub.add_parser("list")
 
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="task_command", required=True)
@@ -2423,10 +2441,14 @@ def main():
                 principal_id=args.principal, ttl_seconds=args.ttl)
             console.print_json(data=pairing)
             return 0
+
         if args.client_command == "revoke":
             client = revoke_core_client(args.client_id)
             console.print(f"[green]Revoked[/green] {client.id} · {client.name}")
             return 0
+
+    if args.command == "extension" and args.extension_command == "list":
+        return command_extension_list(cfg)
 
     if args.command == "task":
         if args.task_command == "list":

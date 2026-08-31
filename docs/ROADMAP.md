@@ -276,9 +276,20 @@ Status: implemented.
 
 Oracle remains optional. Model installation and hardware acceptance are separate operator actions.
 
+### v0.8.4 — extension boundaries
+
+Status: implemented.
+
+- versioned minimal providers for runtime and tool extension classes
+- metadata-only discovery with explicit enable and in-process trust gates
+- authoritative local-only runtime routing and guarded tool dispatch integration
+- non-shadowing extension namespaces and visible built-in/third-party provenance
+- MCP retained as the preferred low-coupling external tool boundary
+
+See [EXTENSIONS.md](EXTENSIONS.md) for contracts and trust behavior.
+
 ### Remaining v0.8.x work
 
-- extension boundaries
 - SecretStore
 - versioned backup/restore/migration
 

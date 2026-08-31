@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.4 - Extension Boundaries
+
+- added a versioned provider contract and metadata-only discovery for runtime and tool extensions
+- required explicit enablement and trust before importing any third-party in-process code
+- integrated local-only runtime providers into authoritative routing without allowing cloud fallback
+- routed in-process tool extensions through deterministic scope authorization, action journaling
+  and real ToolResult enforcement under a non-shadowing namespace
+- exposed built-in versus third-party provenance while retaining MCP as the preferred external
+  tool integration boundary
+
 ## 0.8.3 - Oracle / Colibri
 
 - implemented the optional loopback-local Colibri backend adapter with version, health,

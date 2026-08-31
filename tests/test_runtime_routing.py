@@ -33,6 +33,10 @@ def route_state(monkeypatch, tmp_path):
 
 
 class Backend:
+    identity = "llama.cpp"
+    local_only = True
+    zero_idle = True
+
     def __init__(self, *, available=True, healthy=True, tools=True, reasoning=True,
                  context=65536):
         self.available = available
@@ -105,8 +109,11 @@ def test_task_continuity_requires_explicit_handoff(route_state, monkeypatch):
 def test_no_cloud_or_silent_model_substitution(route_state):
     role, model = route_state
     model.backend = "openai"
+    backend = Backend()
+    backend.identity = "openai"
+    backend.local_only = False
     route = routing.LocalRuntimeRouter(
-        {}, backend_factory=lambda model, cfg: Backend()).resolve("general")
+        {}, backend_factory=lambda model, cfg: backend).resolve("general")
     assert not route.ready and route.selected_role == "general"
     assert route.model_alias == "local"
     assert any("not an allowed local runtime" in reason for reason in route.reasons)

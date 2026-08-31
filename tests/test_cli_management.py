@@ -97,6 +97,7 @@ def test_core_client_cli_surface():
     pair = parser.parse_args(["client", "pair", "--permission", "task.read"])
     assert pair.permission == ["task.read"]
     assert parser.parse_args(["client", "revoke", "client-one"]).client_id == "client-one"
+    assert parser.parse_args(["extension", "list"]).extension_command == "list"
 
 
 def test_policy_approval_and_audit_cli_parsing():

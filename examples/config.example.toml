@@ -27,6 +27,10 @@ allow_remote = false
 # base_url = "http://127.0.0.1:9988"
 # ttl_seconds = 60
 
+[extensions]
+enabled = []
+trusted = []
+
 [policy.zero_idle]
 enabled = true
 default_ttl_seconds = 30

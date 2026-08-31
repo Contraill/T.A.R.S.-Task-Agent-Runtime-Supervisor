@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import inspect
 import json
@@ -15,6 +15,7 @@ from .control_queue import (annotate, claim_next, enqueue, finish as finish_cont
 from .conversation import add_message
 from .evidence import load as load_evidence
 from .events import append_event
+from .policy import ScopeRequest
 from .runtime import chat_completion
 from .state_events import append_state_event
 from .tasks import canonical_task_state, load_task, update_task
@@ -87,6 +88,8 @@ class ToolBinding:
     cancel: object | None = None
     retry_safe: bool = False
     before_execute: object | None = None
+    provenance: str = "builtin"
+    trusted: bool = True
 
     @property
     def cancellable(self):
@@ -98,14 +101,73 @@ class ToolDispatcher:
         self._bindings = {}
 
     def register(self, name, execute, *, cancel=None, retry_safe=False,
-                 before_execute=None):
+                 before_execute=None, provenance="builtin", trusted=True):
         if not callable(execute):
             raise TypeError("tool execute binding must be callable")
         if before_execute is not None and not callable(before_execute):
             raise TypeError("before_execute must be callable")
-        self._bindings[str(name)] = ToolBinding(execute, cancel, retry_safe,
-                                                before_execute)
+        if provenance == "third-party" and not trusted:
+            raise PermissionError("untrusted in-process tool extensions cannot be registered")
+        self._bindings[str(name)] = ToolBinding(
+            execute, cancel, retry_safe, before_execute, str(provenance), bool(trusted))
         return self
+
+    def register_extension(self, name, loader, *, runtime):
+        provider = loader.load("tool", name)
+        tool = provider.create()
+        execute = getattr(tool, "execute", None)
+        if not callable(execute):
+            raise TypeError(f"tool extension has no execute binding: {name}")
+        scope_requests = getattr(tool, "scope_requests", None)
+        if not callable(scope_requests):
+            raise TypeError(f"tool extension has no deterministic scope contract: {name}")
+        tool_name = str(getattr(tool, "name", name))
+        if not tool_name.startswith(f"ext.{name}."):
+            raise ValueError(f"tool extension must use namespace ext.{name}.*")
+        if tool_name in self._bindings:
+            raise ValueError(f"tool extension cannot shadow an existing binding: {tool_name}")
+
+        execute_parameters = inspect.signature(execute).parameters
+        accepts_task_id = ("task_id" in execute_parameters or any(
+            item.kind == inspect.Parameter.VAR_KEYWORD
+            for item in execute_parameters.values()))
+
+        def guarded_execute(task_id=None, **arguments):
+            approval_ids = arguments.pop("approval_ids", None)
+            call_arguments = dict(arguments)
+            scope_arguments = dict(arguments)
+            if task_id is not None:
+                scope_arguments["task_id"] = task_id
+            if task_id is not None and accepts_task_id:
+                call_arguments["task_id"] = task_id
+            requests = tuple(scope_requests(scope_arguments))
+            if not requests or any(
+                    not isinstance(item, tuple) or len(item) != 2 or
+                    not isinstance(item[1], ScopeRequest) for item in requests):
+                raise TypeError(
+                    "tool extension scope contract must return keyed ScopeRequest values")
+            if any(request.tool != tool_name for _, request in requests):
+                raise ValueError("tool extension scope contract used a different tool identity")
+            if task_id is not None and any(
+                    request.task_id != task_id for _, request in requests):
+                raise ValueError("tool extension scope contract omitted or changed task identity")
+            actions = runtime.authorize(requests, approval_ids=approval_ids)
+            try:
+                result = execute(**call_arguments)
+                if not isinstance(result, ToolResult):
+                    raise TypeError("tools must return a real ToolResult")
+            except Exception as exc:
+                runtime.finish(actions, state="failed", result={"error": str(exc)})
+                raise
+            runtime.finish(actions, state=result.state, result=result.data | {
+                "error": result.error})
+            return replace(
+                result, action_ids=tuple(dict.fromkeys(
+                    (*result.action_ids, *(action.id for action in actions)))))
+        return self.register(
+            tool_name, guarded_execute,
+            retry_safe=bool(getattr(tool, "retry_safe", False)),
+            provenance="third-party", trusted=True)
 
     def binding(self, name):
         try:

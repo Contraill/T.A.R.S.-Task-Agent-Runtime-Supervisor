@@ -157,6 +157,8 @@ def normalize_chat_stream(chunks: Iterable[dict]) -> Iterable[StreamEvent]:
 class LlamaCppBackend:
     identity = "llama.cpp"
     support = "reference-tested"
+    local_only = True
+    zero_idle = True
 
     def __init__(self, cfg, *, transport: Transport | None = None, model_record=None):
         self.cfg = cfg
@@ -247,6 +249,8 @@ class ColibriBackend:
 
     identity = "colibri"
     support = "supported-optional"
+    local_only = True
+    zero_idle = True
 
     def __init__(self, cfg=None, *, transport=None):
         self.cfg = cfg or {}
@@ -414,17 +418,28 @@ BACKEND_TYPES = {"llama.cpp": LlamaCppBackend, "colibri": ColibriBackend}
 
 
 def backend_for_name(name: str, cfg, *, transport=None) -> RuntimeBackend:
+    backend_type = BACKEND_TYPES.get(name)
+    if backend_type is not None:
+        return backend_type(cfg, transport=transport)
+    from .extensions import ExtensionLoader, validate_runtime_backend
     try:
-        backend_type = BACKEND_TYPES[name]
+        provider = ExtensionLoader(cfg).load("runtime_backend", name)
     except KeyError as exc:
         raise KeyError(f"unknown runtime backend: {name}") from exc
-    return backend_type(cfg, transport=transport)
+    return validate_runtime_backend(provider.create(
+        cfg=cfg, model_record=None, transport=transport))
 
 
 def backend_for_model(model, cfg, *, transport=None) -> RuntimeBackend:
     backend_type = BACKEND_TYPES.get(model.backend)
     if backend_type is None:
-        raise KeyError(f"unknown runtime backend: {model.backend}")
+        from .extensions import ExtensionLoader, validate_runtime_backend
+        try:
+            provider = ExtensionLoader(cfg).load("runtime_backend", model.backend)
+        except KeyError as exc:
+            raise KeyError(f"unknown runtime backend: {model.backend}") from exc
+        return validate_runtime_backend(provider.create(
+            cfg=cfg, model_record=model, transport=transport))
     if backend_type is LlamaCppBackend:
         return backend_type(cfg, transport=transport, model_record=model)
     return backend_type(cfg, transport=transport)
@@ -442,4 +457,6 @@ def backend_binding_ready(model, cfg=None) -> bool:
         return (bool(getattr(model, "integrity_verified", False)) and
                 bool(getattr(model, "runtime_compatible", False)) and
                 model.path.is_file())
-    return False
+    return (bool(getattr(model, "integrity_verified", False)) and
+            bool(getattr(model, "runtime_compatible", False)) and
+            bool(getattr(model, "path", None)) and model.path.is_file())

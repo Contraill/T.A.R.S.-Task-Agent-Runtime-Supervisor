@@ -6,14 +6,11 @@ import uuid
 from .calibration import get_profile
 from .registry import get_model
 from .roles import get_role, resolve_role_id
-from .runtime_backends import (BACKEND_TYPES, BackendStatus, LifecycleResult,
+from .runtime_backends import (BackendStatus, LifecycleResult,
                                ModelCapabilities, RuntimeCapabilities,
                                backend_binding_ready, backend_for_model)
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import append_event, load_task
-
-
-LOCAL_BACKENDS = frozenset(BACKEND_TYPES)
 
 
 class RuntimeRouteUnavailable(RuntimeError):
@@ -107,8 +104,6 @@ class LocalRuntimeRouter:
                 reasons.append(f"model binding cannot be loaded: {exc}")
 
         if model is not None:
-            if model.backend not in LOCAL_BACKENDS:
-                reasons.append(f"backend is not an allowed local runtime: {model.backend}")
             if not model.integrity_verified:
                 reasons.append(f"model {model.alias} integrity is not verified")
             if not model.runtime_compatible:
@@ -124,6 +119,14 @@ class LocalRuntimeRouter:
                 reasons.append(f"runtime profile {role.profile} is unavailable: {exc}")
             try:
                 backend = self.backend_factory(model, self.cfg)
+                if getattr(backend, "local_only", None) is not True:
+                    reasons.append(f"backend is not an allowed local runtime: {model.backend}")
+                if getattr(backend, "zero_idle", None) is not True:
+                    reasons.append(f"backend does not guarantee Zero-Idle: {model.backend}")
+                if getattr(backend, "identity", None) != model.backend:
+                    reasons.append(
+                        f"backend identity mismatch: expected {model.backend}, got "
+                        f"{getattr(backend, 'identity', 'unknown')}")
                 status = backend.status()
                 runtime_caps = backend.capabilities()
                 if status.available and status.healthy:

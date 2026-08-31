@@ -32,6 +32,8 @@ Memory           ScopeGuard
 
 **Heavy reasoning is optional.** Oracle uses the replaceable Colibri backend only when explicitly configured and bound. Probes remain model-free, Heavy state loads on demand with a short finite TTL, and Oracle delegation records its input and required result evidence.
 
+**Core is stable; edges are replaceable.** Built-ins are identified separately from explicitly trusted in-process extensions. Runtime extensions still pass local routing and lifecycle checks; tool extensions still pass deterministic policy, audit and ToolResult checks. MCP is preferred when an integration does not require a native in-process contract.
+
 **One task has one owner.** Delegation does not change ownership. Handoff does, and must be transactional.
 
 **Security is deterministic.** ScopeGuard and the tool executor decide what can run. The model does not grant itself permission.
