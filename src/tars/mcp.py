@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+from . import __version__
 from .policy import ScopeRequest, normalize_network_target, redact
 from .state_store import (connect, ensure_state_store, json_dumps, json_loads,
                           now_utc, transaction)
@@ -287,7 +288,7 @@ class MCPClient:
 
     def initialize(self):
         result = self._request("initialize", {"protocolVersion": PROTOCOL_VERSION,
-                               "capabilities": {}, "clientInfo": {"name": "tars", "version": "0.7.6"}})
+                               "capabilities": {}, "clientInfo": {"name": "tars", "version": __version__}})
         self._initialized = True
         return redact(result)
 

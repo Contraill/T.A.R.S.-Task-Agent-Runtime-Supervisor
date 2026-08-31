@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 def now_utc() -> str:
@@ -381,6 +381,35 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_schedule_deliveries_state
         ON schedule_deliveries(state, updated_at);
 
+    CREATE TABLE IF NOT EXISTS core_clients (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        principal_id TEXT NOT NULL DEFAULT 'local-owner',
+        token_salt TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        permissions_json TEXT NOT NULL DEFAULT '[]',
+        state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','revoked')),
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT,
+        revoked_at TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_core_clients_state
+        ON core_clients(state, created_at);
+
+    CREATE TABLE IF NOT EXISTS core_pairings (
+        id TEXT PRIMARY KEY,
+        code_hash TEXT NOT NULL UNIQUE,
+        permissions_json TEXT NOT NULL DEFAULT '[]',
+        principal_id TEXT NOT NULL DEFAULT 'local-owner',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        client_id TEXT REFERENCES core_clients(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_core_pairings_expiry
+        ON core_pairings(expires_at, consumed_at);
+
     CREATE TABLE IF NOT EXISTS task_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_uuid TEXT NOT NULL UNIQUE,
@@ -632,7 +661,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries", "core_clients", "core_pairings"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,

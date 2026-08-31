@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1 - Core API and Authenticated Clients
+
+- added one authoritative native Core API over canonical conversations, tasks, controls and events
+- added one-time client pairing, hashed bearer credentials, revocation and per-client permissions
+- added resumable task-event streaming and a native client with reconnect cursors
+- enforced loopback defaults and explicit TLS for direct non-loopback binding
+- added future-ready principal identifiers without introducing separate per-client state models
+- integrated authenticated schedule controls with the Core-owned event-driven scheduler loop
+
 ## 0.8.0 - Durable Scheduler and TUI Transcript
 
 - replaced the TUI's joined-line transcript with structured user, assistant, system, tool and error entries

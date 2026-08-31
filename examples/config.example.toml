@@ -17,6 +17,11 @@ manager = "llama-swap"
 base_url = "http://127.0.0.1:8080"
 llama_swap_config = "~/.config/tars/llama-swap/config.yaml"
 
+[core]
+host = "127.0.0.1"
+port = 8765
+allow_remote = false
+
 [policy.zero_idle]
 enabled = true
 default_ttl_seconds = 30

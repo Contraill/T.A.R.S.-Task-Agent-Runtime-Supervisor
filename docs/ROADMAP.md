@@ -239,7 +239,18 @@ See [SCHEDULER.md](SCHEDULER.md) for scheduling and recovery semantics.
 
 ### Remaining v0.8.x work
 
-- Core/client API
+### v0.8.1 — Core API and authenticated clients
+
+Status: implemented.
+
+- one authoritative Core over canonical conversations, tasks, controls and events
+- one-time pairing, hashed credentials, revocation and per-client permissions
+- resumable task-event streaming and native client access
+- authenticated schedule controls with immediate Core scheduler wakeups
+- loopback defaults with explicit TLS requirements for direct remote binding
+- principal-ready client identity without per-client state models
+
+See [REMOTE.md](REMOTE.md) for API, pairing and transport boundaries.
 - optional Tailscale Serve integration
 - Oracle/Colibri backend
 - `.tarsbundle` backup/restore/reset

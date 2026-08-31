@@ -81,6 +81,15 @@ def test_scheduler_cli_surface():
     assert parser.parse_args(["schedule", "run-due"]).schedule_command == "run-due"
 
 
+def test_core_client_cli_surface():
+    parser = build_parser()
+    serve = parser.parse_args(["core", "serve"])
+    assert serve.host == "127.0.0.1" and not serve.allow_remote
+    pair = parser.parse_args(["client", "pair", "--permission", "task.read"])
+    assert pair.permission == ["task.read"]
+    assert parser.parse_args(["client", "revoke", "client-one"]).client_id == "client-one"
+
+
 def test_policy_approval_and_audit_cli_parsing():
     parser = build_parser()
     scope = parser.parse_args([

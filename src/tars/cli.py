@@ -1,6 +1,9 @@
 import argparse
 import json
 import shutil
+import ssl
+import threading
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -124,6 +127,10 @@ from .scheduler import (Scheduler, create_schedule, edit_schedule, list_runs as 
                         condition_registry, health as scheduler_health, list_schedules,
                         load_schedule, remove_schedule, require_condition_support,
                         set_enabled as set_schedule_enabled)
+from .core_auth import (DEFAULT_PERMISSIONS, PERMISSIONS as CLIENT_PERMISSIONS,
+                        create_pairing, list_clients as list_core_clients,
+                        revoke as revoke_core_client)
+from .core_api import CoreAPI, CoreServerConfig, make_server
 
 console = Console()
 
@@ -183,19 +190,75 @@ def command_schedule_run_due(cfg):
     recovered = engine.recover()
     claimed = engine.claim_due()
 
+    completed = engine.execute_claimed(_schedule_executor(cfg))
+    console.print(f"Recovered {recovered} · claimed {len(claimed)} · completed {len(completed)}")
+    return 1 if any(run.state == "failed" for run in completed) else 0
+
+
+def command_client_list():
+    table = Table(title="Core Clients")
+    for column in ("ID", "Name", "Principal", "State", "Permissions", "Last seen"):
+        table.add_column(column)
+    for client in list_core_clients():
+        table.add_row(client.id, client.name, client.principal_id, client.state,
+                      ", ".join(client.permissions), client.last_seen_at or "-")
+    console.print(table)
+
+
+def _schedule_executor(cfg):
     def execute(scheduled_run):
         run = create_run(scheduled_run.task_id)
         outcome = run_task_epoch(cfg, run.id)
         finished = outcome["run"]
         if finished.state in {"failed", "cancelled"}:
-            raise RuntimeError(f"task run {finished.id} {finished.state}: {finished.error or finished.finish_reason}")
+            raise RuntimeError(
+                f"task run {finished.id} {finished.state}: "
+                f"{finished.error or finished.finish_reason}")
         return {"task_run_id": finished.id, "state": finished.state,
                 "finish_reason": finished.finish_reason,
                 "checkpoint_id": outcome.get("checkpoint_id")}
+    return execute
 
-    completed = engine.execute_claimed(execute)
-    console.print(f"Recovered {recovered} · claimed {len(claimed)} · completed {len(completed)}")
-    return 1 if any(run.state == "failed" for run in completed) else 0
+
+def command_core_serve(cfg, args):
+    context = None
+    if args.cert or args.key:
+        if not args.cert or not args.key:
+            raise ValueError("both --cert and --key are required for TLS")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.cert, args.key)
+    conditions = condition_registry(cfg)
+    require_condition_support(conditions)
+    server = make_server(
+        CoreServerConfig(args.host, args.port, allow_remote=args.allow_remote,
+                         ssl_context=context),
+        api=CoreAPI(allow_remote_pairing=args.allow_remote and context is not None,
+                    conditions=conditions))
+    scheduler = Scheduler(
+        max_concurrency=int(cfg.get("scheduler", {}).get("max_concurrency", 1)),
+        conditions=conditions)
+    scheduler_stop = threading.Event()
+    scheduler_thread = threading.Thread(
+        target=scheduler.run_forever, args=(_schedule_executor(cfg),),
+        kwargs={"stop": scheduler_stop}, name="tars-scheduler", daemon=True)
+    scheduler_thread.start()
+    deadline = time.monotonic() + 2
+    while scheduler_thread.is_alive() and not scheduler._wake_socket and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not scheduler_thread.is_alive() or scheduler._wake_socket is None:
+        server.server_close()
+        raise RuntimeError("Core scheduler failed to start")
+    scheme = "https" if context else "http"
+    console.print(f"T.A.R.S. Core listening on {scheme}://{args.host}:{server.server_port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        server.server_close()
+        scheduler_stop.set()
+        scheduler.wake()
+        scheduler_thread.join(timeout=5)
 
 
 def command_status(cfg):
@@ -1984,6 +2047,26 @@ def build_parser():
     schedule_runs.add_argument("--limit", type=int, default=50)
     schedule_sub.add_parser("run-due")
 
+    core = sub.add_parser("core", help="authoritative authenticated Core API")
+    core_sub = core.add_subparsers(dest="core_command", required=True)
+    core_serve = core_sub.add_parser("serve")
+    core_serve.add_argument("--host", default="127.0.0.1")
+    core_serve.add_argument("--port", type=int, default=8765)
+    core_serve.add_argument("--allow-remote", action="store_true")
+    core_serve.add_argument("--cert")
+    core_serve.add_argument("--key")
+
+    client = sub.add_parser("client", help="Core client pairing and revocation")
+    client_sub = client.add_subparsers(dest="client_command", required=True)
+    client_sub.add_parser("list")
+    client_pair = client_sub.add_parser("pair")
+    client_pair.add_argument("--permission", action="append",
+                             choices=sorted(CLIENT_PERMISSIONS))
+    client_pair.add_argument("--principal", default="local-owner")
+    client_pair.add_argument("--ttl", type=int, default=300)
+    client_revoke = client_sub.add_parser("revoke")
+    client_revoke.add_argument("client_id")
+
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="task_command", required=True)
     task_list = task_sub.add_parser("list")
@@ -2277,6 +2360,23 @@ def main():
             return command_schedule_runs(args.schedule_id, args.limit)
         if args.schedule_command == "run-due":
             return command_schedule_run_due(cfg)
+
+    if args.command == "core" and args.core_command == "serve":
+        return command_core_serve(cfg, args)
+
+    if args.command == "client":
+        if args.client_command == "list":
+            return command_client_list()
+        if args.client_command == "pair":
+            pairing = create_pairing(
+                permissions=args.permission or DEFAULT_PERMISSIONS,
+                principal_id=args.principal, ttl_seconds=args.ttl)
+            console.print_json(data=pairing)
+            return 0
+        if args.client_command == "revoke":
+            client = revoke_core_client(args.client_id)
+            console.print(f"[green]Revoked[/green] {client.id} · {client.name}")
+            return 0
 
     if args.command == "task":
         if args.task_command == "list":
