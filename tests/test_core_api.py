@@ -6,7 +6,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from tars import conversation, core_api, core_auth, events, scheduler, state_store, tasks
+from tars import cli, conversation, core_api, core_auth, events, scheduler, state_store, tasks
 from tars.core_client import CoreClient as NativeCoreClient
 
 
@@ -33,6 +33,7 @@ def test_pairing_token_is_one_time_hashed_and_revocable(core_state):
         row = conn.execute("SELECT token_hash,token_salt FROM core_clients WHERE id=?",
                            (client.id,)).fetchone()
         assert token not in (row["token_hash"], row["token_salt"])
+        assert row["token_hash"].startswith("v2$")
         assert pairing["code"] not in conn.execute(
             "SELECT code_hash FROM core_pairings").fetchone()[0]
     with pytest.raises(PermissionError, match="consumed"):
@@ -40,6 +41,38 @@ def test_pairing_token_is_one_time_hashed_and_revocable(core_state):
     assert core_auth.revoke(client.id).state == "revoked"
     with pytest.raises(PermissionError, match="revoked"):
         core_auth.authenticate(token)
+
+
+def test_authentication_uses_indexed_client_and_one_scrypt(core_state, monkeypatch):
+    first, first_token = paired()
+    paired()
+    paired()
+    calls = []
+    real_derive = core_auth._derive
+
+    def counted(secret, salt):
+        calls.append((secret, salt))
+        return real_derive(secret, salt)
+
+    monkeypatch.setattr(core_auth, "_derive", counted)
+    assert core_auth.authenticate(first_token).id == first.id
+    assert len(calls) == 1
+    with pytest.raises(PermissionError, match="invalid"):
+        core_auth.authenticate(first_token.rsplit(".", 1)[0] + ".wrong")
+    assert len(calls) == 2
+    with pytest.raises(PermissionError, match="invalid"):
+        core_auth.authenticate("client-does-not-exist.secret")
+    assert len(calls) == 3
+
+
+def test_legacy_unindexed_credentials_are_revoked_on_upgrade(core_state):
+    client, _ = paired()
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE core_clients SET token_hash='legacy-hash' WHERE id=?", (client.id,)
+        )
+    state_store.ensure_state_store()
+    assert next(item for item in core_auth.list_clients() if item.id == client.id).state == "revoked"
 
 
 def test_api_uses_canonical_conversation_task_and_permissions(core_state):
@@ -84,6 +117,77 @@ def test_task_event_stream_resumes_and_hides_internal_events(core_state):
     assert [item["message"] for item in resumed] == ["two"]
 
 
+def test_open_event_stream_stops_after_client_revocation(core_state):
+    client, token = paired()
+    task = tasks.create_task("stream", "general", make_active=False)
+    api = core_api.CoreAPI()
+    authenticated = api.authenticate_header(f"Bearer {token}")
+    stream = api.stream_task_events(task.id, authenticated, follow=True, poll_seconds=0.02)
+    assert next(stream)["task_id"] == task.id
+    core_auth.revoke(client.id)
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_open_http_event_stream_closes_after_client_revocation(core_state):
+    client, token = paired()
+    task = tasks.create_task("network stream", "general", make_active=False)
+    server = core_api.make_server(core_api.CoreServerConfig(port=0))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    response = None
+    try:
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/tasks/{task.id}/events",
+            headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"})
+        response = urlopen(request, timeout=2)
+        while response.readline() not in {b"\n", b""}:
+            pass
+        core_auth.revoke(client.id)
+        closed = []
+
+        def read_to_close():
+            closed.append(response.read())
+
+        reader = threading.Thread(target=read_to_close, daemon=True)
+        reader.start()
+        reader.join(timeout=2)
+        assert not reader.is_alive() and closed == [b""]
+    finally:
+        if response is not None:
+            response.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+
+def test_sse_denial_and_missing_task_happen_before_success_headers(core_state):
+    _, no_read_token = paired(permissions=("status.read",))
+    _, read_token = paired(permissions=("task.read",))
+    task = tasks.create_task("protected stream", "general", make_active=False)
+    server = core_api.make_server(core_api.CoreServerConfig(port=0))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def status(path, token):
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}{path}",
+                headers={"Authorization": f"Bearer {token}",
+                         "Accept": "text/event-stream"})
+            try:
+                urlopen(request, timeout=2)
+            except Exception as exc:
+                return exc.code
+            raise AssertionError("SSE request unexpectedly succeeded")
+
+        assert status(f"/v1/tasks/{task.id}/events?follow=0", no_read_token) == 403
+        assert status("/v1/tasks/task-missing/events?follow=0", read_token) == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_network_defaults_require_explicit_tls_for_remote(core_state):
     core_api.CoreServerConfig().validate()
     with pytest.raises(PermissionError, match="allow_remote"):
@@ -93,6 +197,18 @@ def test_network_defaults_require_explicit_tls_for_remote(core_state):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     core_api.CoreServerConfig(
         host="192.0.2.1", allow_remote=True, ssl_context=context).validate()
+
+
+def test_core_serve_options_use_config_unless_overridden(core_state):
+    parser = cli.build_parser()
+    configured = {"core": {"host": "127.0.0.2", "port": 9123, "allow_remote": True}}
+    defaults = parser.parse_args(["core", "serve"])
+    assert cli._core_server_options(configured, defaults) == ("127.0.0.2", 9123, True)
+    explicit = parser.parse_args([
+        "core", "serve", "--host", "127.0.0.3", "--port", "9456",
+        "--no-allow-remote",
+    ])
+    assert cli._core_server_options(configured, explicit) == ("127.0.0.3", 9456, False)
 
 
 def test_loopback_http_and_native_client_round_trip(core_state):

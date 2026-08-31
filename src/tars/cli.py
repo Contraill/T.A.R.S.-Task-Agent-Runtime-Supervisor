@@ -131,6 +131,7 @@ from .core_auth import (DEFAULT_PERMISSIONS, PERMISSIONS as CLIENT_PERMISSIONS,
                         create_pairing, list_clients as list_core_clients,
                         revoke as revoke_core_client)
 from .core_api import CoreAPI, CoreServerConfig, make_server
+from .runtime_routing import LocalRuntimeRouter
 
 console = Console()
 
@@ -220,7 +221,17 @@ def _schedule_executor(cfg):
     return execute
 
 
+def _core_server_options(cfg, args):
+    core_cfg = cfg.get("core", {})
+    host = args.host if args.host is not None else core_cfg.get("host", "127.0.0.1")
+    port = args.port if args.port is not None else int(core_cfg.get("port", 8765))
+    allow_remote = (args.allow_remote if args.allow_remote is not None
+                    else bool(core_cfg.get("allow_remote", False)))
+    return host, port, allow_remote
+
+
 def command_core_serve(cfg, args):
+    host, port, allow_remote = _core_server_options(cfg, args)
     context = None
     if args.cert or args.key:
         if not args.cert or not args.key:
@@ -230,9 +241,9 @@ def command_core_serve(cfg, args):
     conditions = condition_registry(cfg)
     require_condition_support(conditions)
     server = make_server(
-        CoreServerConfig(args.host, args.port, allow_remote=args.allow_remote,
+        CoreServerConfig(host, port, allow_remote=allow_remote,
                          ssl_context=context),
-        api=CoreAPI(allow_remote_pairing=args.allow_remote and context is not None,
+        api=CoreAPI(allow_remote_pairing=allow_remote and context is not None,
                     conditions=conditions))
     scheduler = Scheduler(
         max_concurrency=int(cfg.get("scheduler", {}).get("max_concurrency", 1)),
@@ -249,7 +260,7 @@ def command_core_serve(cfg, args):
         server.server_close()
         raise RuntimeError("Core scheduler failed to start")
     scheme = "https" if context else "http"
-    console.print(f"T.A.R.S. Core listening on {scheme}://{args.host}:{server.server_port}")
+    console.print(f"T.A.R.S. Core listening on {scheme}://{host}:{server.server_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -324,6 +335,24 @@ def command_status(cfg):
         console.print("  no NVIDIA PCI device found")
 
     return 0
+
+
+def command_runtime_route(cfg, args):
+    route = LocalRuntimeRouter(cfg).resolve(
+        args.role, task_id=args.task, required_capabilities=args.capability,
+        context_tokens=args.context_tokens, require_reasoning=args.reasoning,
+        require_tools=args.tools)
+    console.print_json(data={
+        "id": route.id, "state": route.state,
+        "requested_role": route.requested_role, "selected_role": route.selected_role,
+        "model": route.model_alias, "backend": route.backend,
+        "runtime_id": route.runtime_id, "profile": route.profile,
+        "requested": route.requested, "reasons": list(route.reasons),
+        "backend_status": route.backend_status,
+        "runtime_capabilities": route.runtime_capabilities,
+        "model_capabilities": route.model_capabilities,
+    })
+    return 0 if route.ready else 1
 
 
 def command_agents(cfg):
@@ -2013,6 +2042,13 @@ def build_parser():
         "--yes", action="store_true",
         help="confirm Role Registry and runtime config transaction",
     )
+    runtime_route = runtime_sub.add_parser("route", help="inspect an exact local Role route")
+    runtime_route.add_argument("role")
+    runtime_route.add_argument("--task")
+    runtime_route.add_argument("--capability", action="append", default=[])
+    runtime_route.add_argument("--context-tokens", type=int, default=0)
+    runtime_route.add_argument("--reasoning", action="store_true")
+    runtime_route.add_argument("--tools", action="store_true")
 
     schedule = sub.add_parser("schedule", help="durable model-free scheduling")
     schedule_sub = schedule.add_subparsers(dest="schedule_command", required=True)
@@ -2050,9 +2086,10 @@ def build_parser():
     core = sub.add_parser("core", help="authoritative authenticated Core API")
     core_sub = core.add_subparsers(dest="core_command", required=True)
     core_serve = core_sub.add_parser("serve")
-    core_serve.add_argument("--host", default="127.0.0.1")
-    core_serve.add_argument("--port", type=int, default=8765)
-    core_serve.add_argument("--allow-remote", action="store_true")
+    core_serve.add_argument("--host")
+    core_serve.add_argument("--port", type=int)
+    core_serve.add_argument("--allow-remote", action=argparse.BooleanOptionalAction,
+                            default=None)
     core_serve.add_argument("--cert")
     core_serve.add_argument("--key")
 
@@ -2326,6 +2363,8 @@ def main():
             return command_runtime_apply(cfg, yes=args.yes)
         if args.runtime_command == "switch":
             return command_runtime_switch(cfg, args)
+        if args.runtime_command == "route":
+            return command_runtime_route(cfg, args)
 
     if args.command == "schedule":
         if args.schedule_command == "list":

@@ -237,8 +237,6 @@ Status: implemented.
 
 See [SCHEDULER.md](SCHEDULER.md) for scheduling and recovery semantics.
 
-### Remaining v0.8.x work
-
 ### v0.8.1 — Core API and authenticated clients
 
 Status: implemented.
@@ -251,9 +249,25 @@ Status: implemented.
 - principal-ready client identity without per-client state models
 
 See [REMOTE.md](REMOTE.md) for API, pairing and transport boundaries.
-- optional Tailscale Serve integration
+
+### v0.8.2 — local runtime routing
+
+Status: implemented.
+
+- exact Role to local backend/model/runtime/profile routing
+- artifact, integrity, calibration, health, context and capability validation
+- durable ready/unavailable route evidence with no silent substitution
+- explicit task-owner handoff requirement and local-only inference policy
+- on-demand load and finite-unload lifecycle contracts
+
+See [RUNTIME_BACKENDS.md](RUNTIME_BACKENDS.md) for route and lifecycle truth.
+
+### Remaining v0.8.x work
+
 - Oracle/Colibri backend
-- `.tarsbundle` backup/restore/reset
+- extension boundaries
+- SecretStore
+- versioned backup/restore/migration
 
 Normal portable bundles exclude model weights and include calibration history. Restore performs environment recognition, then Welcome Back.
 

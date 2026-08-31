@@ -28,6 +28,8 @@ Memory           ScopeGuard
 
 **Roles are not models.** A Role owns purpose, capabilities, execution style and policy. Its model and local RuntimeBackend binding may be replaced.
 
+**Routing preserves semantics.** Local routing validates the exact Role binding, backend health, model capabilities and calibrated context. Unavailable bindings fail explicitly; they are not silently replaced.
+
 **One task has one owner.** Delegation does not change ownership. Handoff does, and must be transactional.
 
 **Security is deterministic.** ScopeGuard and the tool executor decide what can run. The model does not grant itself permission.

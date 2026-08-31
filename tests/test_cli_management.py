@@ -37,6 +37,10 @@ def test_runtime_backend_cli_parsing():
     assert parser.parse_args(["backend", "list"]).backend_command == "list"
     status = parser.parse_args(["backend", "status", "llama.cpp"])
     assert status.backend == "llama.cpp"
+    route = parser.parse_args([
+        "runtime", "route", "builder", "--capability", "code", "--tools",
+    ])
+    assert route.runtime_command == "route" and route.capability == ["code"] and route.tools
 
 
 def test_memory_cli_parsing():
@@ -84,7 +88,12 @@ def test_scheduler_cli_surface():
 def test_core_client_cli_surface():
     parser = build_parser()
     serve = parser.parse_args(["core", "serve"])
-    assert serve.host == "127.0.0.1" and not serve.allow_remote
+    assert serve.host is None and serve.port is None and serve.allow_remote is None
+    overridden = parser.parse_args([
+        "core", "serve", "--host", "127.0.0.2", "--port", "9000", "--allow-remote",
+    ])
+    assert (overridden.host, overridden.port, overridden.allow_remote) == (
+        "127.0.0.2", 9000, True)
     pair = parser.parse_args(["client", "pair", "--permission", "task.read"])
     assert pair.permission == ["task.read"]
     assert parser.parse_args(["client", "revoke", "client-one"]).client_id == "client-one"

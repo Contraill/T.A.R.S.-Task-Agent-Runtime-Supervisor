@@ -11,7 +11,8 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .agent_loop import submit_task_control
 from .conversation import add_message, create_conversation, list_conversations, list_messages
-from .core_auth import CoreClient, authenticate, exchange_pairing, list_clients, revoke
+from .core_auth import (CoreClient, authenticate, client_is_active, exchange_pairing,
+                        list_clients, revoke)
 from .events import read_events_since
 from .scheduler import (create_schedule, edit_schedule, list_schedules,
                         load_schedule, remove_schedule, set_enabled)
@@ -198,6 +199,8 @@ class CoreAPI:
         load_task(task_id)
         cursor = int(after)
         while True:
+            if not client_is_active(client.id):
+                return
             events = [event for event in read_events_since(task_id, cursor, 200)
                       if event["visibility"] != "internal"]
             for event in events:
@@ -268,6 +271,8 @@ class CoreRequestHandler(BaseHTTPRequestHandler):
 
     def _stream_events(self, task_id, parsed):
         client = self.server.api.authenticate_header(self.headers.get("Authorization", ""))
+        client.require("task.read")
+        load_task(task_id)
         query = parse_qs(parsed.query)
         after = int(query.get("after", [self.headers.get("Last-Event-ID", "0")])[0])
         follow = query.get("follow", ["1"])[0] not in {"0", "false"}
@@ -286,8 +291,7 @@ class CoreRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
         finally:
-            if not follow:
-                self.close_connection = True
+            self.close_connection = True
 
 
 def make_server(config: CoreServerConfig, api=None):

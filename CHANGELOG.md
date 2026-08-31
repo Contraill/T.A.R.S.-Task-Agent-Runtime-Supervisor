@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.2 - Local Runtime Routing
+
+- added persistent exact-Role routing decisions across local backend, model, runtime and profile bindings
+- added truthful artifact, integrity, calibration, availability, health, context, modality and capability checks
+- added explicit unavailable routes and task-owner handoff requirements without silent substitution
+- added on-demand load and finite-unload lifecycle preparation contracts
+- rejected non-local backend routes and retained local-only inference policy
+- indexed Core credentials to one scrypt verification, hardened SSE preflight/revocation,
+  and honored configured Core bind defaults; pre-index credentials require re-pairing
+
 ## 0.8.1 - Core API and Authenticated Clients
 
 - added one authoritative native Core API over canonical conversations, tasks, controls and events

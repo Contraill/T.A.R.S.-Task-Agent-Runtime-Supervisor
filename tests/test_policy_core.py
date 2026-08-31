@@ -200,4 +200,4 @@ def test_failed_result_is_truthful_and_redacted(isolated_policy):
     )
     assert failed.state == "failed" and failed.result["error"] == "not found"
     assert failed.result["authorization"] == "[REDACTED]"
-    assert state_store.health()["schema_version"] == 16
+    assert state_store.health()["schema_version"] == 17

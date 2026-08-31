@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 def now_utc() -> str:
@@ -410,6 +410,26 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_core_pairings_expiry
         ON core_pairings(expires_at, consumed_at);
 
+    CREATE TABLE IF NOT EXISTS runtime_routes (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        requested_role TEXT NOT NULL,
+        selected_role TEXT NOT NULL,
+        model_alias TEXT NOT NULL DEFAULT '',
+        backend TEXT NOT NULL DEFAULT '',
+        runtime_id TEXT NOT NULL DEFAULT '',
+        profile TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL CHECK(state IN ('ready','unavailable')),
+        requested_json TEXT NOT NULL DEFAULT '{}',
+        reasons_json TEXT NOT NULL DEFAULT '[]',
+        backend_status_json TEXT NOT NULL DEFAULT '{}',
+        runtime_capabilities_json TEXT NOT NULL DEFAULT '{}',
+        model_capabilities_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_runtime_routes_task_created
+        ON runtime_routes(task_id, created_at DESC);
+
     CREATE TABLE IF NOT EXISTS task_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_uuid TEXT NOT NULL UNIQUE,
@@ -606,6 +626,11 @@ def ensure_state_store() -> Path:
     try:
         conn.executescript(_schema_sql())
         conn.execute(
+            """UPDATE core_clients SET state='revoked',revoked_at=COALESCE(revoked_at, ?)
+               WHERE state='active' AND token_hash NOT LIKE 'v2$%'""",
+            (now_utc(),),
+        )
+        conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
@@ -642,6 +667,11 @@ def ensure_state_store_no_migration() -> Path:
     try:
         conn.executescript(_schema_sql())
         conn.execute(
+            """UPDATE core_clients SET state='revoked',revoked_at=COALESCE(revoked_at, ?)
+               WHERE state='active' AND token_hash NOT LIKE 'v2$%'""",
+            (now_utc(),),
+        )
+        conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
@@ -661,7 +691,7 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries", "core_clients", "core_pairings"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries", "core_clients", "core_pairings", "runtime_routes"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION,

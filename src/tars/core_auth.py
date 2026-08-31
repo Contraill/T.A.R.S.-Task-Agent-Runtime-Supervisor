@@ -87,7 +87,7 @@ def exchange_pairing(code: str, name: str, *, metadata=None) -> tuple[CoreClient
         row = conn.execute("SELECT * FROM core_pairings WHERE code_hash=?", (digest,)).fetchone()
         if not row or row["consumed_at"] or _time(row["expires_at"]) <= now:
             raise PermissionError("pairing code is invalid, expired or already consumed")
-        token = secrets.token_urlsafe(48)
+        secret = secrets.token_urlsafe(48)
         salt = secrets.token_bytes(16)
         client_id = "client-" + uuid.uuid4().hex
         stamp = now.isoformat().replace("+00:00", "Z")
@@ -96,32 +96,47 @@ def exchange_pairing(code: str, name: str, *, metadata=None) -> tuple[CoreClient
                permissions_json,state,created_at,metadata_json)
                VALUES(?,?,?,?,?,?,'active',?,?)""",
             (client_id, str(name).strip() or "Unnamed client", row["principal_id"],
-             salt.hex(), _derive(token, salt), row["permissions_json"], stamp,
+             salt.hex(), "v2$" + _derive(secret, salt), row["permissions_json"], stamp,
              json_dumps(metadata or {})))
         conn.execute("UPDATE core_pairings SET consumed_at=?,client_id=? WHERE id=?",
                      (stamp, client_id, row["id"]))
         client_row = conn.execute("SELECT * FROM core_clients WHERE id=?", (client_id,)).fetchone()
-    return _client(client_row), token
+    return _client(client_row), f"{client_id}.{secret}"
 
 
 def authenticate(token: str) -> CoreClient:
     ensure_state_store()
     if not token:
         raise PermissionError("missing client token")
+    client_id, separator, secret = str(token).partition(".")
+    if not separator or not client_id.startswith("client-") or not secret:
+        raise PermissionError("invalid or revoked client token")
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM core_clients WHERE state='active'").fetchall()
-    matched = None
-    for row in rows:
-        salt = bytes.fromhex(row["token_salt"])
-        if hmac.compare_digest(_derive(token, salt), row["token_hash"]):
-            matched = row
+        matched = conn.execute(
+            "SELECT * FROM core_clients WHERE id=? AND state='active'", (client_id,)
+        ).fetchone()
     if matched is None:
+        hmac.compare_digest(_derive(secret, bytes(16)), "0" * 128)
+        raise PermissionError("invalid or revoked client token")
+    if not matched["token_hash"].startswith("v2$"):
+        raise PermissionError("invalid or revoked client token")
+    salt = bytes.fromhex(matched["token_salt"])
+    if not hmac.compare_digest(_derive(secret, salt), matched["token_hash"][3:]):
         raise PermissionError("invalid or revoked client token")
     stamp = now_utc()
     with transaction(immediate=True) as conn:
         conn.execute("UPDATE core_clients SET last_seen_at=? WHERE id=?", (stamp, matched["id"]))
         row = conn.execute("SELECT * FROM core_clients WHERE id=?", (matched["id"],)).fetchone()
     return _client(row)
+
+
+def client_is_active(client_id: str) -> bool:
+    """Cheap revocation check for an already authenticated long-lived request."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT state FROM core_clients WHERE id=?", (str(client_id),)
+        ).fetchone()
+    return bool(row and row["state"] == "active")
 
 
 def list_clients(*, include_revoked=True) -> list[CoreClient]:
