@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 BASE_SCHEMA_VERSION = 3
 
 # Schema objects were introduced monotonically in the public state-store history.
@@ -47,6 +47,7 @@ _SCHEMA_INTRODUCED = {
     "idx_core_pairings_expiry": 16, "runtime_routes": 17,
     "idx_runtime_routes_task_created": 17,
     "resource_leases": 18, "idx_resource_leases_expiry": 18,
+    "control_cancellations": 19, "idx_control_cancellations_state": 19,
 }
 
 
@@ -324,6 +325,23 @@ def _schema_sql() -> str:
     );
     CREATE INDEX IF NOT EXISTS idx_task_controls_pending
         ON task_controls(task_id, state, priority, seq);
+
+    CREATE TABLE IF NOT EXISTS control_cancellations (
+        control_id TEXT PRIMARY KEY REFERENCES task_controls(id) ON DELETE CASCADE,
+        state TEXT NOT NULL CHECK(state IN ('intent','attempting','resolved','ambiguous')),
+        operation_id TEXT NOT NULL DEFAULT '',
+        active_tool TEXT NOT NULL DEFAULT '',
+        cancellable INTEGER NOT NULL DEFAULT 0,
+        cancellation_effect TEXT NOT NULL DEFAULT 'execute'
+            CHECK(cancellation_effect IN ('execute','destructive')),
+        result_json TEXT,
+        error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        attempt_started_at TEXT,
+        reconciled_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_control_cancellations_state
+        ON control_cancellations(state, created_at);
 
     CREATE TABLE IF NOT EXISTS workspace_checkpoints (
         id TEXT PRIMARY KEY,
@@ -724,6 +742,59 @@ def _apply_schema_level(conn: sqlite3.Connection, version: int) -> None:
                            f"{', '.join(sorted(missing))}")
 
 
+def _migrate_control_cancellations(conn: sqlite3.Connection) -> None:
+    """Give legacy interrupt controls conservative, non-replayable outcome truth."""
+    rows = conn.execute(
+        """SELECT * FROM task_controls WHERE kind IN ('interrupt','cancel')
+           AND NOT EXISTS (
+               SELECT 1 FROM control_cancellations x WHERE x.control_id=task_controls.id
+           )"""
+    ).fetchall()
+    stamp = now_utc()
+    for row in rows:
+        payload = json_loads(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            payload = {}
+        had_truth = "cancellation_requested" in payload
+        cancellable = bool(payload.get("cancellable", False))
+        requested = payload.get("cancellation_requested")
+        returned = "cancellation_result" in payload
+        if had_truth and not cancellable and requested is False:
+            cancellation_state = "resolved"
+            safe_requested = False
+            outcome = "legacy-not-cancellable"
+        elif had_truth and requested is True and returned:
+            cancellation_state = "resolved"
+            safe_requested = True
+            outcome = "legacy-request-dispatched"
+        else:
+            cancellation_state = "ambiguous"
+            safe_requested = None
+            outcome = "legacy-outcome-ambiguous"
+        payload.update({
+            "cancellation_phase": cancellation_state,
+            "cancellation_requested": safe_requested,
+            "cancellation_outcome": outcome,
+            "cancellation_result": {"requested": safe_requested},
+            "cancellable": cancellable,
+            "cancellation_effect": "execute",
+        })
+        payload.pop("cancellation_error", None)
+        conn.execute(
+            "UPDATE task_controls SET payload_json=? WHERE id=?",
+            (json_dumps(payload), row["id"]),
+        )
+        conn.execute(
+            """INSERT INTO control_cancellations(
+               control_id,state,operation_id,active_tool,cancellable,cancellation_effect,
+               result_json,error,created_at,reconciled_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (row["id"], cancellation_state, "",
+             str(payload.get("active_tool", ""))[:256], int(cancellable), "execute",
+             json_dumps({"requested": safe_requested}), "", row["created_at"], stamp),
+        )
+
+
 def _expected_schema() -> dict[str, tuple[str, ...]]:
     expected = {}
     conn = sqlite3.connect(":memory:")
@@ -789,6 +860,8 @@ def migrate_connection(conn: sqlite3.Connection) -> int:
         while version < SCHEMA_VERSION:
             target = version + 1
             _apply_schema_level(conn, target)
+            if target == 19:
+                _migrate_control_cancellations(conn)
             conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(target),))
             version = target
         errors = schema_errors(conn)
@@ -853,13 +926,24 @@ def health() -> dict:
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
         shape_errors = schema_errors(conn)
+        cancellation_orphans = conn.execute(
+            """SELECT COUNT(*) FROM task_controls c
+               WHERE c.kind IN ('interrupt','cancel') AND NOT EXISTS (
+                   SELECT 1 FROM control_cancellations x WHERE x.control_id=c.id
+               )"""
+        ).fetchone()[0]
+        state_errors = ([] if not cancellation_orphans else [
+            f"{cancellation_orphans} cancellation controls lack durable outcome state"
+        ])
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "resource_leases", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries", "core_clients", "core_pairings", "runtime_routes"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "resource_leases", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "control_cancellations", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries", "core_clients", "core_pairings", "runtime_routes"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
-            "ok": integrity == "ok" and version == SCHEMA_VERSION and not shape_errors,
+            "ok": (integrity == "ok" and version == SCHEMA_VERSION
+                   and not shape_errors and not state_errors),
             "integrity": integrity,
             "schema_errors": shape_errors,
+            "state_errors": state_errors,
             "schema_version": version,
             "expected_schema_version": SCHEMA_VERSION,
             "counts": counts,

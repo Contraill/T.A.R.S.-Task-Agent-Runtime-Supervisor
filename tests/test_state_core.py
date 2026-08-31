@@ -152,9 +152,99 @@ def test_real_v17_layout_adds_durable_lease_schema(isolated_state):
     state_store.ensure_state_store_no_migration()
     with sqlite3.connect(isolated_state) as conn:
         assert conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "18"
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(
+                state_store.SCHEMA_VERSION)
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='resource_leases'").fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='control_cancellations'").fetchone()
+
+
+def test_real_v18_layout_adds_control_cancellation_schema(isolated_state):
+    conn = sqlite3.connect(isolated_state)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        for version in range(state_store.BASE_SCHEMA_VERSION, 19):
+            state_store._apply_schema_level(conn, version)
+        conn.execute("INSERT INTO meta(key,value) VALUES('schema_version','18')")
+        conn.execute(
+            """INSERT INTO tasks(id,goal,owner_role,state,created_at,updated_at)
+               VALUES('task-legacy','goal','general','running','2025-01-01','2025-01-01')"""
+        )
+        conn.execute(
+            """INSERT INTO task_controls(
+               id,task_id,seq,kind,priority,state,message,payload_json,created_at,applied_at)
+               VALUES('control-raced','task-legacy',1,'interrupt',1,'applied','stop',
+                      '{"applied_at_boundary":true}','2025-01-01','2025-01-01')"""
+        )
+        conn.execute(
+            """INSERT INTO task_controls(
+               id,task_id,seq,kind,priority,state,message,payload_json,created_at)
+               VALUES('control-returned','task-legacy',2,'cancel',0,'pending','cancel',
+                      ?,'2025-01-01')""",
+            ('{"cancellable":true,"cancellation_requested":true,'
+             '"cancellation_result":{"private":"must-not-survive"}}',),
+        )
+        conn.execute(
+            """INSERT INTO task_controls(
+               id,task_id,seq,kind,priority,state,message,payload_json,created_at)
+               VALUES('control-malformed','task-legacy',3,'interrupt',1,'pending',
+                      'stop','[]','2025-01-01')"""
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='resource_leases'").fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='control_cancellations'").fetchone() is None
+    finally:
+        conn.close()
+    state_store.ensure_state_store_no_migration()
+    with sqlite3.connect(isolated_state) as conn:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "19"
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='control_cancellations'").fetchone()
+        raced = conn.execute(
+            "SELECT state FROM control_cancellations WHERE control_id='control-raced'"
+        ).fetchone()
+        returned = conn.execute(
+            "SELECT state,result_json FROM control_cancellations "
+            "WHERE control_id='control-returned'"
+        ).fetchone()
+        malformed = conn.execute(
+            "SELECT state FROM control_cancellations WHERE control_id='control-malformed'"
+        ).fetchone()
+        payload = conn.execute(
+            "SELECT payload_json FROM task_controls WHERE id='control-returned'"
+        ).fetchone()[0]
+        assert raced[0] == "ambiguous"
+        assert returned == ("resolved", '{"requested":true}')
+        assert malformed[0] == "ambiguous"
+        assert "must-not-survive" not in payload
+
+
+def test_failed_cancellation_backfill_does_not_advance_v18(monkeypatch, isolated_state):
+    conn = sqlite3.connect(isolated_state)
+    try:
+        for version in range(state_store.BASE_SCHEMA_VERSION, 19):
+            state_store._apply_schema_level(conn, version)
+        conn.execute("INSERT INTO meta(key,value) VALUES('schema_version','18')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fail_backfill(conn):
+        raise RuntimeError("injected cancellation backfill failure")
+
+    monkeypatch.setattr(state_store, "_migrate_control_cancellations", fail_backfill)
+    with pytest.raises(RuntimeError, match="injected cancellation backfill failure"):
+        state_store.ensure_state_store_no_migration()
+    with sqlite3.connect(isolated_state) as conn:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "18"
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='control_cancellations'"
+        ).fetchone() is None
 
 def test_failed_migration_never_advances_version(monkeypatch, isolated_state):
     conn = sqlite3.connect(isolated_state)

@@ -56,6 +56,40 @@ def _claim_control_and_exit(database, scratch, task_id):
     assert control_queue.claim_next(task_id, owner) is not None
 
 
+def _strand_cancellation(database, scratch, task_id, attempted, marker, connection):
+    _configure_process_state(database, scratch)
+    owner = ownership.Owner.create("cancel-worker")
+    control = control_queue.enqueue_cancellation(
+        task_id, "interrupt", "stop", active_tool="terminal.run",
+        cancellable=True, operation_id="operation-crash", owner=owner,
+    )
+    if attempted:
+        control_queue.begin_cancellation(control.id, owner)
+        Path(marker).write_text("external cancellation may have happened", encoding="utf-8")
+    connection.send(control.id)
+    connection.close()
+    import os
+    os._exit(23)
+
+
+def _recover_cancellations_in_process(database, scratch, task_id, connection):
+    _configure_process_state(database, scratch)
+    recovered = control_queue.recover_cancellations(
+        task_id, ownership.Owner.create("cancel-recovery"))
+    connection.send(recovered)
+    connection.close()
+
+
+def _wait_for_cancellation_state(control_id, expected, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = control_queue.cancellation_state(control_id)
+        if state and state["state"] == expected:
+            return state
+        threading.Event().wait(0.01)
+    raise AssertionError(f"cancellation {control_id} did not reach {expected}")
+
+
 def test_agent_loop_executes_real_tool_result_and_requires_completion_evidence(loop_state):
     task, _ = loop_state
     calls = iter((
@@ -214,10 +248,448 @@ def test_immediate_interrupt_records_actual_cancellation_truth(loop_state, cance
     recorded = control_queue.load(control.id)
     assert recorded.state == "applied"
     assert recorded.payload.get("cancellable") is cancellable
+    assert recorded.payload["cancellation_phase"] == "resolved"
+    assert recorded.payload["cancellation_requested"] is cancellable
     assert bool(cancel_called) is cancellable
     messages = [item.content for item in conversation.list_messages(conv.id)
                 if item.kind == "control"]
     assert messages == ["stop and inspect"]
+
+
+def test_worker_cannot_terminalize_or_duplicate_cancel_before_reconciliation(loop_state):
+    task, _ = loop_state
+    started = threading.Event()
+    release_tool = threading.Event()
+    tool_returned = threading.Event()
+    cancel_entered = threading.Event()
+    allow_cancel_return = threading.Event()
+    cancel_calls = []
+    model_calls = []
+
+    def execute(task_id=None):
+        started.set()
+        assert release_tool.wait(5)
+        tool_returned.set()
+        return result_for(task_id, tool="terminal.run", state="failed", error="cancelled")
+
+    def cancel():
+        cancel_calls.append(True)
+        cancel_entered.set()
+        release_tool.set()
+        assert allow_cancel_return.wait(5)
+        return {"requested": True, "sensitive_backend_detail": "must-not-persist"}
+
+    decisions = iter((
+        {"type": "tool", "tool": "terminal.run", "arguments": {}},
+        {"type": "finish", "summary": "done"},
+    ))
+
+    def model(current, controls):
+        model_calls.append(True)
+        return next(decisions)
+
+    loop = agent_loop.AgentLoop(
+        task.id, model,
+        agent_loop.ToolDispatcher().register(
+            "terminal.run", execute, cancel=cancel, retry_safe=True),
+        limits=agent_loop.LoopLimits(cancellation_reconcile_seconds=5),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    holder = {}
+    thread = threading.Thread(target=lambda: holder.setdefault("outcome", loop.run()))
+    thread.start()
+    assert started.wait(5)
+    control, _ = loop.submit_control("interrupt", "first interrupt")
+    assert cancel_entered.wait(5)
+    assert tool_returned.wait(5)
+
+    duplicate, _ = loop.submit_control("interrupt", "duplicate interrupt")
+    assert control_queue.cancellation_state(control.id)["state"] == "attempting"
+    assert control_queue.load(control.id).state == "pending"
+    assert control_queue.cancellation_state(duplicate.id)["state"] == "resolved"
+    assert duplicate.payload["cancellation_outcome"] == "already-requested"
+    assert cancel_calls == [True]
+    assert len(model_calls) == 1
+
+    allow_cancel_return.set()
+    thread.join(5)
+    assert not thread.is_alive() and holder["outcome"].state == "completed"
+    recorded = control_queue.load(control.id)
+    assert recorded.state == "applied"
+    assert recorded.payload["cancellation_outcome"] == "request-dispatched"
+    assert recorded.payload["cancellation_result"] == {"requested": True}
+    assert "must-not-persist" not in str(recorded.payload)
+    assert control_queue.load(duplicate.id).state == "applied"
+    assert cancel_calls == [True]
+
+
+def test_blocking_cancel_pauses_loop_without_advancing_and_can_reconcile_later(loop_state):
+    task, _ = loop_state
+    started = threading.Event()
+    release_tool = threading.Event()
+    cancel_entered = threading.Event()
+    allow_cancel_return = threading.Event()
+    model_calls = []
+
+    def execute(task_id=None):
+        started.set()
+        assert release_tool.wait(5)
+        return result_for(task_id, tool="terminal.run", state="failed", error="cancelled")
+
+    def cancel():
+        cancel_entered.set()
+        release_tool.set()
+        assert allow_cancel_return.wait(5)
+        return True
+
+    def model(current, controls):
+        model_calls.append(True)
+        return {"type": "tool", "tool": "terminal.run", "arguments": {}}
+
+    loop = agent_loop.AgentLoop(
+        task.id, model,
+        agent_loop.ToolDispatcher().register(
+            "terminal.run", execute, cancel=cancel, retry_safe=True),
+        limits=agent_loop.LoopLimits(cancellation_reconcile_seconds=0.01),
+    )
+    holder = {}
+    thread = threading.Thread(target=lambda: holder.setdefault("outcome", loop.run()))
+    thread.start()
+    assert started.wait(5)
+    control, _ = loop.submit_control("interrupt", "stop")
+    assert cancel_entered.wait(5)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert holder["outcome"].reason == "cancellation reconciliation pending"
+    assert len(model_calls) == 1
+    assert control_queue.load(control.id).state == "pending"
+    assert control_queue.cancellation_state(control.id)["state"] == "attempting"
+
+    allow_cancel_return.set()
+    _wait_for_cancellation_state(control.id, "resolved")
+    resumed = agent_loop.AgentLoop(
+        task.id, lambda current, controls: {"type": "finish", "summary": "done"},
+        agent_loop.ToolDispatcher(),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    ).run()
+    assert resumed.state == "completed"
+    assert control_queue.load(control.id).state == "applied"
+
+
+def test_cancellation_exception_is_ambiguous_and_does_not_persist_error_text(loop_state):
+    task, _ = loop_state
+    started = threading.Event()
+    release_tool = threading.Event()
+
+    def execute(task_id=None):
+        started.set()
+        assert release_tool.wait(5)
+        return result_for(task_id, tool="terminal.run", state="failed", error="cancelled")
+
+    def cancel():
+        release_tool.set()
+        raise RuntimeError("resolved-secret-must-not-persist")
+
+    decisions = iter((
+        {"type": "tool", "tool": "terminal.run", "arguments": {}},
+        {"type": "finish", "summary": "done"},
+    ))
+    loop = agent_loop.AgentLoop(
+        task.id, lambda current, controls: next(decisions),
+        agent_loop.ToolDispatcher().register(
+            "terminal.run", execute, cancel=cancel, retry_safe=True),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    holder = {}
+    thread = threading.Thread(target=lambda: holder.setdefault("outcome", loop.run()))
+    thread.start()
+    assert started.wait(5)
+    control, _ = loop.submit_control("interrupt", "stop")
+    thread.join(5)
+    assert not thread.is_alive() and holder["outcome"].state == "completed"
+    recorded = control_queue.load(control.id)
+    assert control_queue.cancellation_state(control.id)["state"] == "ambiguous"
+    assert recorded.payload["cancellation_requested"] is None
+    assert recorded.payload["cancellation_error"] == "RuntimeError"
+    assert "resolved-secret" not in str(recorded.payload)
+
+
+def test_reconciliation_retry_never_replays_external_cancellation(loop_state, monkeypatch):
+    task, _ = loop_state
+    started = threading.Event()
+    release_tool = threading.Event()
+    cancel_calls = []
+    real_reconcile = control_queue.reconcile_cancellation
+    attempts = []
+
+    def execute(task_id=None):
+        started.set()
+        assert release_tool.wait(5)
+        return result_for(task_id, tool="terminal.run", state="failed", error="cancelled")
+
+    def cancel():
+        cancel_calls.append(True)
+        release_tool.set()
+        return True
+
+    def flaky_reconcile(*args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError("database temporarily unavailable")
+        return real_reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(agent_loop, "reconcile_cancellation", flaky_reconcile)
+    decisions = iter((
+        {"type": "tool", "tool": "terminal.run", "arguments": {}},
+        {"type": "finish", "summary": "done"},
+    ))
+    loop = agent_loop.AgentLoop(
+        task.id, lambda current, controls: next(decisions),
+        agent_loop.ToolDispatcher().register(
+            "terminal.run", execute, cancel=cancel, retry_safe=True),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    holder = {}
+    thread = threading.Thread(target=lambda: holder.setdefault("outcome", loop.run()))
+    thread.start()
+    assert started.wait(5)
+    control, _ = loop.submit_control("interrupt", "stop")
+    thread.join(5)
+    assert not thread.is_alive() and holder["outcome"].state == "completed"
+    assert len(attempts) >= 2
+    assert cancel_calls == [True]
+    assert control_queue.cancellation_state(control.id)["state"] == "resolved"
+
+
+def test_attempt_start_failure_resolves_without_external_cancellation(loop_state, monkeypatch):
+    task, _ = loop_state
+    started = threading.Event()
+    release_tool = threading.Event()
+    cancel_calls = []
+
+    def execute(task_id=None):
+        started.set()
+        assert release_tool.wait(5)
+        return result_for(task_id, tool="terminal.run")
+
+    def fail_begin(*args, **kwargs):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(agent_loop, "begin_cancellation", fail_begin)
+    dispatcher = agent_loop.ToolDispatcher().register(
+        "terminal.run", execute, cancel=lambda: cancel_calls.append(True))
+    decisions = iter((
+        {"type": "tool", "tool": "terminal.run", "arguments": {}},
+        {"type": "finish", "summary": "done"},
+    ))
+    loop = agent_loop.AgentLoop(
+        task.id, lambda current, controls: next(decisions), dispatcher,
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    holder = {}
+    thread = threading.Thread(target=lambda: holder.setdefault("outcome", loop.run()))
+    thread.start()
+    assert started.wait(5)
+    control, _ = loop.submit_control("interrupt", "stop")
+    assert cancel_calls == []
+    assert control_queue.cancellation_state(control.id)["state"] == "resolved"
+    assert control_queue.load(control.id).payload["cancellation_outcome"] == (
+        "attempt-start-failed")
+    release_tool.set()
+    thread.join(5)
+    assert not thread.is_alive() and holder["outcome"].state == "completed"
+
+
+def test_cancellation_enqueue_rolls_back_intent_lease_when_event_insert_fails(
+        loop_state, monkeypatch):
+    task, _ = loop_state
+    owner = ownership.Owner.create("cancel-owner")
+
+    def fail_event(*args, **kwargs):
+        raise OSError("event insert failed")
+
+    monkeypatch.setattr(control_queue, "insert_state_event", fail_event)
+    with pytest.raises(OSError, match="event insert failed"):
+        control_queue.enqueue_cancellation(
+            task.id, "interrupt", "stop", active_tool="terminal.run",
+            cancellable=True, operation_id="operation-rollback", owner=owner,
+        )
+    with state_store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_controls").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM control_cancellations").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM resource_leases "
+            "WHERE resource_type='control-cancellation'"
+        ).fetchone()[0] == 0
+
+
+def test_destructive_cancellation_callback_is_not_exercised_by_interrupt(loop_state):
+    task, _ = loop_state
+    started = threading.Event()
+    release_tool = threading.Event()
+    cancel_calls = []
+
+    def execute(task_id=None):
+        started.set()
+        assert release_tool.wait(5)
+        return result_for(task_id, tool="terminal.run")
+
+    dispatcher = agent_loop.ToolDispatcher().register(
+        "terminal.run", execute,
+        cancel=lambda: cancel_calls.append(True),
+        cancellation_effect="destructive",
+    )
+    decisions = iter((
+        {"type": "tool", "tool": "terminal.run", "arguments": {}},
+        {"type": "finish", "summary": "done"},
+    ))
+    loop = agent_loop.AgentLoop(
+        task.id, lambda current, controls: next(decisions), dispatcher,
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    holder = {}
+    thread = threading.Thread(target=lambda: holder.setdefault("outcome", loop.run()))
+    thread.start()
+    assert started.wait(5)
+    control, _ = loop.submit_control("interrupt", "stop")
+    release_tool.set()
+    thread.join(5)
+    assert not thread.is_alive() and holder["outcome"].state == "completed"
+    assert cancel_calls == []
+    assert control_queue.load(control.id).payload["cancellation_outcome"] == (
+        "requires-explicit-destructive-authority")
+
+
+def test_live_cancellation_intent_cannot_be_recovered_by_second_process(loop_state):
+    task, _ = loop_state
+    owner = ownership.Owner.create("cancel-owner")
+    control = control_queue.enqueue_cancellation(
+        task.id, "interrupt", "stop", active_tool="terminal.run",
+        cancellable=True, operation_id="operation-live", owner=owner,
+    )
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_recover_cancellations_in_process,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              task.id, sender),
+    )
+    process.start()
+    assert receiver.recv() == 0
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    assert control_queue.cancellation_state(control.id)["state"] == "intent"
+    control_queue.resolve_unattempted_cancellation(
+        control.id, owner, outcome="test-cleanup")
+
+
+def test_expired_cancellation_attempt_is_recovered_as_ambiguous(loop_state):
+    task, _ = loop_state
+    owner = ownership.Owner.create("stale-cancel-owner")
+    control = control_queue.enqueue_cancellation(
+        task.id, "interrupt", "stop", active_tool="terminal.run",
+        cancellable=True, operation_id="operation-stale", owner=owner,
+    )
+    control_queue.begin_cancellation(control.id, owner)
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            """UPDATE resource_leases SET expires_at='2000-01-01T00:00:00+00:00'
+               WHERE resource_type='control-cancellation' AND resource_key=?""",
+            (control.id,),
+        )
+    assert control_queue.recover_cancellations(
+        task.id, ownership.Owner.create("recovery")) == 1
+    assert control_queue.cancellation_state(control.id)["state"] == "ambiguous"
+    assert control_queue.load(control.id).payload["cancellation_requested"] is None
+
+
+@pytest.mark.parametrize("attempted", [False, True])
+def test_dead_cancellation_owner_recovers_without_replay(loop_state, tmp_path, attempted):
+    task, _ = loop_state
+    marker = tmp_path / "external-effect"
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_strand_cancellation,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              task.id, attempted, str(marker), sender),
+    )
+    process.start()
+    control_id = receiver.recv()
+    process.join(timeout=10)
+    assert process.exitcode == 23
+
+    tasks.update_task(task.id, state="running", phase="stranded-execution")
+    model_calls = []
+    recovering_loop = agent_loop.AgentLoop(
+        task.id,
+        lambda current, controls: model_calls.append(True) or {
+            "type": "finish", "summary": "must not run"},
+        agent_loop.ToolDispatcher(),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    with pytest.raises(RuntimeError, match="automatic replay is unsafe"):
+        recovering_loop.run()
+    assert model_calls == []
+    state = control_queue.cancellation_state(control_id)
+    recorded = control_queue.load(control_id)
+    if attempted:
+        assert marker.read_text(encoding="utf-8") == "external cancellation may have happened"
+        assert state["state"] == "ambiguous"
+        assert recorded.payload["cancellation_requested"] is None
+    else:
+        assert not marker.exists()
+        assert state["state"] == "resolved"
+        assert recorded.payload["cancellation_requested"] is False
+
+
+def test_unreconciled_cancellation_cannot_be_claimed_or_finished(loop_state):
+    task, _ = loop_state
+    attempt_owner = ownership.Owner.create("cancel-attempt")
+    processor = ownership.Owner.create("control-processor")
+    control = control_queue.enqueue_cancellation(
+        task.id, "interrupt", "stop", active_tool="terminal.run",
+        cancellable=True, operation_id="operation-terminalization", owner=attempt_owner,
+    )
+    control_queue.begin_cancellation(control.id, attempt_owner)
+    assert control_queue.claim_next(task.id, processor) is None
+    assert control_queue.load(control.id).state == "pending"
+    control_queue.reconcile_cancellation(control.id, attempt_owner, result=True)
+    claimed = control_queue.claim_next(task.id, processor)
+    assert claimed.id == control.id
+    assert control_queue.finish(control.id, processor).state == "applied"
+
+
+def test_generic_control_api_cannot_bypass_cancellation_state_machine(loop_state):
+    task, _ = loop_state
+    with pytest.raises(ValueError, match="durable cancellation state"):
+        control_queue.enqueue(task.id, "interrupt", "stop")
+    control = control_queue.enqueue_cancellation(
+        task.id, "interrupt", "stop", ready=True, outcome="no-active-tool",
+        payload={"cancellation_requested": True,
+                 "cancellation_outcome": "forged-success",
+                 "cancellation_result": {"secret": "must-not-persist"}},
+    )
+    assert control.payload["cancellation_requested"] is False
+    assert control.payload["cancellation_outcome"] == "no-active-tool"
+    assert "must-not-persist" not in str(control.payload)
+
+
+def test_orphaned_cancellation_control_fails_closed_and_is_unhealthy(loop_state):
+    task, _ = loop_state
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            """INSERT INTO task_controls(
+               id,task_id,seq,kind,priority,state,message,payload_json,created_at)
+               VALUES('control-orphan',?,1,'interrupt',1,'pending','stop','{}',?)""",
+            (task.id, state_store.now_utc()),
+        )
+    owner = ownership.Owner.create("control-processor")
+    assert control_queue.claim_next(task.id, owner) is None
+    report = state_store.health()
+    assert not report["ok"]
+    assert report["state_errors"] == [
+        "1 cancellation controls lack durable outcome state"]
 
 
 def test_redirect_updates_canonical_instruction_and_priority_preempts_message(loop_state):

@@ -151,12 +151,12 @@ def test_older_schema_bundle_is_migrated_in_the_real_restore_path(source, tmp_pa
     database.write_bytes(entries[backup.DB_MEMBER])
     conn = sqlite3.connect(database)
     try:
-        conn.execute("DROP TABLE resource_leases")
+        conn.execute("DROP TABLE control_cancellations")
         conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
                      (str(state_store.SCHEMA_VERSION - 1),))
         conn.commit()
         assert conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='resource_leases'").fetchone() is None
+            "SELECT 1 FROM sqlite_master WHERE name='control_cancellations'").fetchone() is None
     finally:
         conn.close()
     entries[backup.DB_MEMBER] = database.read_bytes()
