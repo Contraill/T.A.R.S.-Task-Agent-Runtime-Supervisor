@@ -22,6 +22,8 @@ Unavailable routes are durable inspection records with concrete reasons. The rou
 
 Lifecycle preparation calls the selected backend's on-demand load contract. Release calls its finite unload/TTL contract. Route inspection itself does not run inference or keep a model loaded.
 
+Completion, streaming and task inference wrap the backend call in that lifecycle. Heavy preparation completes before the first inference request, and release runs after success, failure, or early stream close. Status, doctor, capability and route inspection remain probe-only.
+
 ```text
 tars runtime route general --capability conversation
 tars runtime route builder --task TASK --capability code --tools

@@ -22,7 +22,8 @@ def availability(cfg, *, router_factory=LocalRuntimeRouter) -> OracleAvailabilit
         route = router_factory(cfg).resolve(
             "oracle", required_capabilities=("deep-reasoning",), persist=False)
     except Exception as exc:
-        return OracleAvailability(False, False, "not-configured", (str(exc),))
+        return OracleAvailability(
+            False, False, "error", (f"{type(exc).__name__}: {exc}",))
     configured = bool(route.model_alias and route.backend == "colibri")
     state = "ready" if route.ready else ("unavailable" if configured else "not-configured")
     return OracleAvailability(configured, route.ready, state, route.reasons, route.id)

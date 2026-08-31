@@ -31,6 +31,14 @@ def test_oracle_availability_is_truthful_for_unbound_and_ready_states():
     missing = oracle.availability({}, router_factory=Missing)
     assert not missing.configured and missing.state == "not-configured"
 
+    class Broken:
+        def __init__(self, cfg):
+            raise RuntimeError("state store corrupt")
+
+    broken = oracle.availability({}, router_factory=Broken)
+    assert not broken.ready and broken.state == "error"
+    assert broken.reasons == ("RuntimeError: state store corrupt",)
+
 
 def test_oracle_delegation_requires_explicit_evidence_contract(monkeypatch):
     with pytest.raises(ValueError, match="input evidence"):

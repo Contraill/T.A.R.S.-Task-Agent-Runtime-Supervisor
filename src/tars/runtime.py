@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import replace
 from urllib.parse import quote
 import urllib.request
@@ -153,7 +154,26 @@ def _inference_request(cfg, role, messages, *, max_tokens=None, input_tokens=Non
                 "profile_context_limit": budget.context_window,
                 "backend_context_limit": backend_context,
                 "effective_context_limit": effective_window}
-    return backend, request, metadata
+    return router, route, backend, request, metadata
+
+
+@contextmanager
+def _inference_lifecycle(router, route):
+    """Apply the resolved backend lifecycle around every real inference attempt."""
+    primary_error = None
+    try:
+        router.prepare(route)
+        yield
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            router.release(route)
+        except Exception as release_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(f"runtime release also failed: {release_error}")
 
 
 def _reported_usage(usage):
@@ -171,13 +191,14 @@ def chat_completion(cfg, role, messages, *, max_tokens=None, input_tokens=None,
                     temperature=0.2, thinking="auto", operation="chat",
                     task_active=False, requires_tools=False, complex_task=False):
     overall_started = time.monotonic()
-    backend, request, metadata = _inference_request(
+    router, route, backend, request, metadata = _inference_request(
         cfg, role, messages, max_tokens=max_tokens, input_tokens=input_tokens,
         temperature=temperature, thinking=thinking, operation=operation,
         task_active=task_active, requires_tools=requires_tools,
         complex_task=complex_task)
     started = time.monotonic()
-    response = backend.complete(request)
+    with _inference_lifecycle(router, route):
+        response = backend.complete(request)
     choice = (response.get("choices") or [{}])[0]
     usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
     response["_tars_generation"] = metadata | _reported_usage(usage) | {
@@ -202,7 +223,7 @@ def chat_completion_stream(cfg, role, messages, *, max_tokens=None, input_tokens
     equivalent reasoning field).  T.A.R.S. never synthesizes Raw reasoning.
     """
     overall_started = time.monotonic()
-    backend, request, metadata = _inference_request(
+    router, route, backend, request, metadata = _inference_request(
         cfg, role, messages, max_tokens=max_tokens, input_tokens=input_tokens,
         temperature=temperature, thinking=thinking, operation=operation,
         task_active=task_active, requires_tools=requires_tools,
@@ -210,24 +231,25 @@ def chat_completion_stream(cfg, role, messages, *, max_tokens=None, input_tokens
     started = time.monotonic()
     first_token = None
     last_finish = None
-    for event in backend.stream(request):
-        if first_token is None and (event.content or event.reasoning):
-            first_token = time.monotonic() - started
-        usage = event.usage or {}
-        if event.finish_reason is not None:
-            last_finish = event.finish_reason
-        generation = metadata | _reported_usage(usage) | {
-            "finish_reason": last_finish,
-            "elapsed_seconds": time.monotonic() - started,
-            "preparation_seconds": started - overall_started,
-            "first_token_seconds": first_token,
-        }
-        yield {
-            "content": event.content,
-            "reasoning": event.reasoning,
-            "tool_calls": list(event.tool_calls),
-            "finish_reason": event.finish_reason,
-            "usage": event.usage,
-            "generation": generation,
-            "raw": event.raw,
-        }
+    with _inference_lifecycle(router, route):
+        for event in backend.stream(request):
+            if first_token is None and (event.content or event.reasoning):
+                first_token = time.monotonic() - started
+            usage = event.usage or {}
+            if event.finish_reason is not None:
+                last_finish = event.finish_reason
+            generation = metadata | _reported_usage(usage) | {
+                "finish_reason": last_finish,
+                "elapsed_seconds": time.monotonic() - started,
+                "preparation_seconds": started - overall_started,
+                "first_token_seconds": first_token,
+            }
+            yield {
+                "content": event.content,
+                "reasoning": event.reasoning,
+                "tool_calls": list(event.tool_calls),
+                "finish_reason": event.finish_reason,
+                "usage": event.usage,
+                "generation": generation,
+                "raw": event.raw,
+            }

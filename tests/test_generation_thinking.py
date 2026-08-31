@@ -71,6 +71,12 @@ def test_runtime_request_uses_dynamic_ceiling_and_real_thinking_toggle(monkeypat
             assert kwargs["context_tokens"] == 100
             return route
 
+        def prepare(self, route):
+            return None
+
+        def release(self, route):
+            return None
+
     monkeypatch.setattr(runtime, "LocalRuntimeRouter", lambda cfg: Router())
     monkeypatch.setattr(runtime, "get_role", lambda value: role)
     monkeypatch.setattr(runtime, "get_model", lambda value: model)

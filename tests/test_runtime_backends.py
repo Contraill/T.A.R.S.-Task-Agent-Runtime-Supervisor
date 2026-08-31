@@ -4,6 +4,7 @@ import pytest
 
 from tars import runtime
 from tars import runtime_backends as backends
+from tars import runtime_routing as routing
 from tars.generation import GenerationBudget
 
 
@@ -165,6 +166,12 @@ def test_runtime_dispatches_role_through_model_backend(monkeypatch):
             calls.append(("require", kwargs))
             return route
 
+        def prepare(self, route):
+            calls.append(("prepare", route.model_alias))
+
+        def release(self, route):
+            calls.append(("release", route.model_alias))
+
     monkeypatch.setattr(runtime, "get_role", lambda name: role)
     monkeypatch.setattr(runtime, "get_model", lambda alias: model)
     monkeypatch.setattr(runtime, "LocalRuntimeRouter", Router)
@@ -181,6 +188,94 @@ def test_runtime_dispatches_role_through_model_backend(monkeypatch):
     assert [call[0] for call in calls].count("resolve") == 2
     assert all(call[2]["persist"] is False for call in calls if call[0] == "resolve")
     assert [call[0] for call in calls].count("require") == 2
+    assert [call[0] for call in calls].count("prepare") == 2
+    assert [call[0] for call in calls].count("release") == 2
+
+
+def test_stream_close_releases_authoritative_runtime_lifecycle(monkeypatch):
+    role = SimpleNamespace(id="oracle", model="heavy", runtime_id="oracle",
+                           display_name="Oracle", execution="delegate")
+    model = SimpleNamespace(alias="heavy", backend="colibri", thinking_control="unknown")
+    calls = []
+
+    class Backend:
+        def count_tokens(self, *args, **kwargs):
+            return 10
+
+        def stream(self, request):
+            yield backends.StreamEvent(content="first")
+            yield backends.StreamEvent(content="second")
+
+    class Router:
+        def __init__(self, cfg):
+            self.backend = Backend()
+
+        def resolve(self, role_id, **kwargs):
+            return SimpleNamespace(
+                selected_role="oracle", model_alias="heavy", backend_instance=self.backend,
+                model_capabilities={"context": 100}, require_ready=lambda: None)
+
+        def require(self, route, **kwargs):
+            return route
+
+        def prepare(self, route):
+            calls.append("load")
+
+        def release(self, route):
+            calls.append("unload")
+
+    monkeypatch.setattr(runtime, "LocalRuntimeRouter", Router)
+    monkeypatch.setattr(runtime, "get_role", lambda value: role)
+    monkeypatch.setattr(runtime, "get_model", lambda value: model)
+    monkeypatch.setattr(runtime, "generation_budget", lambda *args, **kwargs: GenerationBudget(
+        "oracle", 100, 20, 10, 70, None))
+    stream = runtime.chat_completion_stream(
+        {}, "oracle", [{"role": "user", "content": "review"}])
+    assert next(stream)["content"] == "first"
+    assert calls == ["load"]
+    stream.close()
+    assert calls == ["load", "unload"]
+
+
+def test_real_oracle_completion_path_loads_infers_and_releases(monkeypatch, tmp_path):
+    model_path = tmp_path / "heavy.fixture"
+    model_path.write_bytes(b"fixture-not-model-weights")
+    role = SimpleNamespace(
+        id="oracle", enabled=True, model="heavy", runtime_id="oracle", profile="normal",
+        display_name="Oracle", execution="delegate", capabilities=("deep-reasoning",))
+    model = SimpleNamespace(
+        alias="heavy", backend="colibri", path=model_path, integrity_verified=True,
+        runtime_compatible=True, thinking_control="unknown")
+    transport = ColibriTransport()
+    backend = backends.ColibriBackend(
+        {"colibri": {"base_url": "http://127.0.0.1:9988", "ttl_seconds": 30}},
+        transport=transport)
+
+    monkeypatch.setattr(routing, "resolve_role_id", lambda value: "oracle")
+    monkeypatch.setattr(routing, "get_role", lambda value: role)
+    monkeypatch.setattr(routing, "get_model", lambda value: model)
+    monkeypatch.setattr(routing, "get_profile", lambda *args: SimpleNamespace(context=131072))
+    monkeypatch.setattr(routing, "backend_binding_ready", lambda value, cfg=None: True)
+    monkeypatch.setattr(runtime, "get_role", lambda value: role)
+    monkeypatch.setattr(runtime, "get_model", lambda value: model)
+    monkeypatch.setattr(
+        runtime, "LocalRuntimeRouter",
+        lambda cfg: routing.LocalRuntimeRouter(
+            cfg, backend_factory=lambda model_record, config: backend))
+    monkeypatch.setattr(runtime, "generation_budget", lambda *args, **kwargs: GenerationBudget(
+        "oracle", 131072, 1024, 128, 129920, None))
+
+    response = runtime.chat_completion(
+        {"colibri": {"base_url": "http://127.0.0.1:9988"}}, "oracle",
+        [{"role": "user", "content": "review"}])
+    assert response["choices"][0]["message"]["content"] == "answer"
+    urls = [call[1] for call in transport.calls]
+    load_index = next(i for i, url in enumerate(urls) if url.endswith("/load"))
+    inference_index = next(i for i, url in enumerate(urls)
+                           if url.endswith("/v1/chat/completions"))
+    unload_index = next(i for i, url in enumerate(urls) if url.endswith("/unload"))
+    assert load_index < inference_index < unload_index
+    assert transport.calls[load_index][2] == {"ttl_seconds": 30}
 
 
 def test_stream_normalization_never_synthesizes_reasoning():

@@ -12,6 +12,9 @@
 - made local routing the authoritative chat/stream/task inference preflight and bounded
   generation by both calibrated and backend-reported context limits
 - rejected missing runtime inventory identities and zero/unverified backend context
+- enforced prepare/infer/release lifecycle execution in the real completion, streaming and
+  task-inference path, including release on stream close and inference failure
+- distinguished unbound Oracle from unavailable and internal-error availability states
 
 ## 0.8.2 - Local Runtime Routing
 
