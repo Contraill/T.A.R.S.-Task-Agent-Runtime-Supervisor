@@ -456,6 +456,17 @@ def command_doctor(cfg):
     except Exception as exc:
         console.print(f"[yellow]WARN[/yellow] llama-swap API: {exc}")
 
+    colibri = backend_for_name("colibri", cfg).diagnostics()
+    if not colibri["configured"]:
+        console.print("[yellow]WARN[/yellow] Oracle / Colibri: not configured (optional)")
+    elif colibri["healthy"]:
+        console.print(
+            f"[green]OK  [/green] Oracle / Colibri ({colibri['message']}; "
+            f"TTL {colibri['ttl_seconds']}s)")
+    else:
+        console.print(f"[red]FAIL[/red] Oracle / Colibri: {colibri['message']}")
+        failures += 1
+
     try:
         calibrations = list_calibrations()
         ready = sum(1 for x in calibrations if x["status"] == "ready")

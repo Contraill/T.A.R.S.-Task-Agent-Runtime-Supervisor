@@ -7,7 +7,7 @@ import uuid
 from .checkpoints import latest_checkpoint
 from .conversation import list_messages
 from .roles import get_role, resolve_role_id
-from .runtime import count_chat_tokens
+from .runtime import count_role_chat_tokens
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import active_task, canonical_task_state, load_task
 from .generation import (DEFAULT_GENERATION_TOKENS, DEFAULT_SAFETY_MARGIN,
@@ -389,8 +389,8 @@ class ContextManager:
 
         if exact:
             try:
-                token_count = count_chat_tokens(
-                    self.cfg, budget.runtime_id, messages
+                token_count = count_role_chat_tokens(
+                    self.cfg, budget.role_id, messages
                 )
                 is_exact = True
                 # Exact tightening. Remove only oldest conversation messages and
@@ -404,8 +404,8 @@ class ContextManager:
                         break
                     _normalize_selected_history(selected, omitted=True)
                     messages = candidate_messages()
-                    token_count = count_chat_tokens(
-                        self.cfg, budget.runtime_id, messages
+                    token_count = count_role_chat_tokens(
+                        self.cfg, budget.role_id, messages
                     )
                     attempts += 1
             except Exception as exc:

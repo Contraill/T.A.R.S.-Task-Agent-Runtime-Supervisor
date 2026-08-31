@@ -27,17 +27,19 @@ def route_state(monkeypatch, tmp_path):
     monkeypatch.setattr(routing, "resolve_role_id", lambda value: value)
     monkeypatch.setattr(routing, "get_role", lambda value: role)
     monkeypatch.setattr(routing, "get_model", lambda value: model)
-    monkeypatch.setattr(routing, "backend_binding_ready", lambda value: True)
+    monkeypatch.setattr(routing, "backend_binding_ready", lambda value, cfg=None: True)
     monkeypatch.setattr(routing, "get_profile", lambda *args: SimpleNamespace(context=65536))
     return role, model
 
 
 class Backend:
-    def __init__(self, *, available=True, healthy=True, tools=True, reasoning=True):
+    def __init__(self, *, available=True, healthy=True, tools=True, reasoning=True,
+                 context=65536):
         self.available = available
         self.healthy = healthy
         self.tools = tools
         self.reasoning = reasoning
+        self.context = context
         self.lifecycle = []
 
     def status(self):
@@ -49,7 +51,7 @@ class Backend:
         return RuntimeCapabilities(True, self.reasoning, self.tools, False, False, True)
 
     def model_capabilities(self, model):
-        return ModelCapabilities(model, 65536, reasoning=self.reasoning,
+        return ModelCapabilities(model, self.context, reasoning=self.reasoning,
                                  tool_calls=self.tools)
 
     def load(self, model):
@@ -116,3 +118,19 @@ def test_missing_role_semantics_do_not_fall_back(route_state):
             "general", required_capabilities=("code",))
     assert not route.ready and route.selected_role == "general"
     assert route.reasons[0] == "Role lacks capabilities: code"
+
+
+def test_missing_runtime_identity_is_unavailable(route_state):
+    route = routing.LocalRuntimeRouter(
+        {}, backend_factory=lambda model, cfg: Backend(context=0)).resolve("general")
+    assert not route.ready
+    assert any("runtime model daily is absent" in reason for reason in route.reasons)
+
+
+def test_backend_context_is_an_independent_effective_limit(route_state):
+    route = routing.LocalRuntimeRouter(
+        {}, backend_factory=lambda model, cfg: Backend(context=32768)).resolve(
+            "general", context_tokens=48000)
+    assert not route.ready
+    assert any("exceeds backend model context 32768" in reason for reason in route.reasons)
+    assert not any("exceeds profile context" in reason for reason in route.reasons)

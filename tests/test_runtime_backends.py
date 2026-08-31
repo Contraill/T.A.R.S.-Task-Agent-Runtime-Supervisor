@@ -4,6 +4,7 @@ import pytest
 
 from tars import runtime
 from tars import runtime_backends as backends
+from tars.generation import GenerationBudget
 
 
 class FakeTransport:
@@ -50,13 +51,81 @@ def test_llama_cpp_backend_contract(monkeypatch, tmp_path):
     assert events[1].content == "answer" and events[1].tool_calls[0]["id"] == "one"
 
 
-def test_colibri_boundary_is_explicitly_unavailable():
+def test_colibri_unconfigured_is_a_supported_truthful_state():
     backend = backends.ColibriBackend({})
     status = backend.status()
-    assert not status.available and backend.support == "unimplemented"
+    assert not status.available and backend.support == "supported-optional"
+    assert "not configured" in status.message
     assert backend.model_capabilities("oracle").context == 0
     with pytest.raises(backends.BackendUnavailable):
         backend.complete(backends.InferenceRequest("oracle", ()))
+
+
+class ColibriTransport:
+    def __init__(self):
+        self.calls = []
+
+    def json(self, method, url, *, payload=None, timeout=30):
+        self.calls.append((method, url, payload))
+        if url.endswith("/v1/health"):
+            return {"status": "ok", "version": "1.2.3"}
+        if url.endswith("/v1/capabilities"):
+            return {"streaming": True, "reasoning": True, "tool_calls": False,
+                    "explicit_load": True, "explicit_unload": True, "on_demand": True,
+                    "thinking_modes": ["on"]}
+        if url.endswith("/v1/models/oracle"):
+            return {"context_length": 131072, "reasoning": True,
+                    "input_modalities": ["text"], "output_modalities": ["text"]}
+        if url.endswith("/load"):
+            return {"state": "loaded", "message": "loaded on demand"}
+        if url.endswith("/unload"):
+            return {"state": "unloaded", "message": "released"}
+        if url.endswith("/v1/tokenize"):
+            return {"tokens": 42}
+        if url.endswith("/v1/chat/completions"):
+            return {"choices": [{"message": {"content": "answer"}}]}
+        raise AssertionError(url)
+
+    def sse(self, url, *, payload, timeout=1200):
+        self.calls.append(("SSE", url, payload))
+        yield {"choices": [{"delta": {"reasoning_content": "reason"}}]}
+        yield {"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]}
+
+
+def test_colibri_probes_lifecycle_context_and_reasoning_stream_without_real_weights():
+    transport = ColibriTransport()
+    backend = backends.ColibriBackend(
+        {"colibri": {"base_url": "http://127.0.0.1:9988", "ttl_seconds": 45}},
+        transport=transport)
+    assert backend.status().healthy
+    assert backend.capabilities().on_demand
+    assert backend.model_capabilities("oracle").context == 131072
+    assert not any(call[1].endswith("/load") for call in transport.calls)
+    assert backend.count_tokens("oracle", ({"role": "user", "content": "hi"},)) == 42
+    assert backend.load("oracle").state == "loaded"
+    assert backend.unload("oracle").state == "unloaded"
+    request = backends.InferenceRequest("oracle", ({"role": "user", "content": "hi"},),
+                                        thinking_mode="on")
+    assert backend.complete(request)["choices"]
+    events = list(backend.stream(request))
+    assert events[0].reasoning == "reason" and events[1].content == "answer"
+    assert backend.diagnostics()["ttl_seconds"] == 45
+
+
+def test_colibri_rejects_nonlocal_endpoint_and_clamps_heavy_ttl():
+    backend = backends.ColibriBackend(
+        {"colibri": {"base_url": "https://example.com", "ttl_seconds": 3600}})
+    assert not backend.status().available
+    assert "loopback-local" in backend.status().message
+    assert backend.ttl_seconds == 300
+    assert backend.diagnostics()["configured"]
+    local = backends.ColibriBackend(
+        {"colibri": {"base_url": "http://127.0.0.1:9988"}})
+    assert any(isinstance(handler, backends._NoRedirectHandler)
+               for handler in local.transport.opener.handlers)
+    malformed = backends.ColibriBackend(
+        {"colibri": {"base_url": "http://127.0.0.1:9988", "ttl_seconds": "bad"}})
+    assert "must be an integer" in malformed.status().message
 
 
 def test_backend_factory_rejects_cloud_provider_names():
@@ -72,17 +141,46 @@ def test_runtime_dispatches_role_through_model_backend(monkeypatch):
 
     class Backend:
         def complete(self, request):
-            return {"model": request.model, "messages": request.messages}
+            return {"model": request.model, "messages": request.messages,
+                    "max_tokens": request.max_tokens}
+
+        def stream(self, request):
+            yield backends.StreamEvent(content="chunk")
+
+    backend = Backend()
+    calls = []
+
+    class Router:
+        def __init__(self, cfg):
+            calls.append(("init", cfg))
+
+        def resolve(self, requested_role, **kwargs):
+            calls.append(("resolve", requested_role, kwargs))
+            return SimpleNamespace(
+                selected_role="general", model_alias="local", backend_instance=backend,
+                model_capabilities={"context": 100},
+                require_ready=lambda: calls.append(("ready",)))
+
+        def require(self, route, **kwargs):
+            calls.append(("require", kwargs))
+            return route
 
     monkeypatch.setattr(runtime, "get_role", lambda name: role)
     monkeypatch.setattr(runtime, "get_model", lambda alias: model)
-    monkeypatch.setattr(runtime, "backend_binding_ready", lambda value: True)
-    monkeypatch.setattr(runtime, "backend_for_model", lambda value, cfg: Backend())
+    monkeypatch.setattr(runtime, "LocalRuntimeRouter", Router)
     monkeypatch.setattr(runtime, "count_chat_tokens", lambda *args, **kwargs: 10)
-    monkeypatch.setattr(runtime, "generation_budget", lambda *args, **kwargs: SimpleNamespace(
-        context_window=100, safety_margin=10, explicit_ceiling=None))
+    monkeypatch.setattr(runtime, "generation_budget", lambda *args, **kwargs: GenerationBudget(
+        "general", 200, 50, 10, 140, None))
     result = runtime.chat_completion({}, "general", [{"role": "user", "content": "hi"}])
     assert result["model"] == "daily"
+    assert result["max_tokens"] == 80
+    assert result["_tars_generation"]["effective_context_limit"] == 100
+    streamed = list(runtime.chat_completion_stream(
+        {}, "general", [{"role": "user", "content": "hi"}]))
+    assert streamed[0]["content"] == "chunk"
+    assert [call[0] for call in calls].count("resolve") == 2
+    assert all(call[2]["persist"] is False for call in calls if call[0] == "resolve")
+    assert [call[0] for call in calls].count("require") == 2
 
 
 def test_stream_normalization_never_synthesizes_reasoning():
@@ -91,6 +189,23 @@ def test_stream_normalization_never_synthesizes_reasoning():
     ]))
     assert events[0].content == "plain"
     assert events[0].reasoning == ""
+
+
+def test_role_token_count_uses_bound_backend_for_context_engine(monkeypatch):
+    role = SimpleNamespace(model="heavy", runtime_id="oracle", display_name="Oracle")
+    model = SimpleNamespace(backend="colibri")
+
+    class Backend:
+        def count_tokens(self, model_id, messages, *, thinking_mode=None):
+            assert model_id == "oracle" and thinking_mode == "on"
+            return 77
+
+    monkeypatch.setattr(runtime, "get_role", lambda value: role)
+    monkeypatch.setattr(runtime, "get_model", lambda value: model)
+    monkeypatch.setattr(runtime, "backend_for_model", lambda value, cfg: Backend())
+    assert runtime.count_role_chat_tokens(
+        {}, "oracle", ({"role": "user", "content": "review"},),
+        thinking_mode="on") == 77
 
 
 def test_backend_readiness_requires_matching_local_calibration(monkeypatch):
@@ -103,4 +218,7 @@ def test_backend_readiness_requires_matching_local_calibration(monkeypatch):
         "status": "ready", "model_sha256": "different"
     })
     assert not backends.backend_binding_ready(model)
-    assert not backends.backend_binding_ready(SimpleNamespace(backend="colibri"))
+    colibri = SimpleNamespace(
+        backend="colibri", integrity_verified=True, runtime_compatible=True,
+        path=SimpleNamespace(is_file=lambda: True))
+    assert backends.backend_binding_ready(colibri)

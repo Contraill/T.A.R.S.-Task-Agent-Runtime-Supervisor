@@ -256,15 +256,28 @@ Status: implemented.
 
 - exact Role to local backend/model/runtime/profile routing
 - artifact, integrity, calibration, health, context and capability validation
+- mandatory completion, stream and task-inference preflight against backend inventory
+- effective context bounded by both calibrated profile and backend-reported model context
 - durable ready/unavailable route evidence with no silent substitution
 - explicit task-owner handoff requirement and local-only inference policy
 - on-demand load and finite-unload lifecycle contracts
 
 See [RUNTIME_BACKENDS.md](RUNTIME_BACKENDS.md) for route and lifecycle truth.
 
+### v0.8.3 — Oracle / Colibri
+
+Status: implemented.
+
+- optional loopback-local Colibri adapter with health, version, capability and model probes
+- on-demand Heavy lifecycle with bounded short TTL and no model load during inspection
+- normalized content/reasoning streams and backend-native Context Engine token counts
+- truthful unbound, not-configured, unavailable and healthy states in routing and doctor
+- Oracle child delegation with explicit input and required result-evidence contracts
+
+Oracle remains optional. Model installation and hardware acceptance are separate operator actions.
+
 ### Remaining v0.8.x work
 
-- Oracle/Colibri backend
 - extension boundaries
 - SecretStore
 - versioned backup/restore/migration

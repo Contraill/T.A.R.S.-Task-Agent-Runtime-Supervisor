@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from urllib.parse import quote
 import urllib.request
 import time
 
 from .config import runtime_base_url
-from .runtime_backends import InferenceRequest, backend_binding_ready, backend_for_model
+from .runtime_backends import InferenceRequest, backend_for_model
+from .runtime_routing import LocalRuntimeRouter
 from .registry import get_model
 from .roles import get_role
 from .generation import generation_budget, generation_ceiling
@@ -90,23 +92,31 @@ def count_chat_tokens(cfg, runtime_id, messages, *, thinking_mode=None):
     return len(tokenize_text(cfg, runtime_id, prompt))
 
 
-def _checked_role(role):
+def count_role_chat_tokens(cfg, role, messages, *, thinking_mode=None):
+    """Count with the bound backend tokenizer without leaking backend details to Context."""
     role_record = get_role(role)
-    if not role_record.enabled:
-        raise RuntimeError(f"role {role_record.display_name!r} is disabled")
     if not role_record.model:
         raise RuntimeError(f"role {role_record.display_name!r} has no model binding")
     model = get_model(role_record.model)
-    if not backend_binding_ready(model):
-        raise RuntimeError(f"model binding {model.alias!r} is not runtime-ready")
-    return role_record, model
+    backend = backend_for_model(model, cfg)
+    if hasattr(backend, "count_tokens"):
+        return backend.count_tokens(
+            role_record.runtime_id, messages, thinking_mode=thinking_mode)
+    return count_chat_tokens(
+        cfg, role_record.runtime_id, messages, thinking_mode=thinking_mode)
 
 
 def _inference_request(cfg, role, messages, *, max_tokens=None, input_tokens=None,
                        temperature=0.2, thinking="auto", operation="chat",
                        task_active=False, requires_tools=False, complex_task=False):
-    role_record, model = _checked_role(role)
-    backend = backend_for_model(model, cfg)
+    router = LocalRuntimeRouter(cfg)
+    route = router.resolve(role, persist=False)
+    route.require_ready()
+    role_record = get_role(route.selected_role)
+    model = get_model(route.model_alias)
+    backend = route.backend_instance
+    if backend is None:
+        raise RuntimeError("resolved runtime backend instance is unavailable")
     thinking_decision = decide_thinking(
         cfg, role_record.id, capability_for_model(model), requested=thinking,
         operation=operation, task_active=task_active, requires_tools=requires_tools,
@@ -114,12 +124,24 @@ def _inference_request(cfg, role, messages, *, max_tokens=None, input_tokens=Non
     # Thinking controls can alter the rendered chat template. Count the exact
     # template used by inference so the dynamic ceiling is based on the real
     # prompt, even when a context projection supplied an earlier estimate.
-    tokens = count_chat_tokens(
-        cfg, role_record.runtime_id, messages,
-        thinking_mode=thinking_decision.effective,
-    )
+    if hasattr(backend, "count_tokens"):
+        tokens = backend.count_tokens(
+            role_record.runtime_id, messages,
+            thinking_mode=thinking_decision.effective)
+    else:
+        tokens = count_chat_tokens(
+            cfg, role_record.runtime_id, messages,
+            thinking_mode=thinking_decision.effective,
+        )
+    router.require(
+        route, context_tokens=tokens,
+        require_reasoning=thinking_decision.effective == "on",
+        require_tools=requires_tools)
     budget = generation_budget(cfg, role_record.id, requested_tokens=max_tokens)
-    ceiling = generation_ceiling(budget, tokens)
+    backend_context = int(route.model_capabilities["context"])
+    effective_window = min(budget.context_window, backend_context)
+    effective_budget = replace(budget, context_window=effective_window)
+    ceiling = generation_ceiling(effective_budget, tokens)
     request = InferenceRequest(
         role_record.runtime_id, tuple(messages), ceiling, temperature,
         thinking_decision.effective, max_tokens, tokens)
@@ -127,7 +149,10 @@ def _inference_request(cfg, role, messages, *, max_tokens=None, input_tokens=Non
                 "configured_generation_limit": ceiling, "input_tokens": tokens,
                 "thinking_policy": thinking_decision.requested,
                 "thinking_effective": thinking_decision.effective,
-                "thinking_mechanism": thinking_decision.mechanism}
+                "thinking_mechanism": thinking_decision.mechanism,
+                "profile_context_limit": budget.context_window,
+                "backend_context_limit": backend_context,
+                "effective_context_limit": effective_window}
     return backend, request, metadata
 
 

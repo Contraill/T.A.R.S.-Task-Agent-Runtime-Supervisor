@@ -48,6 +48,10 @@ class RuntimeRoute:
             raise RuntimeRouteUnavailable("; ".join(self.reasons) or "runtime route unavailable")
         return self
 
+    @property
+    def backend_instance(self):
+        return self._backend
+
 
 def _plain(value):
     return asdict(value) if hasattr(value, "__dataclass_fields__") else {}
@@ -111,8 +115,8 @@ class LocalRuntimeRouter:
                 reasons.append(f"model {model.alias} is not runtime compatible")
             if not model.path.is_file():
                 reasons.append(f"model artifact is missing: {model.path}")
-            if not backend_binding_ready(model):
-                reasons.append(f"model {model.alias} has no matching ready calibration")
+            if not backend_binding_ready(model, self.cfg):
+                reasons.append(f"model {model.alias} binding is not runtime-ready")
             try:
                 profile = get_profile(model.alias, role.profile)
                 profile_context = profile.context
@@ -131,19 +135,18 @@ class LocalRuntimeRouter:
             elif not status.healthy:
                 reasons.append(status.message or f"backend {model.backend} is unhealthy")
 
-        if requested["context_tokens"] and profile_context < requested["context_tokens"]:
+        if status.available and status.healthy and model_caps.context <= 0:
             reasons.append(
-                f"requested context {requested['context_tokens']} exceeds profile context {profile_context}")
-        modalities = set(requested["input_modalities"])
-        if modalities - set(model_caps.input_modalities):
-            reasons.append("model lacks input modalities: " +
-                           ", ".join(sorted(modalities - set(model_caps.input_modalities))))
-        if require_reasoning and model_caps.reasoning is not True:
-            reasons.append("model reasoning capability is not verified")
-        if require_tools and model_caps.tool_calls is not True:
-            reasons.append("model tool-call capability is not verified")
+                f"runtime model {role.runtime_id} is absent or its context is unverified")
+        reasons.extend(self._requirement_reasons(
+            profile_context, model_caps, context_tokens=requested["context_tokens"],
+            require_reasoning=require_reasoning, require_tools=require_tools,
+            input_modalities=requested["input_modalities"]))
         if not runtime_caps.on_demand:
             reasons.append("backend does not provide an on-demand lifecycle")
+        if (model is not None and model.backend == "colibri" and
+                not (runtime_caps.explicit_load and runtime_caps.explicit_unload)):
+            reasons.append("Colibri does not verify explicit Heavy load/unload lifecycle support")
 
         route = RuntimeRoute(
             id="rrt-" + uuid.uuid4().hex,
@@ -162,6 +165,47 @@ class LocalRuntimeRouter:
             created_at=now_utc(), task_id=task_id, _backend=backend)
         if persist:
             self._persist(route)
+        return route
+
+    @staticmethod
+    def _requirement_reasons(profile_context, model_caps, *, context_tokens=0,
+                             require_reasoning=False, require_tools=False,
+                             input_modalities=("text",)):
+        reasons = []
+        context_tokens = max(0, int(context_tokens))
+        if context_tokens and profile_context < context_tokens:
+            reasons.append(
+                f"requested context {context_tokens} exceeds profile context {profile_context}")
+        if context_tokens and model_caps.context < context_tokens:
+            reasons.append(
+                f"requested context {context_tokens} exceeds backend model context "
+                f"{model_caps.context}")
+        modalities = set(input_modalities)
+        if modalities - set(model_caps.input_modalities):
+            reasons.append("model lacks input modalities: " +
+                           ", ".join(sorted(modalities - set(model_caps.input_modalities))))
+        if require_reasoning and model_caps.reasoning is not True:
+            reasons.append("model reasoning capability is not verified")
+        if require_tools and model_caps.tool_calls is not True:
+            reasons.append("model tool-call capability is not verified")
+        return reasons
+
+    def require(self, route, *, context_tokens=0, require_reasoning=False,
+                require_tools=False, input_modalities=("text",)):
+        route.require_ready()
+        model_caps = ModelCapabilities(
+            model=str(route.model_capabilities.get("model", route.runtime_id)),
+            context=int(route.model_capabilities.get("context", 0)),
+            input_modalities=tuple(route.model_capabilities.get("input_modalities", ("text",))),
+            output_modalities=tuple(route.model_capabilities.get("output_modalities", ("text",))),
+            reasoning=route.model_capabilities.get("reasoning"),
+            tool_calls=route.model_capabilities.get("tool_calls"))
+        reasons = self._requirement_reasons(
+            int(route.model_capabilities.get("profile_context", 0)), model_caps,
+            context_tokens=context_tokens, require_reasoning=require_reasoning,
+            require_tools=require_tools, input_modalities=input_modalities)
+        if reasons:
+            raise RuntimeRouteUnavailable("; ".join(reasons))
         return route
 
     @staticmethod

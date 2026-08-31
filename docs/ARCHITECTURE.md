@@ -30,6 +30,8 @@ Memory           ScopeGuard
 
 **Routing preserves semantics.** Local routing validates the exact Role binding, backend health, model capabilities and calibrated context. Unavailable bindings fail explicitly; they are not silently replaced.
 
+**Heavy reasoning is optional.** Oracle uses the replaceable Colibri backend only when explicitly configured and bound. Probes remain model-free, Heavy state loads on demand with a short finite TTL, and Oracle delegation records its input and required result evidence.
+
 **One task has one owner.** Delegation does not change ownership. Handoff does, and must be transactional.
 
 **Security is deterministic.** ScopeGuard and the tool executor decide what can run. The model does not grant itself permission.

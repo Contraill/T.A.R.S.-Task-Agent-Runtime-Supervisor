@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.3 - Oracle / Colibri
+
+- implemented the optional loopback-local Colibri backend adapter with version, health,
+  capability and model probes
+- added on-demand Heavy load/unload with a bounded short TTL and probe-only Zero-Idle behavior
+- normalized Colibri reasoning/content streams and routed exact token counts through the
+  replaceable backend boundary for Context Engine compatibility
+- added truthful optional Oracle doctor states and evidence-contracted Oracle delegation
+- kept an unbound Oracle fully supported without model weights or fabricated inference results
+- made local routing the authoritative chat/stream/task inference preflight and bounded
+  generation by both calibrated and backend-reported context limits
+- rejected missing runtime inventory identities and zero/unverified backend context
+
 ## 0.8.2 - Local Runtime Routing
 
 - added persistent exact-Role routing decisions across local backend, model, runtime and profile bindings

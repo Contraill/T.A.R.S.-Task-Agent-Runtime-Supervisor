@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import json
+from urllib.parse import quote, urlsplit
 from typing import Iterable, Protocol
 import urllib.request
 
@@ -83,12 +85,16 @@ class Transport(Protocol):
 
 
 class UrllibTransport:
+    def __init__(self, *, allow_redirects=True):
+        self.opener = (urllib.request.build_opener() if allow_redirects else
+                       urllib.request.build_opener(_NoRedirectHandler()))
+
     def json(self, method, url, *, payload=None, timeout=30):
         body = json.dumps(payload).encode() if payload is not None else None
         request = urllib.request.Request(
             url, data=body, method=method, headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with self.opener.open(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def sse(self, url, *, payload, timeout=1200):
@@ -96,7 +102,7 @@ class UrllibTransport:
             url, data=json.dumps(payload).encode(), method="POST",
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with self.opener.open(request, timeout=timeout) as response:
             for raw in response:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line or line.startswith(":"):
@@ -111,6 +117,11 @@ class UrllibTransport:
                     continue
                 if isinstance(value, dict):
                     yield value
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class RuntimeBackend(Protocol):
@@ -232,42 +243,171 @@ class LlamaCppBackend:
 
 
 class ColibriBackend:
-    """Reserved local Heavy-runtime boundary; full Oracle integration lands later."""
+    """Optional local Heavy-runtime adapter; probing never loads a model."""
 
     identity = "colibri"
-    support = "unimplemented"
+    support = "supported-optional"
 
     def __init__(self, cfg=None, *, transport=None):
         self.cfg = cfg or {}
+        runtime_cfg = self.cfg.get("runtime", {}) if isinstance(self.cfg, dict) else {}
+        nested = runtime_cfg.get("colibri", {}) if isinstance(runtime_cfg, dict) else {}
+        direct = self.cfg.get("colibri", {}) if isinstance(self.cfg, dict) else {}
+        self.settings = dict(nested or direct or {})
+        self.base_url = str(self.settings.get("base_url", "")).rstrip("/")
+        self._ttl_error = ""
+        try:
+            self.ttl_seconds = max(5, min(300, int(self.settings.get("ttl_seconds", 60))))
+        except (TypeError, ValueError):
+            self.ttl_seconds = 60
+            self._ttl_error = "Colibri ttl_seconds must be an integer"
+        self.transport = transport or UrllibTransport(allow_redirects=False)
+
+    def _configuration_error(self):
+        if not self.base_url:
+            return "Colibri is not configured"
+        if self._ttl_error:
+            return self._ttl_error
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return "Colibri base_url must be a local HTTP(S) endpoint"
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            return "Colibri base_url must be a local origin without credentials or query data"
+        if parsed.path not in {"", "/"}:
+            return "Colibri base_url must not contain an API path"
+        try:
+            local = ipaddress.ip_address(parsed.hostname.split("%", 1)[0]).is_loopback
+        except ValueError:
+            local = parsed.hostname.casefold() == "localhost"
+        if not local:
+            return "Colibri base_url must be loopback-local"
+        return ""
+
+    def _probe(self):
+        error = self._configuration_error()
+        if error:
+            raise BackendUnavailable(error)
+        value = self.transport.json("GET", self.base_url + "/v1/health", timeout=5)
+        if not isinstance(value, dict):
+            raise BackendUnavailable("Colibri health probe returned an invalid response")
+        return value
 
     def status(self):
-        return BackendStatus(self.identity, False, False,
-                             "Colibri runtime integration is not implemented", self.support)
+        error = self._configuration_error()
+        if error:
+            return BackendStatus(self.identity, False, False, error, self.support)
+        try:
+            probe = self._probe()
+        except Exception as exc:
+            return BackendStatus(self.identity, True, False, str(exc), self.support)
+        version = str(probe.get("version", "")).strip()
+        healthy = probe.get("status") in {"ok", "healthy"} and bool(version)
+        message = f"healthy · version {version}" if healthy else "health/version probe failed"
+        return BackendStatus(self.identity, True, healthy, message, self.support)
 
     def capabilities(self):
-        return RuntimeCapabilities(False, None, None, False, False, False)
+        if self._configuration_error():
+            return RuntimeCapabilities(False, None, None, False, False, False)
+        try:
+            value = self.transport.json(
+                "GET", self.base_url + "/v1/capabilities", timeout=5)
+            if not isinstance(value, dict):
+                raise TypeError("invalid capability response")
+        except Exception:
+            return RuntimeCapabilities(False, None, None, False, False, False)
+        return RuntimeCapabilities(
+            bool(value.get("streaming")),
+            True if value.get("reasoning") is True else None,
+            True if value.get("tool_calls") is True else None,
+            bool(value.get("explicit_load")),
+            bool(value.get("explicit_unload")),
+            bool(value.get("on_demand")),
+            tuple(value.get("thinking_modes") or ()),
+            str(value.get("thinking_mechanism") or "backend reasoning mode"),
+        )
 
     def model_capabilities(self, model):
-        return ModelCapabilities(model, 0, reasoning=None, tool_calls=None)
+        if self._configuration_error():
+            return ModelCapabilities(model, 0, reasoning=None, tool_calls=None)
+        try:
+            value = self.transport.json(
+                "GET", self.base_url + "/v1/models/" + quote(str(model), safe=""), timeout=5)
+            if not isinstance(value, dict):
+                raise TypeError("invalid model response")
+        except Exception:
+            return ModelCapabilities(model, 0, reasoning=None, tool_calls=None)
+        return ModelCapabilities(
+            model, int(value.get("context_length") or 0),
+            tuple(value.get("input_modalities") or ()),
+            tuple(value.get("output_modalities") or ()),
+            True if value.get("reasoning") is True else None,
+            True if value.get("tool_calls") is True else None,
+            tuple(value.get("thinking_modes") or ()),
+            str(value.get("thinking_mechanism") or "backend reasoning mode"),
+        )
 
     def load(self, model):
-        raise BackendUnavailable("Colibri load lifecycle is not implemented")
+        self._probe()
+        value = self.transport.json(
+            "POST", self.base_url + "/v1/models/" + quote(str(model), safe="") + "/load",
+            payload={"ttl_seconds": self.ttl_seconds}, timeout=1200)
+        state = str(value.get("state") or "failed")
+        return LifecycleResult(self.identity, model, state, True,
+                               str(value.get("message") or state))
 
     def unload(self, model):
-        raise BackendUnavailable("Colibri unload lifecycle is not implemented")
+        self._probe()
+        value = self.transport.json(
+            "POST", self.base_url + "/v1/models/" + quote(str(model), safe="") + "/unload",
+            payload={}, timeout=120)
+        state = str(value.get("state") or "failed")
+        return LifecycleResult(self.identity, model, state, True,
+                               str(value.get("message") or state))
+
+    @staticmethod
+    def _payload(request, *, stream=False):
+        payload = {"model": request.model, "messages": list(request.messages),
+                   "max_tokens": request.max_tokens, "temperature": request.temperature,
+                   "stream": bool(stream)}
+        if request.thinking_mode is not None:
+            payload["reasoning_mode"] = request.thinking_mode
+        return payload
 
     def complete(self, request):
-        raise BackendUnavailable("Colibri inference is not implemented")
+        self._probe()
+        return self.transport.json(
+            "POST", self.base_url + "/v1/chat/completions",
+            payload=self._payload(request), timeout=1200)
 
     def stream(self, request):
-        raise BackendUnavailable("Colibri streaming is not implemented")
-        yield  # pragma: no cover
+        self._probe()
+        chunks = self.transport.sse(
+            self.base_url + "/v1/chat/completions",
+            payload=self._payload(request, stream=True), timeout=1200)
+        yield from normalize_chat_stream(chunks)
+
+    def count_tokens(self, model, messages, *, thinking_mode=None):
+        self._probe()
+        value = self.transport.json(
+            "POST", self.base_url + "/v1/tokenize",
+            payload={"model": model, "messages": list(messages),
+                     "reasoning_mode": thinking_mode}, timeout=120)
+        count = value.get("tokens")
+        if not isinstance(count, int) or count < 0:
+            raise BackendUnavailable("Colibri tokenizer returned no token count")
+        return count
 
     def diagnostics(self):
         status = self.status()
+        capabilities = self.capabilities()
         return {"backend": self.identity, "support": self.support,
+                "configured": bool(self.base_url),
+                "configuration_error": self._configuration_error() or None,
                 "available": status.available, "healthy": status.healthy,
-                "message": status.message}
+                "message": status.message, "base_url": self.base_url or None,
+                "ttl_seconds": self.ttl_seconds,
+                "capabilities": capabilities.__dict__,
+                "zero_idle": "probes do not load models; inference loads on demand with finite TTL"}
 
 
 BACKEND_TYPES = {"llama.cpp": LlamaCppBackend, "colibri": ColibriBackend}
@@ -290,7 +430,7 @@ def backend_for_model(model, cfg, *, transport=None) -> RuntimeBackend:
     return backend_type(cfg, transport=transport)
 
 
-def backend_binding_ready(model) -> bool:
+def backend_binding_ready(model, cfg=None) -> bool:
     if model.backend == "llama.cpp":
         try:
             calibration = load_calibration(model.alias)
@@ -298,4 +438,8 @@ def backend_binding_ready(model) -> bool:
             return False
         return (calibration.get("status") == "ready" and
                 calibration.get("model_sha256") == model.sha256)
+    if model.backend == "colibri":
+        return (bool(getattr(model, "integrity_verified", False)) and
+                bool(getattr(model, "runtime_compatible", False)) and
+                model.path.is_file())
     return False

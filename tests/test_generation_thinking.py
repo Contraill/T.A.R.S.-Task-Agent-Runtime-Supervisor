@@ -58,8 +58,22 @@ def test_runtime_request_uses_dynamic_ceiling_and_real_thinking_toggle(monkeypat
                                   "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 100, "completion_tokens": 3}}
 
-    monkeypatch.setattr(runtime, "_checked_role", lambda value: (role, model))
-    monkeypatch.setattr(runtime, "backend_for_model", lambda *args: Backend())
+    backend = Backend()
+
+    class Router:
+        def resolve(self, value, **kwargs):
+            return SimpleNamespace(
+                selected_role="general", model_alias="model", backend_instance=backend,
+                model_capabilities={"context": 65536},
+                require_ready=lambda: None)
+
+        def require(self, route, **kwargs):
+            assert kwargs["context_tokens"] == 100
+            return route
+
+    monkeypatch.setattr(runtime, "LocalRuntimeRouter", lambda cfg: Router())
+    monkeypatch.setattr(runtime, "get_role", lambda value: role)
+    monkeypatch.setattr(runtime, "get_model", lambda value: model)
     monkeypatch.setattr(
         runtime, "count_chat_tokens",
         lambda cfg, runtime_id, messages, *, thinking_mode=None: (
