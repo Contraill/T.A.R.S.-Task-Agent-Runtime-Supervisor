@@ -12,6 +12,8 @@ from typing import Callable, Mapping
 
 from .checkpoints import latest_checkpoint
 from . import state_store as _state_store
+from .ownership import (Heartbeat, Owner, claim, claim_in_transaction,
+                        release as release_lease)
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import append_event, load_task
 
@@ -182,6 +184,8 @@ def create_schedule(task_id: str, kind: str, expression: str, *, next_run_at=Non
         raise ValueError(f"invalid schedule kind: {kind}")
     if missed_policy not in MISSED_POLICIES:
         raise ValueError(f"invalid missed-run policy: {missed_policy}")
+    if delivery_target:
+        raise ValueError("scheduled delivery targets are not supported by the production service")
     if timezone_name != "UTC":
         raise ValueError("v0.8.0 schedule storage is UTC; convert local times before registration")
     current = _dt(now or now_utc())
@@ -250,6 +254,8 @@ def edit_schedule(schedule_id: str, *, expression=None, next_run_at=None,
         recomputed = _initial_next(schedule.kind, expression, next_run_at, current_time)
         values["expression"] = expression
         values["next_run_at"] = recomputed
+        if schedule.kind == "condition":
+            values["condition_state"] = 0
     if next_run_at is not None:
         values["next_run_at"] = _iso(next_run_at)
     if missed_policy is not None:
@@ -263,6 +269,9 @@ def edit_schedule(schedule_id: str, *, expression=None, next_run_at=None,
     if max_concurrency is not None:
         values["max_concurrency"] = int(max_concurrency)
     if delivery_target is not None:
+        if delivery_target:
+            raise ValueError(
+                "scheduled delivery targets are not supported by the production service")
         values["delivery_target"] = delivery_target
     if not values:
         return schedule
@@ -333,9 +342,13 @@ def _advance(schedule: Schedule, planned: datetime, now: datetime) -> str | None
 class Scheduler:
     """Model-free durable scheduler. Inference exists only inside the executor."""
 
-    def __init__(self, *, max_concurrency=1, conditions: Mapping[str, Callable[[], bool]] | None = None):
+    def __init__(self, *, max_concurrency=1,
+                 conditions: Mapping[str, Callable[[], bool]] | None = None,
+                 lease_seconds=30.0):
         self.max_concurrency = max(1, int(max_concurrency))
         self.conditions = dict(conditions or {})
+        self.lease_seconds = max(2.0, float(lease_seconds))
+        self.owner = Owner.create("scheduler")
         self._wake_socket = None
         ensure_state_store()
 
@@ -366,14 +379,35 @@ class Scheduler:
         _wake_path().unlink(missing_ok=True)
 
     def recover(self) -> int:
-        """Reclaim interrupted work with the same idempotency key and checkpoint."""
+        """Reclaim only work whose durable execution lease is absent or stale."""
         stamp = now_utc()
+        recovered = []
         with transaction(immediate=True) as conn:
             rows = conn.execute("SELECT * FROM schedule_runs WHERE state='running'").fetchall()
             for row in rows:
-                conn.execute("UPDATE schedule_runs SET state='claimed',attempt=attempt+1,error=?,claimed_at=?,started_at=NULL WHERE id=?",
-                             ("recovered after scheduler restart", stamp, row["id"]))
-        return len(rows)
+                if not claim_in_transaction(
+                    conn, "schedule-run", row["id"], self.owner,
+                    lease_seconds=self.lease_seconds,
+                    metadata={"schedule_id": row["schedule_id"]},
+                ):
+                    continue
+                changed = conn.execute(
+                    "UPDATE schedule_runs SET state='failed',error=?,finished_at=? "
+                    "WHERE id=? AND state='running'",
+                    ("execution owner was lost; external outcome is ambiguous", stamp,
+                     row["id"]),
+                ).rowcount
+                if changed:
+                    conn.execute(
+                        "UPDATE tasks SET last_run_at=?,last_result_status='failed',updated_at=? "
+                        "WHERE id=?", (stamp, stamp, row["task_id"]),
+                    )
+                    conn.execute(
+                        "DELETE FROM resource_leases WHERE resource_type='schedule-run' "
+                        "AND resource_key=? AND owner_token=?", (row["id"], self.owner.token),
+                    )
+                    recovered.append(row["id"])
+        return len(recovered)
 
     def _condition_due(self, schedule: Schedule) -> bool:
         name = schedule.expression.split("@", 1)[0].strip()
@@ -396,9 +430,19 @@ class Scheduler:
             first = _dt(schedule.next_run_at)
             if first > current:
                 continue
-            if schedule.kind == "condition" and not self._condition_due(schedule):
-                self._set_next(schedule, _advance(schedule, first, current))
-                continue
+            if schedule.kind == "condition":
+                try:
+                    condition_due = self._condition_due(schedule)
+                except Exception as exc:
+                    append_event(
+                        schedule.task_id, "error", "Schedule condition evaluation failed",
+                        data={"schedule_id": schedule.id, "error": str(exc)},
+                    )
+                    self._set_next(schedule, _advance(schedule, first, current))
+                    continue
+                if not condition_due:
+                    self._set_next(schedule, _advance(schedule, first, current))
+                    continue
             planned_slots = [first]
             if schedule.kind == "recurring" and schedule.missed_policy == "catch-up":
                 step = timedelta(seconds=interval_seconds(schedule.expression))
@@ -447,6 +491,12 @@ class Scheduler:
                         if "UNIQUE" in str(exc):
                             continue
                         raise
+                    if state == "claimed" and not claim_in_transaction(
+                        conn, "schedule-run", run_id, self.owner,
+                        lease_seconds=self.lease_seconds,
+                        metadata={"schedule_id": locked_schedule.id},
+                    ):
+                        raise RuntimeError("new schedule run could not acquire ownership")
                     next_run = _advance(locked_schedule, planned, current)
                     conn.execute("UPDATE schedules SET next_run_at=?,enabled=?,updated_at=? WHERE id=?",
                                  (next_run, 0 if next_run is None else 1, _iso(current),
@@ -477,6 +527,12 @@ class Scheduler:
             run = _run(row)
             stamp = now_utc()
             with transaction(immediate=True) as conn:
+                if not claim_in_transaction(
+                    conn, "schedule-run", run.id, self.owner,
+                    lease_seconds=self.lease_seconds,
+                    metadata={"schedule_id": run.schedule_id},
+                ):
+                    continue
                 changed = conn.execute("UPDATE schedule_runs SET state='running',started_at=? WHERE id=? AND state='claimed'",
                                        (stamp, run.id)).rowcount
             if not changed:
@@ -484,17 +540,22 @@ class Scheduler:
             append_event(run.task_id, "status", f"Scheduled run {run.id} started",
                          data={"schedule_id": run.schedule_id, "idempotency_key": run.idempotency_key})
             try:
-                result = executor(load_run(run.id)) or {}
+                with Heartbeat("schedule-run", run.id, self.owner,
+                               lease_seconds=self.lease_seconds):
+                    result = executor(load_run(run.id)) or {}
+            except Exception as exc:
+                checkpoint = latest_checkpoint(run.task_id)
+                self._finish(run.id, "failed", error=str(exc),
+                             checkpoint_id=checkpoint.id if checkpoint else None)
+            else:
                 checkpoint = latest_checkpoint(run.task_id)
                 self._finish(run.id, "succeeded", result=result,
                              checkpoint_id=checkpoint.id if checkpoint else None)
                 self._queue_delivery(run.id)
                 if deliver is not None:
                     self.deliver_pending(deliver, run_id=run.id)
-            except Exception as exc:
-                checkpoint = latest_checkpoint(run.task_id)
-                self._finish(run.id, "failed", error=str(exc),
-                             checkpoint_id=checkpoint.id if checkpoint else None)
+            finally:
+                release_lease("schedule-run", run.id, self.owner)
             completed.append(load_run(run.id))
         return completed
 
@@ -502,10 +563,26 @@ class Scheduler:
         run = load_run(run_id)
         stamp = now_utc()
         with transaction(immediate=True) as conn:
-            conn.execute("UPDATE schedule_runs SET state=?,result_json=?,error=?,checkpoint_id=?,finished_at=? WHERE id=?",
-                         (state, json_dumps(result or {}), error, checkpoint_id, stamp, run_id))
+            lease = conn.execute(
+                "SELECT owner_token,expires_at FROM resource_leases "
+                "WHERE resource_type='schedule-run' AND resource_key=?", (run_id,),
+            ).fetchone()
+            if (not lease or lease["owner_token"] != self.owner.token
+                    or lease["expires_at"] <= stamp):
+                raise RuntimeError(f"scheduler no longer owns run {run_id}")
+            changed = conn.execute(
+                "UPDATE schedule_runs SET state=?,result_json=?,error=?,checkpoint_id=?,"
+                "finished_at=? WHERE id=? AND state='running'",
+                (state, json_dumps(result or {}), error, checkpoint_id, stamp, run_id),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(f"schedule run {run_id} changed concurrently")
             conn.execute("UPDATE tasks SET last_run_at=?,last_result_status=?,updated_at=? WHERE id=?",
                          (stamp, state, stamp, run.task_id))
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_type='schedule-run' "
+                "AND resource_key=? AND owner_token=?", (run_id, self.owner.token),
+            )
         append_event(run.task_id, "result" if state == "succeeded" else "error",
                      f"Scheduled run {run_id} {state}",
                      data={"schedule_id": run.schedule_id, "checkpoint_id": checkpoint_id,
@@ -521,7 +598,7 @@ class Scheduler:
 
     def deliver_pending(self, deliver: Callable[[str, ScheduleRun], dict], *, run_id=None) -> int:
         ensure_state_store()
-        sql = "SELECT * FROM schedule_deliveries WHERE state IN ('pending','failed')"
+        sql = "SELECT * FROM schedule_deliveries WHERE state='pending'"
         params = []
         if run_id:
             sql += " AND run_id=?"
@@ -530,7 +607,23 @@ class Scheduler:
             rows = conn.execute(sql, params).fetchall()
         delivered = 0
         for row in rows:
+            if not claim(
+                "schedule-delivery", row["id"], self.owner,
+                lease_seconds=self.lease_seconds,
+                metadata={"run_id": row["run_id"], "target": row["target"]},
+            ):
+                continue
             run = load_run(row["run_id"])
+            with transaction(immediate=True) as conn:
+                changed = conn.execute(
+                    "UPDATE schedule_deliveries SET state='failed',attempt=attempt+1,error=?,"
+                    "updated_at=? WHERE id=? AND state='pending'",
+                    ("delivery started; outcome is ambiguous until completion",
+                     now_utc(), row["id"]),
+                ).rowcount
+            if changed != 1:
+                release_lease("schedule-delivery", row["id"], self.owner)
+                continue
             try:
                 result = deliver(row["target"], run) or {}
                 state, error = "delivered", ""
@@ -538,8 +631,22 @@ class Scheduler:
             except Exception as exc:
                 result, state, error = {}, "failed", str(exc)
             with transaction(immediate=True) as conn:
-                conn.execute("UPDATE schedule_deliveries SET state=?,attempt=attempt+1,result_json=?,error=?,updated_at=? WHERE id=?",
-                             (state, json_dumps(result), error, now_utc(), row["id"]))
+                stamp = now_utc()
+                changed = conn.execute(
+                    "UPDATE schedule_deliveries SET state=?,result_json=?,error=?,updated_at=? "
+                    "WHERE id=? AND state='failed' AND EXISTS (SELECT 1 FROM resource_leases "
+                    "WHERE resource_type='schedule-delivery' AND resource_key=? "
+                    "AND owner_token=? AND expires_at>?)",
+                    (state, json_dumps(result), error, stamp, row["id"], row["id"],
+                     self.owner.token, stamp),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError(
+                        f"scheduler no longer owns delivery {row['id']}")
+                conn.execute(
+                    "DELETE FROM resource_leases WHERE resource_type='schedule-delivery' "
+                    "AND resource_key=? AND owner_token=?", (row["id"], self.owner.token),
+                )
         return delivered
 
     def next_wake_seconds(self, *, now=None, maximum=3600.0) -> float:

@@ -7,6 +7,7 @@ from pathlib import Path
 import signal as signals
 import shlex
 import subprocess
+import sys
 import threading
 import uuid
 
@@ -15,6 +16,29 @@ from .execution_backends import ExecutionRequest, GuardedExecutor, HostBackend, 
 from .policy import ScopeRequest, canonical_path
 from .tool_core import ToolResult, ToolRuntime
 from .secret_store import SecretStore
+
+
+_PARENT_DEATH_WRAPPER = r"""
+import ctypes
+import os
+import signal
+import subprocess
+import sys
+
+expected_parent = int(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(1, signal.SIGTERM) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+def parent_died(_signum=None, _frame=None):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+signal.signal(signal.SIGTERM, parent_died)
+if os.getppid() != expected_parent:
+    parent_died()
+child = subprocess.Popen(sys.argv[2:])
+returncode = child.wait()
+raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
+"""
 
 
 @dataclass
@@ -45,6 +69,7 @@ class ProcessManager:
         self.secret_store = secret_store or SecretStore()
         self._processes = {}
         self._handles = {}
+        self._watch_errors = {}
         self._lock = threading.Lock()
 
     def start(self, request, *, approval_id=None, task_id=None, session_id=None):
@@ -76,6 +101,8 @@ class ProcessManager:
         stdout_path.chmod(0o600)
         stderr_path.chmod(0o600)
         argv = ["/bin/bash", "-lc", request.argv[0]] if request.shell else list(request.argv)
+        managed_argv = [sys.executable, "-c", _PARENT_DEATH_WRAPPER,
+                        str(os.getpid()), *argv]
         environment = os.environ.copy()
         try:
             resolved = self.secret_store.resolve_many(
@@ -83,7 +110,7 @@ class ProcessManager:
             environment.update(resolved)
             secrets = tuple(environment[name].encode() for name in request.environment_refs)
             process = subprocess.Popen(
-                argv, cwd=cwd, env=environment, stdin=subprocess.PIPE,
+                managed_argv, cwd=cwd, env=environment, stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
             )
         except Exception as exc:
@@ -114,6 +141,11 @@ class ProcessManager:
         with self._lock:
             self._processes[process_id] = record
             self._handles[process_id] = (stdout_handle, stderr_handle, actions, threads)
+        watcher = threading.Thread(
+            target=self._watch, args=(record,),
+            name=f"tars-process-watch-{process_id}", daemon=True,
+        )
+        watcher.start()
         data = {
             "process_id": process_id, "pid": process.pid, "target": "host", "cwd": cwd,
             "state": "running", "cancellable": True,
@@ -128,16 +160,28 @@ class ProcessManager:
                           evidence_ids=(evidence.id,))
 
     def _get(self, process_id):
+        with self._lock:
+            try:
+                return self._processes[process_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown process: {process_id}") from exc
+
+    def _watch(self, record):
+        record.process.wait()
         try:
-            return self._processes[process_id]
-        except KeyError as exc:
-            raise KeyError(f"unknown process: {process_id}") from exc
+            self._refresh(record)
+        except Exception as exc:
+            with self._lock:
+                self._watch_errors[record.id] = str(exc)
 
     def _refresh(self, record):
         code = record.process.poll()
-        if code is not None and record.completed_at is None:
-            record.completed_at = _stamp()
-            handles = self._handles.pop(record.id, None)
+        handles = None
+        if code is not None:
+            with self._lock:
+                if record.completed_at is None:
+                    record.completed_at = _stamp()
+                    handles = self._handles.pop(record.id, None)
             if handles:
                 for thread in handles[3]:
                     thread.join(timeout=5)
@@ -169,9 +213,11 @@ class ProcessManager:
                           evidence_ids=(evidence.id,))
 
     def list(self, *, task_id=None, session_id=None):
+        with self._lock:
+            records = tuple(self._processes.values())
         return self._read_result(
             "process.list", "process-manager",
-            lambda: [self._status(record) for record in self._processes.values()],
+            lambda: [self._status(record) for record in records],
             task_id=task_id, session_id=session_id,
         )
 
@@ -180,7 +226,8 @@ class ProcessManager:
         return {"process_id": record.id, "pid": record.process.pid,
                 "state": "running" if code is None else "exited", "exit_code": code,
                 "cancellable": record.cancellable, "started_at": record.started_at,
-                "completed_at": record.completed_at}
+                "completed_at": record.completed_at,
+                "management_error": self._watch_errors.get(record.id, "")}
 
     def poll(self, process_id, *, task_id=None, session_id=None):
         return self._read_result(

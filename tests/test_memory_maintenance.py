@@ -1,8 +1,25 @@
+import multiprocessing
+from pathlib import Path
 import uuid
 
 import pytest
 
-from tars import memory, memory_maintenance as maintenance, state_store
+from tars import memory, memory_maintenance as maintenance, ownership, state_store
+
+
+def _strand_maintenance(database, scratch):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(scratch) / "legacy"
+    state_store.TASK_EVENTS_ROOT = Path(scratch) / "legacy-events"
+    state_store.TASK_INDEX_PATH = Path(scratch) / "legacy-index"
+    state_store.ensure_state_store()
+    owner = ownership.Owner.create("maintenance-worker")
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "INSERT INTO memory_maintenance_runs(id,trigger,mode,status,created_at) "
+            "VALUES('maint-crashed','explicit','apply','running',?)", (state_store.now_utc(),))
+        assert ownership.claim_in_transaction(
+            conn, "memory-maintenance", "maint-crashed", owner, lease_seconds=300)
 
 
 @pytest.fixture
@@ -76,4 +93,17 @@ def test_maintenance_triggers_are_explicit_and_inspectable(isolated_memory):
     assert len(maintenance.list_runs()) == len(maintenance.TRIGGERS)
     with pytest.raises(ValueError):
         maintenance.run_maintenance(trigger="startup")
-    assert state_store.health()["schema_version"] == 17
+    assert state_store.health()["schema_version"] == state_store.SCHEMA_VERSION
+
+
+def test_crashed_maintenance_is_terminalized_without_replay(isolated_memory):
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_strand_maintenance,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent)),
+    )
+    process.start(); process.join(timeout=10)
+    assert process.exitcode == 0
+    run = maintenance.list_runs()[0]
+    assert run.status == "failed"
+    assert "partial changes may exist" in run.report["error"]

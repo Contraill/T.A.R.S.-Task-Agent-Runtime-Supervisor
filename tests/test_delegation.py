@@ -1,13 +1,62 @@
+import multiprocessing
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from tars import delegation, evidence, memory, orchestration, state_store, tasks
+from tars import delegation, evidence, fs_tools, memory, orchestration, state_store, tasks
 from tars.agent_loop import ToolDispatcher
 from tars.tool_core import ToolResult
 from tars.cli import build_parser
+
+
+def _configure_child_state(database, scratch, memory_root, history_root):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(scratch) / "legacy"
+    state_store.TASK_EVENTS_ROOT = Path(scratch) / "events"
+    state_store.TASK_INDEX_PATH = Path(scratch) / "index"
+    memory.MEMORY_ROOT = Path(memory_root)
+    memory.MEMORY_HISTORY_ROOT = Path(history_root)
+
+
+def _run_delegation_process(database, scratch, memory_root, history_root,
+                            delegation_id, ready, release, crash):
+    _configure_child_state(database, scratch, memory_root, history_root)
+    def execute(context):
+        ready.set()
+        if crash:
+            import os
+            os._exit(17)
+        release.wait(10)
+        return {"summary": "process complete"}
+    future = delegation.start(delegation_id, execute)
+    future.result(timeout=15)
+
+
+def _strand_memory_review(database, scratch, memory_root, history_root, candidate_id):
+    _configure_child_state(database, scratch, memory_root, history_root)
+    from tars import ownership
+    owner = ownership.Owner.create("stranded-review")
+    with state_store.transaction(immediate=True) as conn:
+        assert ownership.claim_in_transaction(
+            conn, "memory-candidate-review", candidate_id, owner, lease_seconds=300)
+        conn.execute("UPDATE memory_candidates SET status='reviewing' WHERE id=?",
+                     (candidate_id,))
+
+
+def _strand_scheduled_delegation(database, scratch, memory_root, history_root,
+                                 delegation_id):
+    _configure_child_state(database, scratch, memory_root, history_root)
+    from tars import ownership
+    owner = ownership.Owner.create("stranded-delegation")
+    with state_store.transaction(immediate=True) as conn:
+        assert ownership.claim_in_transaction(
+            conn, "delegation", delegation_id, owner, lease_seconds=300)
+        conn.execute(
+            "UPDATE delegation_contracts SET state='scheduled' WHERE delegation_id=?",
+            (delegation_id,))
 
 
 def _role(role_id):
@@ -114,6 +163,54 @@ def test_child_run_join_and_parent_evidence_acceptance(delegated):
         "requested": False, "state": "accepted", "cancelled": False}
 
 
+def test_delegation_has_one_live_executor_across_processes(delegated):
+    _, root, create = delegated
+    (root / "value.txt").write_text("value")
+    contract = create()
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(
+        target=_run_delegation_process,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              str(memory.MEMORY_ROOT), str(memory.MEMORY_HISTORY_ROOT),
+              contract.delegation_id, ready, release, False),
+    )
+    process.start()
+    assert ready.wait(5)
+    with pytest.raises(RuntimeError, match="live executor"):
+        delegation.start(contract.delegation_id, lambda context: {"summary": "duplicate"})
+    with pytest.raises(RuntimeError, match="exclusively owned"):
+        fs_tools.FilesystemTools((root,)).read(root / "value.txt")
+    release.set()
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    assert delegation.load_contract(contract.delegation_id).state == "completed"
+
+
+def test_dead_running_delegation_is_not_replayed(delegated):
+    _, _, create = delegated
+    contract = create()
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(
+        target=_run_delegation_process,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              str(memory.MEMORY_ROOT), str(memory.MEMORY_HISTORY_ROOT),
+              contract.delegation_id, ready, release, True),
+    )
+    process.start()
+    assert ready.wait(5)
+    process.join(timeout=10)
+    assert process.exitcode == 17
+    called = []
+    with pytest.raises(RuntimeError, match="not replayed"):
+        delegation.start(contract.delegation_id,
+                         lambda context: called.append(True) or {"summary": "duplicate"})
+    assert called == []
+    current = delegation.load_contract(contract.delegation_id)
+    assert current.state == "failed"
+
+
 def test_child_thinking_cannot_bypass_generation_budget(delegated):
     _, _, create = delegated
     contract = create(budget={"max_seconds": 5, "max_iterations": 2,
@@ -163,12 +260,58 @@ def test_cancel_is_cooperative_and_truthful(delegated):
     assert joined == {"state": "cancelled", "joined": True}
 
 
-def test_local_inference_children_serialize(delegated):
+def test_unstarted_delegation_can_be_cancelled_terminally(delegated):
+    _, _, create = delegated
+    contract = create()
+    assert delegation.cancel(contract.delegation_id) == {
+        "requested": True, "state": "cancelled", "cancelled": True}
+    assert delegation.join(contract.delegation_id) == {
+        "state": "cancelled", "joined": True}
+
+
+def test_queued_future_cancellation_is_terminal(monkeypatch, delegated):
+    _, _, create = delegated
+    executor = delegation.ThreadPoolExecutor(max_workers=1)
+    gate = threading.Event()
+    blocker = executor.submit(gate.wait, 5)
+    monkeypatch.setattr(delegation, "_EXECUTOR", executor)
+    contract = create()
+    future = delegation.start(contract.delegation_id,
+                              lambda context: {"summary": "must not run"})
+    result = delegation.cancel(contract.delegation_id)
+    assert result == {"requested": True, "state": "cancelled", "cancelled": True}
+    assert future.cancelled()
+    assert delegation.join(contract.delegation_id) == {
+        "state": "cancelled", "joined": True}
+    gate.set()
+    blocker.result(timeout=2)
+    executor.shutdown()
+
+
+def test_cancel_reclaims_dead_scheduled_owner(delegated):
+    _, _, create = delegated
+    contract = create()
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_strand_scheduled_delegation,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              str(memory.MEMORY_ROOT), str(memory.MEMORY_HISTORY_ROOT),
+              contract.delegation_id),
+    )
+    process.start(); process.join(timeout=10)
+    assert process.exitcode == 0
+    assert delegation.cancel(contract.delegation_id) == {
+        "requested": True, "state": "cancelled", "cancelled": True}
+    assert delegation.join(contract.delegation_id) == {
+        "state": "cancelled", "joined": True}
+
+
+def test_children_with_same_exclusive_workspace_serialize(delegated):
     _, _, create = delegated
     first = create(budget={"max_seconds": 5, "max_iterations": 2,
-                           "max_tokens": 100, "inference": True})
+                           "max_tokens": 100, "inference": False})
     second = create(budget={"max_seconds": 5, "max_iterations": 2,
-                            "max_tokens": 100, "inference": True})
+                            "max_tokens": 100, "inference": False})
     active = 0
     maximum = 0
     lock = threading.Lock()
@@ -190,6 +333,25 @@ def test_local_inference_children_serialize(delegated):
     assert maximum == 1
 
 
+def test_exclusive_workspace_blocks_sibling_tool_surfaces(delegated):
+    _, root, create = delegated
+    (root / "value.txt").write_text("value")
+    contract = create()
+    entered, release = threading.Event(), threading.Event()
+    def execute(context):
+        assert fs_tools.FilesystemTools((root,)).read(root / "value.txt").succeeded
+        entered.set()
+        assert release.wait(5)
+        return {"summary": "done"}
+    delegation.start(contract.delegation_id, execute)
+    assert entered.wait(5)
+    with pytest.raises(RuntimeError, match="exclusively owned"):
+        fs_tools.FilesystemTools((root,)).read(root / "value.txt")
+    release.set()
+    assert delegation.join(contract.delegation_id, timeout=2)["joined"]
+    assert fs_tools.FilesystemTools((root,)).read(root / "value.txt").succeeded
+
+
 def test_child_timeout_requests_cooperative_stop(delegated):
     _, _, create = delegated
     contract = create(budget={"max_seconds": 1, "max_iterations": 2,
@@ -202,6 +364,59 @@ def test_child_timeout_requests_cooperative_stop(delegated):
     delegation.start(contract.delegation_id, execute)
     assert delegation.join(contract.delegation_id, timeout=2) == {
         "state": "timed_out", "joined": True}
+
+
+def test_iteration_budget_is_enforced_by_child_executor_protocol(delegated):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": False})
+    def execute(context):
+        yield {"summary": "one"}
+        yield {"summary": "two"}
+        yield {"summary": "three"}
+    future = delegation.start(contract.delegation_id, execute)
+    with pytest.raises(RuntimeError, match="iteration budget"):
+        future.result(timeout=2)
+    assert delegation.load_contract(contract.delegation_id).state == "failed"
+    assert delegation.join(contract.delegation_id) == {
+        "state": "failed", "joined": True}
+
+
+def test_accept_reject_review_is_compare_and_swap(delegated):
+    _, _, create = delegated
+    contract = create()
+    delegation.start(contract.delegation_id, lambda context: {"summary": "done"})
+    assert delegation.join(contract.delegation_id, timeout=2)["joined"]
+    barrier = threading.Barrier(2)
+    outcomes = []
+    def decide(value):
+        barrier.wait()
+        try:
+            outcomes.append(delegation.accept(
+                contract.delegation_id, accept_result=value).state)
+        except RuntimeError:
+            outcomes.append("lost")
+    first = threading.Thread(target=decide, args=(True,))
+    second = threading.Thread(target=decide, args=(False,))
+    first.start(); second.start(); first.join(); second.join()
+    assert outcomes.count("lost") == 1
+    assert set(outcomes) & {"accepted", "rejected"}
+
+
+def test_crashed_memory_review_is_reclaimable(delegated):
+    _, _, create = delegated
+    contract = create()
+    candidate = delegation.stage_child_memory(
+        contract.delegation_id, "recover review", kind="reference", scope="project")
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_strand_memory_review,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              str(memory.MEMORY_ROOT), str(memory.MEMORY_HISTORY_ROOT), candidate),
+    )
+    process.start(); process.join(timeout=10)
+    assert process.exitcode == 0
+    assert memory.decide_candidate(candidate, promote=True).content == "recover review"
 
 
 def test_child_cli_surfaces_parse():

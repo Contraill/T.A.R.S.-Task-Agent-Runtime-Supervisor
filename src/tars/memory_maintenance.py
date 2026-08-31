@@ -5,6 +5,7 @@ import uuid
 
 from . import memory
 from .memory import MEMORY_KINDS, doctor as memory_doctor, forget, stage_candidate
+from .ownership import Heartbeat, Owner, claim_in_transaction
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 
 TRIGGERS = {"explicit", "session_close", "context_rollover", "scheduled"}
@@ -93,11 +94,32 @@ def audit():
     }
 
 
+def _finish_owned_run(run_id, owner, *, status, report, actions, rollback_refs=()):
+    stamp = now_utc()
+    with transaction(immediate=True) as conn:
+        changed = conn.execute(
+            """UPDATE memory_maintenance_runs SET status=?,report_json=?,actions_json=?,
+               rollback_refs_json=?,completed_at=? WHERE id=? AND status='running'
+               AND EXISTS (SELECT 1 FROM resource_leases WHERE
+               resource_type='memory-maintenance' AND resource_key=?
+               AND owner_token=? AND expires_at>?)""",
+            (status, json_dumps(report), json_dumps(actions), json_dumps(rollback_refs),
+             stamp, run_id, run_id, owner.token, stamp),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"memory maintenance run {run_id} lost ownership")
+        conn.execute(
+            "DELETE FROM resource_leases WHERE resource_type='memory-maintenance' "
+            "AND resource_key=? AND owner_token=?", (run_id, owner.token),
+        )
+
+
 def run_maintenance(*, trigger="explicit", apply=False):
     if trigger not in TRIGGERS:
         raise ValueError(f"invalid maintenance trigger: {trigger}")
     ensure_state_store()
     run_id = "maint-" + uuid.uuid4().hex
+    owner = Owner.create("memory-maintenance")
     created = now_utc()
     with transaction(immediate=True) as conn:
         conn.execute(
@@ -105,40 +127,43 @@ def run_maintenance(*, trigger="explicit", apply=False):
                VALUES(?,?,?,?,?)""",
             (run_id, trigger, "apply" if apply else "audit", "running", created),
         )
-    before = audit()
+        if not claim_in_transaction(
+            conn, "memory-maintenance", run_id, owner, lease_seconds=30,
+            metadata={"mode": "apply" if apply else "audit"}):
+            raise RuntimeError("new memory maintenance run could not acquire ownership")
+    before = {}
     actions = []
     rollback_refs = []
     status = "completed"
     try:
-        if apply:
-            for entry_id in before["expired"]:
-                archive = forget(entry_id)
-                actions.append({"action": "forget_expired", "memory_id": entry_id})
-                if archive:
-                    rollback_refs.append(str(archive))
-            repair = memory_doctor()
-            actions.append({"action": "rebuild_index", "indexed": repair["indexed"]})
-            if not repair["ok"]:
-                status = "failed"
-        report = {"before": before, "after": audit() if apply else before}
+        with Heartbeat("memory-maintenance", run_id, owner, lease_seconds=30):
+            before = audit()
+            if apply:
+                for entry_id in before["expired"]:
+                    archive = forget(entry_id)
+                    actions.append({"action": "forget_expired", "memory_id": entry_id})
+                    if archive:
+                        rollback_refs.append(str(archive))
+                repair = memory_doctor()
+                actions.append({"action": "rebuild_index", "indexed": repair["indexed"]})
+                if not repair["ok"]:
+                    status = "failed"
+            report = {"before": before, "after": audit() if apply else before}
     except Exception as exc:
         status = "failed"
         report = {"before": before, "error": str(exc)}
-        with transaction(immediate=True) as conn:
-            conn.execute(
-                """UPDATE memory_maintenance_runs SET status=?,report_json=?,actions_json=?,
-                   rollback_refs_json=?,completed_at=? WHERE id=?""",
-                (status, json_dumps(report), json_dumps(actions), json_dumps(rollback_refs),
-                 now_utc(), run_id),
+        try:
+            _finish_owned_run(
+                run_id, owner, status=status, report=report, actions=actions,
+                rollback_refs=rollback_refs,
             )
+        except RuntimeError:
+            pass
         raise
-    with transaction(immediate=True) as conn:
-        conn.execute(
-            """UPDATE memory_maintenance_runs SET status=?,report_json=?,actions_json=?,
-               rollback_refs_json=?,completed_at=? WHERE id=?""",
-            (status, json_dumps(report), json_dumps(actions), json_dumps(rollback_refs),
-             now_utc(), run_id),
-        )
+    _finish_owned_run(
+        run_id, owner, status=status, report=report, actions=actions,
+        rollback_refs=rollback_refs,
+    )
     return load_run(run_id)
 
 
@@ -150,6 +175,7 @@ def stage_reflection(proposals, *, trigger="explicit", model_provenance=None):
         raise ValueError("model-assisted reflection requires model and backend provenance")
     ensure_state_store()
     run_id = "maint-" + uuid.uuid4().hex
+    owner = Owner.create("memory-reflection")
     created = now_utc()
     with transaction(immediate=True) as conn:
         conn.execute(
@@ -157,37 +183,42 @@ def stage_reflection(proposals, *, trigger="explicit", model_provenance=None):
                model_provenance_json,created_at) VALUES(?,?,?,?,?,?)""",
             (run_id, trigger, "reflection", "running", json_dumps(provenance), created),
         )
+        if not claim_in_transaction(
+            conn, "memory-maintenance", run_id, owner, lease_seconds=30,
+            metadata={"mode": "reflection"}):
+            raise RuntimeError("new reflection run could not acquire ownership")
     candidate_ids = []
     try:
-        for proposal in proposals:
-            candidate_ids.append(stage_candidate(
-                proposal["content"], kind=proposal.get("kind", "episodic"),
-                scope=proposal.get("scope", "global"), title=proposal.get("title", ""),
-                source=f"reflection:{run_id}", confidence=float(proposal.get("confidence", 0.5)),
-                tags=proposal.get("tags", ()),
-            ))
+        with Heartbeat("memory-maintenance", run_id, owner, lease_seconds=30):
+            for proposal in proposals:
+                candidate_ids.append(stage_candidate(
+                    proposal["content"], kind=proposal.get("kind", "episodic"),
+                    scope=proposal.get("scope", "global"), title=proposal.get("title", ""),
+                    source=f"reflection:{run_id}",
+                    confidence=float(proposal.get("confidence", 0.5)),
+                    tags=proposal.get("tags", ()),
+                ))
     except Exception as exc:
-        with transaction(immediate=True) as conn:
-            conn.execute(
-                """UPDATE memory_maintenance_runs SET status='failed',report_json=?,
-                   actions_json=?,completed_at=? WHERE id=?""",
-                (json_dumps({"error": str(exc), "candidate_ids": candidate_ids}),
-                 json_dumps([
-                     {"action": "stage_candidate", "candidate_id": value}
-                     for value in candidate_ids
-                 ]), now_utc(), run_id),
+        try:
+            _finish_owned_run(
+                run_id, owner, status="failed",
+                report={"error": str(exc), "candidate_ids": candidate_ids},
+                actions=[
+                    {"action": "stage_candidate", "candidate_id": value}
+                    for value in candidate_ids
+                ],
             )
+        except RuntimeError:
+            pass
         raise
     report = {"proposals": len(candidate_ids), "candidate_ids": candidate_ids}
-    with transaction(immediate=True) as conn:
-        conn.execute(
-            """UPDATE memory_maintenance_runs SET status='completed',report_json=?,
-               actions_json=?,completed_at=? WHERE id=?""",
-            (json_dumps(report), json_dumps([
-                {"action": "stage_candidate", "candidate_id": value}
-                for value in candidate_ids
-            ]), now_utc(), run_id),
-        )
+    _finish_owned_run(
+        run_id, owner, status="completed", report=report,
+        actions=[
+            {"action": "stage_candidate", "candidate_id": value}
+            for value in candidate_ids
+        ],
+    )
     return load_run(run_id)
 
 
@@ -205,6 +236,7 @@ def load_run(run_id):
 
 def list_runs(limit=50):
     ensure_state_store()
+    recover_interrupted_runs()
     conn = connect()
     try:
         return [_from_row(row) for row in conn.execute(
@@ -213,3 +245,29 @@ def list_runs(limit=50):
         ).fetchall()]
     finally:
         conn.close()
+
+
+def recover_interrupted_runs():
+    owner = Owner.create("memory-maintenance-recovery")
+    recovered = 0
+    with transaction(immediate=True) as conn:
+        rows = conn.execute(
+            "SELECT id FROM memory_maintenance_runs WHERE status='running'"
+        ).fetchall()
+        for row in rows:
+            if not claim_in_transaction(
+                conn, "memory-maintenance", row["id"], owner, lease_seconds=30,
+                metadata={"recovery": True}):
+                continue
+            changed = conn.execute(
+                "UPDATE memory_maintenance_runs SET status='failed',report_json=?,"
+                "completed_at=? WHERE id=? AND status='running'",
+                (json_dumps({"error": "maintenance owner was lost; partial changes may exist"}),
+                 now_utc(), row["id"]),
+            ).rowcount
+            recovered += changed
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_type='memory-maintenance' "
+                "AND resource_key=? AND owner_token=?", (row["id"], owner.token),
+            )
+    return recovered

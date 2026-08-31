@@ -1,9 +1,11 @@
+import multiprocessing
+from pathlib import Path
 import threading
 import time
 
 import pytest
 
-from tars import agent_loop, control_queue, conversation, evidence, state_store, tasks
+from tars import agent_loop, control_queue, conversation, evidence, ownership, state_store, tasks
 from tars.cli import build_parser
 from tars.tool_core import ToolResult
 
@@ -26,6 +28,34 @@ def result_for(task_id, *, tool="fs.write", state="succeeded", error=""):
                       action_ids=("action-real",), evidence_ids=(record.id,))
 
 
+def _configure_process_state(database, scratch):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(scratch) / "legacy"
+    state_store.TASK_EVENTS_ROOT = Path(scratch) / "events"
+    state_store.TASK_INDEX_PATH = Path(scratch) / "index"
+
+
+def _hold_agent_loop(database, scratch, task_id, ready, release, crash=False):
+    _configure_process_state(database, scratch)
+    def model(task, controls):
+        ready.set()
+        if crash:
+            import os
+            os._exit(17)
+        release.wait(10)
+        return {"type": "finish", "summary": "done"}
+    agent_loop.AgentLoop(
+        task_id, model, agent_loop.ToolDispatcher(),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    ).run()
+
+
+def _claim_control_and_exit(database, scratch, task_id):
+    _configure_process_state(database, scratch)
+    owner = ownership.Owner.create("control-worker")
+    assert control_queue.claim_next(task_id, owner) is not None
+
+
 def test_agent_loop_executes_real_tool_result_and_requires_completion_evidence(loop_state):
     task, _ = loop_state
     calls = iter((
@@ -42,6 +72,55 @@ def test_agent_loop_executes_real_tool_result_and_requires_completion_evidence(l
     ).run()
     assert outcome.state == "completed" and outcome.tool_results[0].succeeded
     assert tasks.load_task(task.id).state == "completed" and outcome.checkpoint_id
+
+
+def test_agent_loop_has_one_live_owner_across_processes(loop_state):
+    task, _ = loop_state
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(
+        target=_hold_agent_loop,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              task.id, ready, release),
+    )
+    process.start()
+    assert ready.wait(5)
+    contender = agent_loop.AgentLoop(
+        task.id, lambda task, controls: {"type": "finish", "summary": "duplicate"},
+        agent_loop.ToolDispatcher(),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    with pytest.raises(RuntimeError, match="live execution owner"):
+        contender.run()
+    release.set(); process.join(timeout=10)
+    assert process.exitcode == 0
+
+
+def test_dead_agent_loop_owner_is_not_automatically_replayed(loop_state):
+    task, _ = loop_state
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(
+        target=_hold_agent_loop,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              task.id, ready, release, True),
+    )
+    process.start()
+    assert ready.wait(5)
+    process.join(timeout=10)
+    assert process.exitcode == 17
+    called = []
+    contender = agent_loop.AgentLoop(
+        task.id,
+        lambda task, controls: called.append(True) or {
+            "type": "finish", "summary": "duplicate"},
+        agent_loop.ToolDispatcher(),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    with pytest.raises(RuntimeError, match="automatic replay is unsafe"):
+        contender.run()
+    assert called == []
+    assert tasks.load_task(task.id).state == "failed"
 
 
 def test_model_completion_without_evidence_is_rejected_by_no_progress_guard(loop_state):
@@ -145,19 +224,42 @@ def test_redirect_updates_canonical_instruction_and_priority_preempts_message(lo
     task, _ = loop_state
     message = control_queue.enqueue(task.id, "message", "ordinary")
     redirect = control_queue.enqueue(task.id, "redirect", "Do not touch the database layer.")
-    assert control_queue.claim_next(task.id).id == redirect.id
-    control_queue.finish(redirect.id)
+    owner = ownership.Owner.create("test-control")
+    assert control_queue.claim_next(task.id, owner).id == redirect.id
+    control_queue.finish(redirect.id, owner)
     assert tasks.canonical_task_state(task.id)["current_instruction"] == redirect.message
-    assert control_queue.claim_next(task.id).id == message.id
+    assert control_queue.claim_next(task.id, owner).id == message.id
 
 
 def test_processing_control_recovers_after_client_or_process_disconnect(loop_state):
     task, _ = loop_state
     queued = control_queue.enqueue(task.id, "message", "survive reconnect")
-    assert control_queue.claim_next(task.id).state == "processing"
-    assert control_queue.recover_processing(task.id) == 1
+    first_owner = ownership.Owner.create("test-control")
+    assert control_queue.claim_next(task.id, first_owner).state == "processing"
+    recovery_owner = ownership.Owner.create("recovery")
+    assert control_queue.recover_processing(task.id, recovery_owner) == 0
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE resource_leases SET expires_at='2000-01-01T00:00:00+00:00' "
+            "WHERE resource_type='task-control' AND resource_key=?", (queued.id,))
+    assert control_queue.recover_processing(task.id, recovery_owner) == 1
     recovered = control_queue.load(queued.id)
     assert recovered.state == "pending" and recovered.payload["recovered_after_disconnect"]
+
+
+def test_processing_control_owned_by_dead_process_is_recovered(loop_state):
+    task, _ = loop_state
+    queued = control_queue.enqueue(task.id, "message", "recover after crash")
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_claim_control_and_exit,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent), task.id),
+    )
+    process.start(); process.join(timeout=10)
+    assert process.exitcode == 0
+    assert control_queue.recover_processing(
+        task.id, ownership.Owner.create("recovery")) == 1
+    assert control_queue.load(queued.id).state == "pending"
 
 
 def test_non_tool_return_is_not_promoted_to_fabricated_tool_result(loop_state):
@@ -170,6 +272,20 @@ def test_non_tool_return_is_not_promoted_to_fabricated_tool_result(loop_state):
     outcome = loop.run()
     assert outcome.state == "paused" and not outcome.tool_results
     assert outcome.reason == "tool failure guard"
+
+
+def test_failed_control_terminalizes_loop_instead_of_leaving_task_running(loop_state):
+    task, _ = loop_state
+    control_queue.enqueue(task.id, "approval", "malformed", payload={})
+    outcome = agent_loop.AgentLoop(
+        task.id, lambda task, controls: {"type": "finish", "summary": "unused"},
+        agent_loop.ToolDispatcher(),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    ).run()
+    assert outcome.state == "failed"
+    assert "control application failed" in outcome.reason
+    assert tasks.load_task(task.id).state == "failed"
+    assert control_queue.list_controls(task.id)[0].state == "failed"
 
 
 def test_task_control_cli_surface_parses_redirect_and_inspection():

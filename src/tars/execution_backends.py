@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import os
@@ -13,6 +14,8 @@ import uuid
 
 from .action_journal import begin_action, finish_action, record_denied
 from .approvals import ApprovalBroker
+from .ownership import (Heartbeat, Owner, claim_workspace, current_owner, held_by,
+                        release as release_lease)
 from .policy import ScopeGuard, ScopeRequest, canonical_path, normalize_network_target, redact
 from .secret_store import SecretStore, parse_reference
 
@@ -473,32 +476,39 @@ class GuardedExecutor:
             except ValueError as exc:
                 decision = replace(decision, action="deny", reason=str(exc))
         approval_map = approval_id if isinstance(approval_id, dict) else {"primary": approval_id}
+        workspace_owner = current_owner() or Owner.create("execution")
         actions = [begin_action(
             scope_request, decision, approval_id=approval_map.get("primary"), broker=self.broker,
+            owner=workspace_owner,
         )]
         for key, guarded_path, guarded_decision in path_checks:
             if guarded_decision.action == "ask":
                 try:
                     actions.append(begin_action(
                         guarded_path, guarded_decision, approval_id=approval_map.get(key),
-                        broker=self.broker,
+                        broker=self.broker, owner=workspace_owner,
                     ))
                 except Exception:
                     for active in actions:
                         finish_action(active.id, state="cancelled",
-                                      result={"error": "workspace authorization failed"})
+                                      result={"error": "workspace authorization failed"},
+                                      owner_token=active.owner_token)
                     raise
         if request.network:
             if not request.network_hosts:
                 finish_action(actions[0].id, state="cancelled",
-                              result={"error": "network destinations are required"})
+                              result={"error": "network destinations are required"},
+                              owner_token=actions[0].owner_token)
                 raise PermissionError("network-enabled execution requires explicit destinations")
             try:
                 for host in request.network_hosts:
                     normalize_network_target(host, resolve_dns=True)
             except ValueError as exc:
                 for active in actions:
-                    finish_action(active.id, state="cancelled", result={"error": str(exc)})
+                    finish_action(
+                        active.id, state="cancelled", result={"error": str(exc)},
+                        owner_token=active.owner_token,
+                    )
                 raise PermissionError(str(exc)) from exc
             network_request = ScopeRequest(
                 "terminal.network.unrestricted", "network",
@@ -513,32 +523,69 @@ class GuardedExecutor:
                 actions.append(begin_action(
                     network_request, network_decision,
                     approval_id=approval_map.get("network"), broker=self.broker,
+                    owner=workspace_owner,
                 ))
             except Exception:
                 for active in actions:
                     finish_action(active.id, state="cancelled",
-                                  result={"error": "network authorization failed"})
+                                  result={"error": "network authorization failed"},
+                                  owner_token=active.owner_token)
                 raise
+        workspace_keys = sorted({
+            canonical_path(guarded_decision.target)
+            for _, _, guarded_decision in path_checks if guarded_decision.target
+        })
+        workspace_borrowed = {
+            key for key in workspace_keys
+            if held_by("workspace", key, workspace_owner)
+        }
+        workspace_claimed = []
         try:
-            authorization = _ExecutionAuthorization(action.id for action in actions)
-            result = backend.execute(
-                request, authorization=authorization, allow_host_mounts=escape,
-            ) if backend_name == "container" else backend.execute(
-                request, authorization=authorization,
-            )
-            secret_store = getattr(backend, "secret_store", None)
-            secrets = _secret_values(
-                request.environment_refs, secret_store=secret_store,
-                consumer=f"execution:{backend_name}")
-            if secrets:
-                result = replace(
-                    result, stdout=_mask_text(result.stdout, secrets),
-                    stderr=_mask_text(result.stderr, secrets),
+            for workspace_key in workspace_keys:
+                if not claim_workspace(
+                    workspace_key, workspace_owner, lease_seconds=86_400,
+                    metadata={"backend": backend_name},
+                ):
+                    raise RuntimeError(
+                        "workspace is exclusively owned by another executor: "
+                        f"{workspace_key}")
+                if workspace_key not in workspace_borrowed:
+                    workspace_claimed.append(workspace_key)
+            with ExitStack() as heartbeats:
+                for action in actions:
+                    heartbeats.enter_context(Heartbeat(
+                        "action", action.id, workspace_owner, lease_seconds=30))
+                for workspace_key in workspace_claimed:
+                    heartbeats.enter_context(Heartbeat(
+                        "workspace", workspace_key, workspace_owner, lease_seconds=30))
+                authorization = _ExecutionAuthorization(action.id for action in actions)
+                result = backend.execute(
+                    request, authorization=authorization, allow_host_mounts=escape,
+                ) if backend_name == "container" else backend.execute(
+                    request, authorization=authorization,
                 )
+                secret_store = getattr(backend, "secret_store", None)
+                secrets = _secret_values(
+                    request.environment_refs, secret_store=secret_store,
+                    consumer=f"execution:{backend_name}")
+                if secrets:
+                    result = replace(
+                        result, stdout=_mask_text(result.stdout, secrets),
+                        stderr=_mask_text(result.stderr, secrets),
+                    )
         except Exception as exc:
             for action in actions:
-                finish_action(action.id, state="failed", result={"error": str(exc)})
+                finish_action(
+                    action.id, state="failed", result={"error": str(exc)},
+                    owner_token=action.owner_token,
+                )
             raise
+        finally:
+            for workspace_key in reversed(workspace_claimed):
+                release_lease("workspace", workspace_key, workspace_owner)
         for action in actions:
-            finish_action(action.id, state=result.state, result=result.audit_result())
+            finish_action(
+                action.id, state=result.state, result=result.audit_result(),
+                owner_token=action.owner_token,
+            )
         return replace(result, action_ids=tuple(action.id for action in actions))

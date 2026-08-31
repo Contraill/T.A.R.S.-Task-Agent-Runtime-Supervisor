@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import uuid
 
 from .approvals import ApprovalBroker
+from .ownership import Owner, claim_in_transaction, owner_alive
 from .policy import PolicyDecision, ScopeRequest, redact
 from .state_events import insert_state_event
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
@@ -30,6 +31,7 @@ class ActionRecord:
     created_at: str
     started_at: str | None
     completed_at: str | None
+    owner_token: str | None = None
 
 
 def _from_row(row):
@@ -50,7 +52,7 @@ def record_denied(request: ScopeRequest, decision: PolicyDecision):
 
 
 def begin_action(request: ScopeRequest, decision: PolicyDecision, *, approval_id=None,
-                 broker=None):
+                 broker=None, owner: Owner | None = None):
     broker = broker or ApprovalBroker()
     if decision.action == "deny":
         record_denied(request, decision)
@@ -60,10 +62,13 @@ def begin_action(request: ScopeRequest, decision: PolicyDecision, *, approval_id
     except PermissionError as exc:
         _create(request, decision, state="denied", result={"error": str(exc)})
         raise
-    return _create(request, decision, approval_id=authorization, state="running")
+    return _create(
+        request, decision, approval_id=authorization, state="running", owner=owner,
+    )
 
 
-def _create(request, decision, *, approval_id=None, state, result=None):
+def _create(request, decision, *, approval_id=None, state, result=None,
+            owner: Owner | None = None):
     ensure_state_store()
     action_id = "action-" + uuid.uuid4().hex
     stamp = now_utc()
@@ -101,17 +106,36 @@ def _create(request, decision, *, approval_id=None, state, result=None):
              stamp, stamp if state == "running" else None,
              stamp if state in FINAL_STATES else None),
         )
-    return load_action(action_id)
+        if state == "running":
+            owner = owner or Owner.create("action")
+            if not claim_in_transaction(
+                conn, "action", action_id, owner, lease_seconds=86_400,
+                metadata={"tool": request.tool, "task_id": request.task_id},
+            ):
+                raise RuntimeError("new action could not acquire ownership")
+    record = load_action(action_id)
+    return replace(record, owner_token=owner.token) if owner is not None else record
 
 
-def finish_action(action_id, *, state, result):
+def finish_action(action_id, *, state, result, owner_token):
     if state not in FINAL_STATES - {"denied"}:
         raise ValueError(f"invalid terminal action state: {state}")
     record = load_action(action_id)
     if record.state != "running":
         raise RuntimeError(f"action is not running: {record.state}")
     safe_result = redact(result)
+    caller = Owner.create("action-finish")
     with transaction(immediate=True) as conn:
+        lease = conn.execute(
+            "SELECT * FROM resource_leases WHERE resource_type='action' AND resource_key=?",
+            (action_id,),
+        ).fetchone()
+        if (not owner_token or not lease or lease["owner_token"] != owner_token
+                or lease["expires_at"] <= now_utc()
+                or lease["owner_pid"] != caller.pid
+                or lease["owner_start"] != caller.process_start
+                or not owner_alive(lease["owner_pid"], lease["owner_start"])):
+            raise RuntimeError("action is owned by another or expired executor")
         changed = conn.execute(
             """UPDATE action_journal SET state=?,result_json=?,completed_at=?
                WHERE id=? AND state='running'""",
@@ -123,6 +147,11 @@ def finish_action(action_id, *, state, result):
             conn, "tool_result", f"{record.tool}: {state}",
             session_id=record.session_id, task_id=record.task_id,
             payload={"action_id": action_id, "state": state, "result": safe_result},
+        )
+        conn.execute(
+            "DELETE FROM resource_leases WHERE resource_type='action' AND resource_key=? "
+            "AND owner_token=?",
+            (action_id, owner_token),
         )
     return load_action(action_id)
 
@@ -141,6 +170,7 @@ def load_action(action_id):
 
 def list_actions(*, task_id=None, state=None, limit=50):
     ensure_state_store()
+    recover_interrupted_actions()
     clauses = []
     params = []
     if task_id:
@@ -159,3 +189,36 @@ def list_actions(*, task_id=None, state=None, limit=50):
         return [_from_row(row) for row in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()
+
+
+def recover_interrupted_actions():
+    owner = Owner.create("action-recovery")
+    recovered = 0
+    with transaction(immediate=True) as conn:
+        rows = conn.execute(
+            "SELECT id,tool,task_id,session_id FROM action_journal WHERE state='running'"
+        ).fetchall()
+        for row in rows:
+            if not claim_in_transaction(
+                conn, "action", row["id"], owner, lease_seconds=30,
+                metadata={"recovery": True},
+            ):
+                continue
+            result = {"error": "execution owner was lost; external outcome is unknown"}
+            changed = conn.execute(
+                "UPDATE action_journal SET state='unknown',result_json=?,completed_at=? "
+                "WHERE id=? AND state='running'",
+                (json_dumps(result), now_utc(), row["id"]),
+            ).rowcount
+            if changed:
+                insert_state_event(
+                    conn, "tool_result", f"{row['tool']}: unknown",
+                    session_id=row["session_id"], task_id=row["task_id"],
+                    payload={"action_id": row["id"], "state": "unknown", "result": result},
+                )
+                recovered += 1
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_type='action' "
+                "AND resource_key=? AND owner_token=?", (row["id"], owner.token),
+            )
+    return recovered

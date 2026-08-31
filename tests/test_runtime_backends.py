@@ -1,11 +1,30 @@
 from types import SimpleNamespace
+import multiprocessing
+from pathlib import Path
+import threading
 
 import pytest
 
 from tars import runtime
 from tars import runtime_backends as backends
 from tars import runtime_routing as routing
+from tars import state_store
 from tars.generation import GenerationBudget
+
+
+def _hold_inference_slot(database, scratch, ready, release):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(scratch) / "legacy"
+    state_store.TASK_EVENTS_ROOT = Path(scratch) / "events"
+    state_store.TASK_INDEX_PATH = Path(scratch) / "index"
+    route = SimpleNamespace(backend="llama.cpp", runtime_id="fixture")
+    class Router:
+        def prepare(self, value):
+            ready.set()
+        def release(self, value):
+            pass
+    with runtime._inference_lifecycle(Router(), route):
+        release.wait(10)
 
 
 class FakeTransport:
@@ -27,6 +46,14 @@ class FakeTransport:
         yield {"choices": [{"delta": {"reasoning_content": "think"}}]}
         yield {"choices": [{"delta": {"content": "answer", "tool_calls": [{"id": "one"}]},
                              "finish_reason": "stop"}], "usage": {"total_tokens": 3}}
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", tmp_path / "state.sqlite3")
+    monkeypatch.setattr(state_store, "TASK_ROOT", tmp_path / "legacy")
+    monkeypatch.setattr(state_store, "TASK_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setattr(state_store, "TASK_INDEX_PATH", tmp_path / "index")
 
 
 def _cfg():
@@ -190,6 +217,52 @@ def test_runtime_dispatches_role_through_model_backend(monkeypatch):
     assert [call[0] for call in calls].count("require") == 2
     assert [call[0] for call in calls].count("prepare") == 2
     assert [call[0] for call in calls].count("release") == 2
+
+
+def test_inference_lifecycle_has_one_authoritative_gpu_owner(monkeypatch):
+    monkeypatch.setattr(runtime, "INFERENCE_SLOT_WAIT_SECONDS", 0.1)
+    entered, release = threading.Event(), threading.Event()
+    route = SimpleNamespace(backend="llama.cpp", runtime_id="fixture")
+    class Router:
+        def prepare(self, value):
+            entered.set()
+        def release(self, value):
+            pass
+    router = Router()
+    holder = {}
+    def hold():
+        with runtime._inference_lifecycle(router, route):
+            assert release.wait(5)
+        holder["done"] = True
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert entered.wait(5)
+    with pytest.raises(RuntimeError, match="slot is busy"):
+        with runtime._inference_lifecycle(router, route):
+            pass
+    release.set(); thread.join(timeout=5)
+    assert holder["done"] is True
+
+
+def test_inference_slot_is_exclusive_across_processes(monkeypatch):
+    monkeypatch.setattr(runtime, "INFERENCE_SLOT_WAIT_SECONDS", 0.1)
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(
+        target=_hold_inference_slot,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              ready, release),
+    )
+    process.start()
+    assert ready.wait(5)
+    route = SimpleNamespace(backend="llama.cpp", runtime_id="fixture")
+    router = SimpleNamespace(prepare=lambda value: None, release=lambda value: None)
+    with pytest.raises(RuntimeError, match="slot is busy"):
+        with runtime._inference_lifecycle(router, route):
+            pass
+    release.set()
+    process.join(timeout=10)
+    assert process.exitcode == 0
 
 
 def test_stream_close_releases_authoritative_runtime_lifecycle(monkeypatch):

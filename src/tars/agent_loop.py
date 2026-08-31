@@ -16,6 +16,7 @@ from .conversation import add_message
 from .evidence import load as load_evidence
 from .events import append_event
 from .policy import ScopeRequest
+from .ownership import Heartbeat, Owner, active as lease_active, claim, release as release_lease
 from .runtime import chat_completion
 from .state_events import append_state_event
 from .tasks import canonical_task_state, load_task, update_task
@@ -39,7 +40,8 @@ def submit_task_control(task_id, kind, message="", *, session_id=None, payload=N
 
 def is_task_loop_active(task_id):
     with _ACTIVE_LOOPS_LOCK:
-        return task_id in _ACTIVE_LOOPS
+        local = task_id in _ACTIVE_LOOPS
+    return local or lease_active("task-execution", task_id)
 
 
 @dataclass(frozen=True)
@@ -270,6 +272,7 @@ class AgentLoop:
         self.completion = completion or CompletionContract()
         self.broker = broker or ApprovalBroker()
         self.clock = clock
+        self.owner = Owner.create("agent-loop")
         self._active_lock = threading.Lock()
         self._active_binding = None
         self._active_tool = ""
@@ -298,37 +301,40 @@ class AgentLoop:
         applied = []
         stop = None
         while True:
-            control = claim_next(self.task_id)
+            control = claim_next(self.task_id, self.owner)
             if control is None:
                 break
             try:
-                task = load_task(self.task_id)
-                if control.kind == "approval":
-                    approval_id = control.payload.get("approval_id")
-                    if not approval_id or "approve" not in control.payload:
-                        raise ValueError("approval control requires approval_id and approve")
-                    self.broker.decide(approval_id, approve=bool(control.payload["approve"]),
-                                       reason=control.message, task_id=self.task_id)
-                elif control.kind in {"message", "redirect", "interrupt"}:
-                    if task.conversation_id:
-                        add_message(
-                            task.conversation_id, "user", control.message,
-                            kind="control", related_task_id=task.id,
-                            metadata={"control_id": control.id, "kind": control.kind},
-                            session_id=control.session_id,
-                        )
-                elif control.kind == "cancel":
-                    update_task(task.id, state="cancelled", phase="cancelled")
-                    stop = "cancelled"
-                elif control.kind == "pause":
-                    update_task(task.id, state="paused", phase="paused")
-                    stop = "paused"
-                elif control.kind == "resume" and task.state == "paused":
-                    update_task(task.id, state="running", phase="agent-loop")
-                finish_control(control.id, payload={"applied_at_boundary": True})
+                with Heartbeat("task-control", control.id, self.owner, lease_seconds=30):
+                    task = load_task(self.task_id)
+                    if control.kind == "approval":
+                        approval_id = control.payload.get("approval_id")
+                        if not approval_id or "approve" not in control.payload:
+                            raise ValueError("approval control requires approval_id and approve")
+                        self.broker.decide(approval_id, approve=bool(control.payload["approve"]),
+                                           reason=control.message, task_id=self.task_id)
+                    elif control.kind in {"message", "redirect", "interrupt"}:
+                        if task.conversation_id:
+                            add_message(
+                                task.conversation_id, "user", control.message,
+                                kind="control", related_task_id=task.id,
+                                metadata={"control_id": control.id, "kind": control.kind},
+                                session_id=control.session_id,
+                            )
+                    elif control.kind == "cancel":
+                        update_task(task.id, state="cancelled", phase="cancelled")
+                        stop = "cancelled"
+                    elif control.kind == "pause":
+                        update_task(task.id, state="paused", phase="paused")
+                        stop = "paused"
+                    elif control.kind == "resume" and task.state == "paused":
+                        update_task(task.id, state="running", phase="agent-loop")
+                    finish_control(control.id, self.owner,
+                                   payload={"applied_at_boundary": True})
                 applied.append(control)
             except Exception as exc:
-                finish_control(control.id, success=False, payload={"error": str(exc)})
+                finish_control(control.id, self.owner, success=False,
+                               payload={"error": str(exc)})
                 raise
             if stop:
                 break
@@ -344,19 +350,31 @@ class AgentLoop:
         task = load_task(self.task_id)
         if task.state in {"completed", "cancelled"}:
             raise RuntimeError(f"task {task.id} is {task.state}")
-        with _ACTIVE_LOOPS_LOCK:
-            if task.id in _ACTIVE_LOOPS:
-                raise RuntimeError(f"task {task.id} already has an active agent loop")
-            _ACTIVE_LOOPS[task.id] = self
+        if not claim("task-execution", task.id, self.owner, lease_seconds=30,
+                     metadata={"engine": "agent-loop"}):
+            raise RuntimeError(f"task {task.id} already has a live execution owner")
         try:
-            return self._run_registered(task)
+            if task.state == "running":
+                update_task(task.id, state="failed", phase="execution-owner-lost",
+                            failures=[*task.failures,
+                                      "previous execution outcome is ambiguous"])
+                raise RuntimeError(
+                    f"task {task.id} lost its previous execution owner; "
+                    "automatic replay is unsafe")
+            with _ACTIVE_LOOPS_LOCK:
+                if task.id in _ACTIVE_LOOPS:
+                    raise RuntimeError(f"task {task.id} already has an active agent loop")
+                _ACTIVE_LOOPS[task.id] = self
+            with Heartbeat("task-execution", task.id, self.owner, lease_seconds=30):
+                return self._run_registered(task)
         finally:
             with _ACTIVE_LOOPS_LOCK:
                 if _ACTIVE_LOOPS.get(task.id) is self:
                     del _ACTIVE_LOOPS[task.id]
+            release_lease("task-execution", task.id, self.owner)
 
     def _run_registered(self, task):
-        recover_processing(task.id)
+        recover_processing(task.id, self.owner)
         update_task(task.id, state="running", phase="agent-loop")
         started = self.clock()
         results = []
@@ -366,7 +384,11 @@ class AgentLoop:
         for iteration in range(1, self.limits.max_iterations + 1):
             if self.clock() - started > self.limits.max_seconds:
                 return self._stop("paused", "time budget exhausted", iteration - 1, results)
-            controls, stop = self._apply_controls()
+            try:
+                controls, stop = self._apply_controls()
+            except Exception as exc:
+                return self._stop("failed", f"control application failed: {exc}",
+                                  iteration - 1, results, checkpoint_id)
             if stop:
                 return LoopOutcome(stop, f"{stop} by user control", iteration - 1, tuple(results))
             task = load_task(task.id)
@@ -386,7 +408,11 @@ class AgentLoop:
             except Exception as exc:
                 return self._stop("failed", f"invalid model decision: {exc}",
                                   iteration, results, checkpoint_id)
-            boundary_controls, stop = self._apply_controls()
+            try:
+                boundary_controls, stop = self._apply_controls()
+            except Exception as exc:
+                return self._stop("failed", f"control application failed: {exc}",
+                                  iteration, results, checkpoint_id)
             if stop:
                 return LoopOutcome(stop, f"{stop} by user control", iteration - 1,
                                    tuple(results), checkpoint_id)

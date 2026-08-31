@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 BASE_SCHEMA_VERSION = 3
 
 # Schema objects were introduced monotonically in the public state-store history.
@@ -46,6 +46,7 @@ _SCHEMA_INTRODUCED = {
     "idx_core_clients_state": 16, "core_pairings": 16,
     "idx_core_pairings_expiry": 16, "runtime_routes": 17,
     "idx_runtime_routes_task_created": 17,
+    "resource_leases": 18, "idx_resource_leases_expiry": 18,
 }
 
 
@@ -586,6 +587,21 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_task_runs_state
         ON task_runs(state, heartbeat_at DESC);
 
+    CREATE TABLE IF NOT EXISTS resource_leases (
+        resource_type TEXT NOT NULL,
+        resource_key TEXT NOT NULL,
+        owner_token TEXT NOT NULL,
+        owner_pid INTEGER NOT NULL,
+        owner_start TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY(resource_type, resource_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_resource_leases_expiry
+        ON resource_leases(expires_at);
+
     CREATE TABLE IF NOT EXISTS delegations (
         id TEXT PRIMARY KEY,
         parent_task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -838,7 +854,7 @@ def health() -> dict:
         version = int(version_row[0]) if version_row else 0
         shape_errors = schema_errors(conn)
         counts = {}
-        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries", "core_clients", "core_pairings", "runtime_routes"):
+        for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "resource_leases", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries", "core_clients", "core_pairings", "runtime_routes"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
             "ok": integrity == "ok" and version == SCHEMA_VERSION and not shape_errors,

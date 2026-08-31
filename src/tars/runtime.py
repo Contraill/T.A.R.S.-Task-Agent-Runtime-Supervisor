@@ -14,6 +14,10 @@ from .registry import get_model
 from .roles import get_role
 from .generation import generation_budget, generation_ceiling
 from .thinking import capability_for_model, decide as decide_thinking
+from .ownership import Heartbeat, Owner, acquire, release as release_lease
+
+
+INFERENCE_SLOT_WAIT_SECONDS = 30.0
 
 
 def get_json(url, timeout=5):
@@ -160,10 +164,19 @@ def _inference_request(cfg, role, messages, *, max_tokens=None, input_tokens=Non
 @contextmanager
 def _inference_lifecycle(router, route):
     """Apply the resolved backend lifecycle around every real inference attempt."""
+    owner = Owner.create("inference")
+    if not acquire(
+        "gpu-slot", "local-inference:0", owner, lease_seconds=30,
+        timeout=INFERENCE_SLOT_WAIT_SECONDS,
+        metadata={"backend": getattr(route, "backend", ""),
+                  "runtime_id": getattr(route, "runtime_id", "")},
+    ):
+        raise RuntimeError("local inference slot is busy")
     primary_error = None
     try:
-        router.prepare(route)
-        yield
+        with Heartbeat("gpu-slot", "local-inference:0", owner, lease_seconds=30):
+            router.prepare(route)
+            yield
     except BaseException as exc:
         primary_error = exc
         raise
@@ -174,6 +187,8 @@ def _inference_lifecycle(router, route):
             if primary_error is None:
                 raise
             primary_error.add_note(f"runtime release also failed: {release_error}")
+        finally:
+            release_lease("gpu-slot", "local-inference:0", owner)
 
 
 def _reported_usage(usage):

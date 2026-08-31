@@ -12,6 +12,7 @@ import tempfile
 import uuid
 
 from .config import MEMORY_HISTORY_ROOT, MEMORY_ROOT
+from .ownership import Owner, claim_in_transaction
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 
 MEMORY_KINDS = {"system", "profile", "projects", "episodic", "reference"}
@@ -310,20 +311,41 @@ def review_candidates(*, status="staged"):
 
 def decide_candidate(candidate_id, *, promote: bool, reason=""):
     ensure_state_store()
+    owner = Owner.create("memory-review")
     with transaction(immediate=True) as conn:
         row = conn.execute(
-            "SELECT * FROM memory_candidates WHERE id=? AND status='staged'", (candidate_id,)
+            "SELECT * FROM memory_candidates WHERE id=? AND status IN ('staged','reviewing')",
+            (candidate_id,),
         ).fetchone()
         if not row:
             raise KeyError(f"unknown staged memory candidate: {candidate_id}")
-        status = "reviewing" if promote else "rejected"
+        if not claim_in_transaction(
+            conn, "memory-candidate-review", candidate_id, owner, lease_seconds=30,
+            metadata={"promote": bool(promote)},
+        ):
+            raise RuntimeError(f"memory candidate {candidate_id} has a live reviewer")
         changed = conn.execute(
-            "UPDATE memory_candidates SET status=?,reason=?,reviewed_at=? "
-            "WHERE id=? AND status='staged'",
-            (status, reason, now_utc(), candidate_id)).rowcount
+            "UPDATE memory_candidates SET status='reviewing',reason=?,reviewed_at=? "
+            "WHERE id=? AND status IN ('staged','reviewing')",
+            (reason, now_utc(), candidate_id)).rowcount
         if changed != 1:
             raise RuntimeError(f"memory candidate {candidate_id} changed concurrently")
     if not promote:
+        stamp = now_utc()
+        with transaction(immediate=True) as conn:
+            changed = conn.execute(
+                "UPDATE memory_candidates SET status='rejected',reason=?,reviewed_at=? "
+                "WHERE id=? AND status='reviewing' AND EXISTS (SELECT 1 FROM resource_leases "
+                "WHERE resource_type='memory-candidate-review' AND resource_key=? "
+                "AND owner_token=? AND expires_at>?)",
+                (reason, stamp, candidate_id, candidate_id, owner.token, stamp),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(f"memory candidate {candidate_id} lost review ownership")
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_type='memory-candidate-review' "
+                "AND resource_key=? AND owner_token=?", (candidate_id, owner.token),
+            )
         return None
     entry_id = "mem-" + candidate_id.removeprefix("cand-")
     try:
@@ -333,18 +355,33 @@ def decide_candidate(candidate_id, *, promote: bool, reason=""):
             tags=json_loads(row["tags_json"], []),
             _entry_id=entry_id,
         )
+        stamp = now_utc()
         with transaction(immediate=True) as conn:
             changed = conn.execute(
                 "UPDATE memory_candidates SET status='promoted',reason=?,reviewed_at=? "
-                "WHERE id=? AND status='reviewing'",
-                (reason, now_utc(), candidate_id)).rowcount
+                "WHERE id=? AND status='reviewing' AND EXISTS (SELECT 1 FROM resource_leases "
+                "WHERE resource_type='memory-candidate-review' AND resource_key=? "
+                "AND owner_token=? AND expires_at>?)",
+                (reason, stamp, candidate_id, candidate_id, owner.token, stamp)).rowcount
             if changed != 1:
                 raise RuntimeError(f"memory candidate {candidate_id} lost review ownership")
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_type='memory-candidate-review' "
+                "AND resource_key=? AND owner_token=?", (candidate_id, owner.token),
+            )
     except Exception:
         with transaction(immediate=True) as conn:
-            conn.execute(
+            changed = conn.execute(
                 "UPDATE memory_candidates SET status='staged',reviewed_at=NULL "
-                "WHERE id=? AND status='reviewing'", (candidate_id,))
+                "WHERE id=? AND status='reviewing' AND EXISTS (SELECT 1 FROM resource_leases "
+                "WHERE resource_type='memory-candidate-review' AND resource_key=? "
+                "AND owner_token=?)", (candidate_id, candidate_id, owner.token),
+            ).rowcount
+            if changed:
+                conn.execute(
+                    "DELETE FROM resource_leases WHERE resource_type='memory-candidate-review' "
+                    "AND resource_key=? AND owner_token=?", (candidate_id, owner.token),
+                )
         raise
     return entry
 

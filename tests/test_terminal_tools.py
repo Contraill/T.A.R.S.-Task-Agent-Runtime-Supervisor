@@ -1,10 +1,27 @@
 import sys
 import time
+import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
 
 from tars import approvals, execution_backends as execution, policy, state_store, terminal_tools
+
+
+def _start_background_then_exit(database, state_root, log_root, cwd, output):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(state_root) / "legacy"
+    state_store.TASK_EVENTS_ROOT = Path(state_root) / "events"
+    state_store.TASK_INDEX_PATH = Path(state_root) / "index"
+    policy.add_rule("sandbox_escape", "allow", target="host")
+    manager = terminal_tools.ProcessManager(log_root=log_root)
+    request = execution.ExecutionRequest(
+        (sys.executable, "-c", "import time; time.sleep(60)"),
+        cwd=cwd, allowed_paths=(cwd,),
+    )
+    result = manager.start(request)
+    output.put(result.data["pid"])
 
 
 @pytest.fixture
@@ -99,3 +116,26 @@ def test_process_kill_is_destructive_and_denied_without_approval(terminal):
     killed = tools.processes.kill(process_id, approval_id=approval)
     assert killed.tool == "process.kill" and killed.succeeded
     assert tools.processes.wait(process_id, timeout=5).data["state"] == "exited"
+
+
+def test_background_process_dies_with_owning_manager_process(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    process = context.Process(
+        target=_start_background_then_exit,
+        args=(tmp_path / "state.sqlite3", tmp_path, tmp_path / "logs",
+              str(tmp_path), output),
+    )
+    process.start()
+    child_pid = output.get(timeout=10)
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    for _ in range(100):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        os.kill(child_pid, 9)
+        pytest.fail("managed background child survived its owning process")

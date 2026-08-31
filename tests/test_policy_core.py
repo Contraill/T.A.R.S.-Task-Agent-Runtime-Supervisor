@@ -1,6 +1,18 @@
+import multiprocessing
+from pathlib import Path
+
 import pytest
 
 from tars import action_journal, approvals, conversation, policy, sessions, state_store, tasks
+
+
+def _begin_action_and_exit(database, scratch):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(scratch) / "legacy"
+    state_store.TASK_EVENTS_ROOT = Path(scratch) / "legacy-events"
+    state_store.TASK_INDEX_PATH = Path(scratch) / "legacy-index"
+    request = policy.ScopeRequest("system.info", "read", "host")
+    action_journal.begin_action(request, policy.ScopeGuard().evaluate(request))
 
 
 @pytest.fixture
@@ -115,11 +127,42 @@ def test_one_call_approval_is_consumed_and_cannot_authorize_another_call(isolate
     approved = broker.decide(pending.id, approve=True, reason="write this file")
     action = action_journal.begin_action(request, decision, approval_id=approved.id, broker=broker)
     assert action.state == "running"
-    completed = action_journal.finish_action(action.id, state="succeeded", result={"bytes": 4})
+    completed = action_journal.finish_action(
+        action.id, state="succeeded", result={"bytes": 4},
+        owner_token=action.owner_token,
+    )
     assert completed.result == {"bytes": 4}
     assert broker.load(approved.id).state == "consumed"
     with pytest.raises(PermissionError, match="approved authorization"):
         action_journal.begin_action(request, decision, approval_id=approved.id, broker=broker)
+
+
+def test_crashed_running_action_becomes_unknown_not_replayable(isolated_policy):
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_begin_action_and_exit,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent)),
+    )
+    process.start(); process.join(timeout=10)
+    assert process.exitcode == 0
+    actions = action_journal.list_actions()
+    assert len(actions) == 1 and actions[0].state == "unknown"
+    assert "outcome is unknown" in actions[0].result["error"]
+
+
+def test_running_action_can_only_be_terminalized_by_exact_owner_token(isolated_policy):
+    request = policy.ScopeRequest("system.info", "read", "host")
+    action = action_journal.begin_action(
+        request, policy.ScopeGuard().evaluate(request),
+    )
+    with pytest.raises(RuntimeError, match="another or expired executor"):
+        action_journal.finish_action(
+            action.id, state="succeeded", result={}, owner_token="different-owner",
+        )
+    assert action_journal.load_action(action.id).state == "running"
+    assert action_journal.finish_action(
+        action.id, state="succeeded", result={}, owner_token=action.owner_token,
+    ).state == "succeeded"
 
 
 def test_call_approval_rejects_same_size_different_payload_and_hides_secret(
@@ -244,7 +287,8 @@ def test_failed_result_is_truthful_and_redacted(isolated_policy):
     action = action_journal.begin_action(request, decision)
     failed = action_journal.finish_action(
         action.id, state="failed", result={"error": "not found", "authorization": "Bearer x"},
+        owner_token=action.owner_token,
     )
     assert failed.state == "failed" and failed.result["error"] == "not found"
     assert failed.result["authorization"] == "[REDACTED]"
-    assert state_store.health()["schema_version"] == 17
+    assert state_store.health()["schema_version"] == state_store.SCHEMA_VERSION

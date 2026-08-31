@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import multiprocessing
+from pathlib import Path
 import threading
 import time
 
@@ -23,6 +25,19 @@ def utc(hour=12):
 
 def make_task():
     return tasks.create_task("scheduled work", "general", make_active=False)
+
+
+def _hold_schedule_run(database, scratch, ready, release):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(scratch) / "legacy-tasks"
+    state_store.TASK_EVENTS_ROOT = Path(scratch) / "legacy-events"
+    state_store.TASK_INDEX_PATH = Path(scratch) / "legacy-index.json"
+    engine = scheduler.Scheduler(lease_seconds=60)
+    run = engine.claim_due(now=utc())[0]
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute("UPDATE schedule_runs SET state='running' WHERE id=?", (run.id,))
+    ready.put(run.id)
+    release.wait(10)
 
 
 def test_one_shot_claim_is_deduplicated_and_model_free(scheduled_state):
@@ -100,12 +115,40 @@ def test_condition_watch_is_edge_triggered_without_inference(scheduled_state):
     assert item.expression.startswith("ready@")
 
 
+def test_condition_failure_isolated_and_expression_edit_resets_edge(scheduled_state):
+    failing_task = make_task()
+    healthy_task = make_task()
+    failing = scheduler.create_schedule(
+        failing_task.id, "condition", "broken@every 1m", next_run_at=utc(), now=utc(11))
+    healthy = scheduler.create_schedule(
+        healthy_task.id, "condition", "ready@every 1m", next_run_at=utc(), now=utc(11))
+    engine = scheduler.Scheduler(conditions={
+        "broken": lambda: (_ for _ in ()).throw(RuntimeError("predicate failed")),
+        "ready": lambda: True,
+    }, max_concurrency=2)
+    claimed = engine.claim_due(now=utc())
+    assert [run.schedule_id for run in claimed] == [healthy.id]
+    assert scheduler.load_schedule(failing.id).next_run_at == "2026-08-31T12:01:00Z"
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute("UPDATE schedules SET condition_state=1 WHERE id=?", (healthy.id,))
+    edited = scheduler.edit_schedule(
+        healthy.id, expression="ready@every 2m", now=utc())
+    assert edited.condition_state is False
+
+
+def test_unwired_delivery_target_is_rejected_truthfully(scheduled_state):
+    task = make_task()
+    with pytest.raises(ValueError, match="not supported"):
+        scheduler.create_schedule(
+            task.id, "one-shot", utc().isoformat(), now=utc(11),
+            delivery_target="local:conversation")
+
+
 def test_checkpoint_recovery_delivery_and_failure_truth(scheduled_state):
     task = make_task()
     checkpoint = checkpoints.create_checkpoint(task.id, {"step": 2}, reason="resume")
     item = scheduler.create_schedule(
-        task.id, "recurring", "every 1h", next_run_at=utc(),
-        delivery_target="local:conversation", now=utc(11))
+        task.id, "recurring", "every 1h", next_run_at=utc(), now=utc(11))
     engine = scheduler.Scheduler()
     claimed = engine.claim_due(now=utc())[0]
     assert claimed.checkpoint_id == checkpoint.id
@@ -113,13 +156,13 @@ def test_checkpoint_recovery_delivery_and_failure_truth(scheduled_state):
         conn.execute("UPDATE schedule_runs SET state='running' WHERE id=?", (claimed.id,))
     assert engine.recover() == 1
     recovered = scheduler.load_run(claimed.id)
-    assert recovered.state == "claimed" and recovered.attempt == 2
+    assert recovered.state == "failed"
+    assert "outcome is ambiguous" in recovered.error
+    # A running action is never replayed after owner loss: it may already have committed
+    # an external side effect before its response or terminal state was persisted.
+    assert engine.execute_claimed(lambda run: {"duplicate": True}) == []
     seen = []
-    result = engine.execute_claimed(
-        lambda run: {"resumed_from": run.checkpoint_id},
-        deliver=lambda target, run: seen.append((target, run.id)) or {"ok": True})[0]
-    assert result.state == "succeeded" and result.result["resumed_from"] == checkpoint.id
-    assert seen == [("local:conversation", claimed.id)]
+    assert seen == []
 
     failure_task = make_task()
     failure_schedule = scheduler.create_schedule(
@@ -130,6 +173,64 @@ def test_checkpoint_recovery_delivery_and_failure_truth(scheduled_state):
     assert failed.state == "failed" and failed.error == "real failure"
     assert tasks.load_task(failure_task.id).last_result_status == "failed"
     assert failure_schedule.id == failed.schedule_id
+
+
+def test_live_scheduler_run_is_not_reclaimed_by_second_process(scheduled_state):
+    task = make_task()
+    scheduler.create_schedule(task.id, "one-shot", utc().isoformat(), now=utc(11))
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_schedule_run,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              ready, release),
+    )
+    process.start()
+    run_id = ready.get(timeout=5)
+    contender = scheduler.Scheduler(lease_seconds=60)
+    assert contender.recover() == 0
+    assert scheduler.load_run(run_id).state == "running"
+    assert contender.execute_claimed(lambda run: {"duplicate": True}) == []
+    release.set()
+    process.join(timeout=5)
+    assert process.exitcode == 0
+    assert contender.recover() == 1
+    assert scheduler.load_run(run_id).state == "failed"
+
+
+def test_delivery_has_one_owner_and_ambiguous_failures_are_not_replayed(scheduled_state):
+    task = make_task()
+    item = scheduler.create_schedule(
+        task.id, "one-shot", utc().isoformat(), now=utc(11))
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute("UPDATE schedules SET delivery_target='test-only' WHERE id=?", (item.id,))
+    producer = scheduler.Scheduler()
+    producer.claim_due(now=utc())
+    run = producer.execute_claimed(lambda value: {"ok": True})[0]
+    first = scheduler.Scheduler()
+    second = scheduler.Scheduler()
+    entered, release = threading.Event(), threading.Event()
+    delivered = []
+    def send(target, value):
+        entered.set()
+        assert release.wait(5)
+        delivered.append(value.id)
+        return {"ok": True}
+    holder = {}
+    thread = threading.Thread(
+        target=lambda: holder.setdefault("count", first.deliver_pending(send)))
+    thread.start()
+    assert entered.wait(5)
+    assert second.deliver_pending(lambda target, value: {"duplicate": True}) == 0
+    release.set(); thread.join(timeout=5)
+    assert holder["count"] == 1 and delivered == [run.id]
+
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE schedule_deliveries SET state='failed',error='outcome ambiguous' "
+            "WHERE run_id=?", (run.id,))
+    assert second.deliver_pending(lambda target, value: {"duplicate": True}) == 0
 
 
 def test_pause_edit_remove_preserves_run_journal(scheduled_state):

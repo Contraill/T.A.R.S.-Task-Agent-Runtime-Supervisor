@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from tars import activity, conversation, identity, prompt_compiler, projects, role_state, sessions
-from tars import runner, state_events, state_store, tasks
+from tars import ownership, runner, state_events, state_store, tasks
 
 
 @pytest.fixture
@@ -41,7 +41,7 @@ def test_schema_session_event_role_and_project_state(monkeypatch, isolated_state
     context = projects.register_project(tmp_path)
     assert [path.name for path in context.files] == ["TARS.md", "AGENTS.md"]
     health = state_store.health()
-    assert health["ok"] and health["schema_version"] == 17
+    assert health["ok"] and health["schema_version"] == state_store.SCHEMA_VERSION
     assert health["counts"]["sessions"] == 1 and health["counts"]["state_events"] == 4
 
 
@@ -77,6 +77,22 @@ def test_paused_run_blocks_second_run_and_run_provenance_is_locked(
         runner.create_run(task.id)
 
 
+def test_dead_running_task_owner_is_terminalized_before_new_run(
+        monkeypatch, isolated_state):
+    monkeypatch.setattr(tasks, "resolve_role_id", lambda value: value)
+    task = tasks.create_task("recover runner", "general", make_active=False)
+    first = runner.create_run(task.id)
+    runner._set_run(first.id, state="running")
+    dead = ownership.Owner("dead-owner", 999_999_999, "missing")
+    with state_store.transaction(immediate=True) as conn:
+        assert ownership.claim_in_transaction(
+            conn, "task-execution", task.id, dead, lease_seconds=300)
+    second = runner.create_run(task.id)
+    assert second.state == "queued"
+    recovered = runner.load_run(first.id)
+    assert recovered.state == "failed" and recovered.finish_reason == "owner-lost"
+
+
 def test_schema_upgrade_preserves_existing_conversation(isolated_state):
     state_store.ensure_state_store()
     conv = conversation.create_conversation(title="before upgrade")
@@ -84,15 +100,14 @@ def test_schema_upgrade_preserves_existing_conversation(isolated_state):
         conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
     state_store.ensure_state_store()
     assert conversation.load_conversation(conv.id).title == "before upgrade"
-    assert state_store.health()["schema_version"] == 17
+    assert state_store.health()["schema_version"] == state_store.SCHEMA_VERSION
 
 
 def test_real_v16_layout_is_migrated_in_order(isolated_state):
     conn = sqlite3.connect(isolated_state)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
-        for version in range(state_store.BASE_SCHEMA_VERSION,
-                             state_store.SCHEMA_VERSION):
+        for version in range(state_store.BASE_SCHEMA_VERSION, 17):
             state_store._apply_schema_level(conn, version)
         conn.execute("INSERT INTO meta(key,value) VALUES('schema_version','16')")
         conn.execute(
@@ -110,12 +125,36 @@ def test_real_v16_layout_is_migrated_in_order(isolated_state):
         assert conn.execute(
             "SELECT title FROM conversations WHERE id='conv-old'").fetchone()[0] == "historical"
         assert conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "17"
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(
+                state_store.SCHEMA_VERSION)
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='runtime_routes'").fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='resource_leases'").fetchone()
     finally:
         conn.close()
 
+
+def test_real_v17_layout_adds_durable_lease_schema(isolated_state):
+    conn = sqlite3.connect(isolated_state)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        for version in range(state_store.BASE_SCHEMA_VERSION, 18):
+            state_store._apply_schema_level(conn, version)
+        conn.execute("INSERT INTO meta(key,value) VALUES('schema_version','17')")
+        conn.commit()
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='runtime_routes'").fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='resource_leases'").fetchone() is None
+    finally:
+        conn.close()
+    state_store.ensure_state_store_no_migration()
+    with sqlite3.connect(isolated_state) as conn:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "18"
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='resource_leases'").fetchone()
 
 def test_failed_migration_never_advances_version(monkeypatch, isolated_state):
     conn = sqlite3.connect(isolated_state)

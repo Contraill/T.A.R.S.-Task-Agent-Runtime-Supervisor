@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from collections.abc import Iterator
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import threading
+import time
 
 from . import memory
 from .evidence import load as load_evidence
 from .events import append_event
-from .orchestration import (complete_delegation, create_delegation,
-                            load_delegation)
+from .orchestration import create_delegation, load_delegation
+from .ownership import (Heartbeat, Owner, claim, claim_in_transaction,
+                        claim_workspace, owner_scope, release as release_lease)
 from .policy import canonical_path
 from .state_store import (connect, ensure_state_store, json_dumps, json_loads,
                           now_utc, transaction)
@@ -18,10 +22,8 @@ from .tasks import load_task, update_task
 
 TERMINAL_STATES = {"completed", "failed", "cancelled", "timed_out", "accepted", "rejected"}
 _EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="tars-child")
-_GPU_SLOT = threading.BoundedSemaphore(1)
 _LOCK = threading.RLock()
-_RUNS: dict[str, tuple[Future, threading.Event]] = {}
-_WORKSPACE_LOCKS: dict[str, threading.Lock] = {}
+_RUNS: dict[str, tuple[Future, threading.Event, Owner]] = {}
 
 
 @dataclass(frozen=True)
@@ -203,33 +205,142 @@ def create_child(parent_task_id, goal, *, role=None, required_capabilities=(),
     return load_contract(delegation.id)
 
 
-def _set_state(delegation_id, state, **fields):
+def _set_state(delegation_id, state, *, expected=None, owner=None, **fields):
     allowed = {"started_at", "deadline_at", "finished_at", "accepted", "acceptance_reason"}
     if set(fields) - allowed:
         raise ValueError("unsupported delegation state field")
     assignments = ["state=?", "updated_at=?"] + [f"{key}=?" for key in fields]
     values = [state, now_utc(), *fields.values(), delegation_id]
     with transaction(immediate=True) as conn:
-        conn.execute(f"UPDATE delegation_contracts SET {','.join(assignments)} "
-                     "WHERE delegation_id=?", values)
+        where = "delegation_id=?"
+        if expected:
+            expected = tuple(expected)
+            where += f" AND state IN ({','.join('?' for _ in expected)})"
+            values.extend(expected)
+        if owner is not None:
+            where += (" AND EXISTS (SELECT 1 FROM resource_leases WHERE "
+                      "resource_type='delegation' AND resource_key=delegation_id "
+                      "AND owner_token=? AND expires_at>?)")
+            values.extend((owner.token, now_utc()))
+        changed = conn.execute(
+            f"UPDATE delegation_contracts SET {','.join(assignments)} WHERE {where}",
+            values,
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"delegation {delegation_id} changed concurrently")
+
+
+def _finish_execution(delegation_id, owner, contract_state, *, status, summary, result):
+    stamp = now_utc()
+    delegation = load_delegation(delegation_id)
+    delegation_state = "completed" if status in {"success", "partial"} else status
+    child_state = "completed" if status in {"success", "partial"} else (
+        "cancelled" if status == "cancelled" else "failed")
+    with transaction(immediate=True) as conn:
+        lease = conn.execute(
+            "SELECT owner_token,expires_at FROM resource_leases WHERE resource_type='delegation' "
+            "AND resource_key=?", (delegation_id,),
+        ).fetchone()
+        if (not lease or lease["owner_token"] != owner.token
+                or lease["expires_at"] <= stamp):
+            raise RuntimeError(f"delegation {delegation_id} is not owned by this executor")
+        changed = conn.execute(
+            """UPDATE delegation_contracts SET state=?,updated_at=?,finished_at=?
+               WHERE delegation_id=? AND state IN ('scheduled','running','cancellation_requested')""",
+            (contract_state, stamp, stamp, delegation_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"delegation {delegation_id} changed concurrently")
+        changed = conn.execute(
+            """UPDATE delegations SET state=?,result_status=?,result_summary=?,result_json=?,
+               updated_at=?,completed_at=? WHERE id=?
+               AND state NOT IN ('completed','failed','cancelled')""",
+            (delegation_state, status, str(summary), json_dumps(result or {}), stamp,
+             stamp, delegation_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"delegation {delegation_id} result changed concurrently")
+        conn.execute(
+            "UPDATE tasks SET state=?,phase=?,updated_at=? WHERE id=?",
+            (child_state, f"delegation-{contract_state}", stamp, delegation.child_task_id),
+        )
+        conn.execute(
+            "DELETE FROM resource_leases WHERE resource_type='delegation' "
+            "AND resource_key=? AND owner_token=?", (delegation_id, owner.token),
+        )
+    append_event(
+        delegation.child_task_id, "result" if status in {"success", "partial"} else "error",
+        str(summary), data={"delegation_id": delegation_id, "status": status},
+    )
+    return load_contract(delegation_id)
+
+
+def _execute_bounded(executor, context, maximum):
+    result = executor(context)
+    if isinstance(result, dict):
+        iterations = int(result.get("iterations", 1))
+        if iterations < 0 or iterations > maximum:
+            raise RuntimeError("child exceeded delegated iteration budget")
+        return result
+    if isinstance(result, Iterator):
+        final = None
+        for count, item in enumerate(result, 1):
+            if count > maximum:
+                raise RuntimeError("child exceeded delegated iteration budget")
+            if not isinstance(item, dict):
+                raise TypeError("child iteration must yield a result object")
+            final = item
+        if final is None:
+            raise ValueError("child executor produced no result")
+        return final
+    raise TypeError("child executor must return a result object")
 
 
 def start(delegation_id, executor):
     """Run a child with bounded context and cancellation; executor returns a result dict."""
     contract = load_contract(delegation_id)
-    if contract.state != "created":
-        raise RuntimeError(f"delegation is already {contract.state}")
     delegation = load_delegation(delegation_id)
+    owner = Owner.create("delegation")
     cancel_event = threading.Event()
     start_gate = threading.Event()
-    workspace_lock = None
-    if contract.workspace.get("exclusive") and contract.workspace.get("root"):
-        with _LOCK:
-            workspace_lock = _WORKSPACE_LOCKS.setdefault(contract.workspace["root"], threading.Lock())
+    deadline = (datetime.now(timezone.utc) + timedelta(
+        seconds=contract.budget["max_seconds"])).isoformat()
+    stale_running = False
+    with transaction(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT state FROM delegation_contracts WHERE delegation_id=?", (delegation_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"unknown delegation contract: {delegation_id}")
+        if row["state"] in TERMINAL_STATES:
+            raise RuntimeError(f"delegation is already {row['state']}")
+        if row["state"] not in {"created", "scheduled", "running"}:
+            raise RuntimeError(f"delegation is already {row['state']}")
+        if not claim_in_transaction(
+            conn, "delegation", delegation_id, owner, lease_seconds=30,
+            metadata={"child_task_id": delegation.child_task_id},
+        ):
+            raise RuntimeError("delegation already has a live executor")
+        stale_running = row["state"] == "running"
+        if not stale_running:
+            changed = conn.execute(
+                "UPDATE delegation_contracts SET state='scheduled',deadline_at=?,updated_at=? "
+                "WHERE delegation_id=? AND state IN ('created','scheduled')",
+                (deadline, now_utc(), delegation_id),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(f"delegation {delegation_id} changed concurrently")
+    if stale_running:
+        _finish_execution(
+            delegation_id, owner, "failed", status="failed",
+            summary="previous child execution owner was lost; outcome is ambiguous",
+            result={"owner_lost": True, "replayed": False},
+        )
+        raise RuntimeError("stale running delegation was not replayed")
 
     def run():
         start_gate.wait()
-        acquired_gpu = acquired_workspace = False
+        acquired = []
         timed_out = threading.Event()
         def expire():
             timed_out.set()
@@ -237,16 +348,36 @@ def start(delegation_id, executor):
         timer = threading.Timer(contract.budget["max_seconds"], expire)
         timer.daemon = True
         timer.start()
+        monitor_stop = threading.Event()
+        def monitor_cancel():
+            while not monitor_stop.wait(0.1):
+                if load_contract(delegation_id).state == "cancellation_requested":
+                    cancel_event.set()
+                    return
+        monitor = threading.Thread(target=monitor_cancel, name="tars-child-cancel", daemon=True)
+        monitor.start()
         try:
-            if contract.budget["inference"]:
-                acquired_gpu = _GPU_SLOT.acquire(timeout=contract.budget["max_seconds"])
-                if not acquired_gpu:
-                    raise TimeoutError("local inference slot timeout")
-            if workspace_lock:
-                acquired_workspace = workspace_lock.acquire(timeout=contract.budget["max_seconds"])
-                if not acquired_workspace:
-                    raise TimeoutError("workspace lock timeout")
-            _set_state(delegation_id, "running", started_at=now_utc())
+            if load_contract(delegation_id).state == "cancellation_requested":
+                return _finish_execution(
+                    delegation_id, owner, "cancelled", status="cancelled",
+                    summary="cancelled before start", result={"cancelled": True})
+            resource_lease = max(30.0, float(contract.budget["max_seconds"]) + 5)
+            if contract.workspace.get("exclusive") and contract.workspace.get("root"):
+                workspace_key = contract.workspace["root"]
+                deadline_stamp = time.monotonic() + contract.budget["max_seconds"]
+                while not claim_workspace(
+                    workspace_key, owner, lease_seconds=resource_lease,
+                    metadata={"delegation_id": delegation_id},
+                ):
+                    if cancel_event.wait(0.1) or time.monotonic() >= deadline_stamp:
+                        raise TimeoutError("workspace lock timeout")
+                acquired.append(("workspace", workspace_key))
+            if cancel_event.is_set():
+                return _finish_execution(
+                    delegation_id, owner, "cancelled", status="cancelled",
+                    summary="cancelled before execution", result={"cancelled": True})
+            _set_state(delegation_id, "running", expected=("scheduled",), owner=owner,
+                       started_at=now_utc())
             update_task(delegation.child_task_id, state="running", phase="delegated-running")
             context = {
                 "delegation_id": delegation_id, "task_id": delegation.child_task_id,
@@ -256,48 +387,62 @@ def start(delegation_id, executor):
                 "generation_limit": contract.budget["max_tokens"],
                 "cancel_event": cancel_event,
             }
-            result = executor(context)
+            with owner_scope(owner), ExitStack() as heartbeats:
+                heartbeats.enter_context(Heartbeat(
+                    "delegation", delegation_id, owner, lease_seconds=30))
+                for resource_type, resource_key in acquired:
+                    heartbeats.enter_context(Heartbeat(
+                        resource_type, resource_key, owner, lease_seconds=30))
+                result = _execute_bounded(
+                    executor, context, int(contract.budget["max_iterations"]))
             if timed_out.is_set():
-                complete_delegation(delegation_id, status="failed", summary="child timed out",
-                                    result={"timed_out": True})
-                _set_state(delegation_id, "timed_out", finished_at=now_utc())
+                _finish_execution(
+                    delegation_id, owner, "timed_out", status="failed",
+                    summary="child timed out", result={"timed_out": True})
             elif cancel_event.is_set():
-                complete_delegation(delegation_id, status="cancelled", summary="cancelled",
-                                    result={"cancelled": True})
-                _set_state(delegation_id, "cancelled", finished_at=now_utc())
+                _finish_execution(
+                    delegation_id, owner, "cancelled", status="cancelled",
+                    summary="cancelled", result={"cancelled": True})
             else:
-                if not isinstance(result, dict):
-                    raise TypeError("child executor must return a result object")
                 summary = str(result.get("summary", "")).strip()
                 if contract.completion["summary_required"] and not summary:
                     raise ValueError("child completion summary is required")
-                complete_delegation(delegation_id, status="success",
-                                    summary=summary, result=result)
-                _set_state(delegation_id, "completed", finished_at=now_utc())
+                _finish_execution(
+                    delegation_id, owner, "completed", status="success",
+                    summary=summary, result=result)
             return load_contract(delegation_id)
         except Exception as exc:
             if load_contract(delegation_id).state not in TERMINAL_STATES:
                 try:
-                    complete_delegation(delegation_id, status="failed", summary=str(exc),
-                                        result={"error": str(exc)})
+                    _finish_execution(
+                        delegation_id, owner,
+                        "timed_out" if timed_out.is_set() else "failed", status="failed",
+                        summary=str(exc), result={"error": str(exc)},
+                    )
                 except RuntimeError:
                     pass
-                _set_state(delegation_id, "timed_out" if timed_out.is_set() else "failed",
-                           finished_at=now_utc())
             raise
         finally:
             timer.cancel()
-            if acquired_workspace:
-                workspace_lock.release()
-            if acquired_gpu:
-                _GPU_SLOT.release()
+            monitor_stop.set()
+            monitor.join(timeout=1)
+            for resource_type, resource_key in reversed(acquired):
+                release_lease(resource_type, resource_key, owner)
 
-    deadline = (datetime.now(timezone.utc) + timedelta(
-        seconds=contract.budget["max_seconds"])).isoformat()
-    _set_state(delegation_id, "scheduled", deadline_at=deadline)
-    with _LOCK:
-        future = _EXECUTOR.submit(run)
-        _RUNS[delegation_id] = (future, cancel_event)
+    try:
+        with _LOCK:
+            future = _EXECUTOR.submit(run)
+            _RUNS[delegation_id] = (future, cancel_event, owner)
+    except Exception as exc:
+        _finish_execution(
+            delegation_id, owner, "failed", status="failed", summary=str(exc),
+            result={"submission_failed": True, "error": str(exc)})
+        raise
+    def cleanup(_future):
+        with _LOCK:
+            if _RUNS.get(delegation_id, (None,))[0] is _future:
+                _RUNS.pop(delegation_id, None)
+    future.add_done_callback(cleanup)
     start_gate.set()
     return future
 
@@ -308,14 +453,44 @@ def cancel(delegation_id):
         return {"requested": False, "state": contract.state, "cancelled": contract.state == "cancelled"}
     with _LOCK:
         run = _RUNS.get(delegation_id)
+    with transaction(immediate=True) as conn:
+        changed = conn.execute(
+            "UPDATE delegation_contracts SET state='cancellation_requested',updated_at=? "
+            "WHERE delegation_id=? AND state IN ('created','scheduled','running')",
+            (now_utc(), delegation_id),
+        ).rowcount
+    if not changed:
+        current = load_contract(delegation_id)
+        if not run and current.state == "cancellation_requested":
+            recovery_owner = Owner.create("delegation-cancel")
+            if claim("delegation", delegation_id, recovery_owner, lease_seconds=30,
+                     metadata={"cancellation_recovery": True}):
+                _finish_execution(
+                    delegation_id, recovery_owner, "cancelled", status="cancelled",
+                    summary="cancelled after execution owner loss",
+                    result={"cancelled": True, "owner_lost": True})
+                return {"requested": True, "state": "cancelled", "cancelled": True}
+        return {"requested": current.state == "cancellation_requested",
+                "state": current.state, "cancelled": current.state == "cancelled"}
     if not run:
-        complete_delegation(delegation_id, status="cancelled", summary="cancelled before start")
-        _set_state(delegation_id, "cancelled", finished_at=now_utc())
-        return {"requested": True, "state": "cancelled", "cancelled": True}
-    future, event = run
+        recovery_owner = Owner.create("delegation-cancel")
+        if claim("delegation", delegation_id, recovery_owner, lease_seconds=30,
+                 metadata={"cancellation_recovery": True}):
+            _finish_execution(
+                delegation_id, recovery_owner, "cancelled", status="cancelled",
+                summary="cancelled before start", result={"cancelled": True})
+            return {"requested": True, "state": "cancelled", "cancelled": True}
+        return {"requested": True, "state": "cancellation_requested", "cancelled": False}
+    future, event, owner = run
     event.set()
-    return {"requested": True, "state": "cancellation_requested",
-            "cancelled": future.cancel()}
+    cancelled = future.cancel()
+    if cancelled:
+        _finish_execution(
+            delegation_id, owner, "cancelled", status="cancelled",
+            summary="cancelled before start", result={"cancelled": True})
+    return {"requested": True,
+            "state": "cancelled" if cancelled else "cancellation_requested",
+            "cancelled": cancelled}
 
 
 def join(delegation_id, timeout=None):
@@ -326,7 +501,13 @@ def join(delegation_id, timeout=None):
             run[0].result(timeout=timeout)
         except TimeoutError:
             return {"state": load_contract(delegation_id).state, "joined": False}
-    return {"state": load_contract(delegation_id).state, "joined": True}
+        except CancelledError:
+            pass
+        except Exception:
+            if load_contract(delegation_id).state not in TERMINAL_STATES:
+                raise
+    state = load_contract(delegation_id).state
+    return {"state": state, "joined": state in TERMINAL_STATES}
 
 
 def accept(delegation_id, *, accept_result=True, reason=""):
@@ -347,6 +528,7 @@ def accept(delegation_id, *, accept_result=True, reason=""):
     if accept_result and contract.completion["summary_required"] and not delegation.result_summary.strip():
         raise ValueError("child completion summary is required")
     _set_state(delegation_id, "accepted" if accept_result else "rejected",
+               expected=("completed",),
                accepted=1 if accept_result else 0, acceptance_reason=str(reason))
     append_event(delegation.parent_task_id, "delegation",
                  f"Child result {'accepted' if accept_result else 'rejected'}: {delegation_id}",
@@ -368,30 +550,74 @@ def review_child_memory(delegation_id, candidate_id, *, promote, reason=""):
     contract = load_contract(delegation_id)
     if promote and contract.accepted is not True:
         raise PermissionError("child memory cannot be promoted before parent acceptance")
-    review_token = "processing:" + now_utc()
+    owner = Owner.create("child-memory-review")
     with transaction(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM delegation_memory WHERE delegation_id=? AND candidate_id=? "
+            "AND state='staged'", (delegation_id, candidate_id),
+        ).fetchone()
+        if not row:
+            raise KeyError("unknown staged child memory candidate")
+        if not claim_in_transaction(
+            conn, "delegation-memory-review", f"{delegation_id}:{candidate_id}", owner,
+            lease_seconds=30, metadata={"promote": bool(promote)},
+        ):
+            raise RuntimeError("child memory candidate has a live reviewer")
         changed = conn.execute(
             "UPDATE delegation_memory SET reviewed_at=? WHERE delegation_id=? "
-            "AND candidate_id=? AND state='staged' AND reviewed_at IS NULL",
-            (review_token, delegation_id, candidate_id),
+            "AND candidate_id=? AND state='staged'",
+            ("processing:" + owner.token, delegation_id, candidate_id),
         ).rowcount
     if not changed:
         raise KeyError("unknown staged child memory candidate")
     try:
-        entry = memory.decide_candidate(candidate_id, promote=promote, reason=reason)
+        with connect() as conn:
+            candidate = conn.execute(
+                "SELECT status FROM memory_candidates WHERE id=?", (candidate_id,),
+            ).fetchone()
+        if not candidate:
+            raise KeyError(f"unknown memory candidate: {candidate_id}")
+        if candidate["status"] in {"staged", "reviewing"}:
+            entry = memory.decide_candidate(candidate_id, promote=promote, reason=reason)
+            actual_promote = bool(promote)
+        elif candidate["status"] == "promoted":
+            actual_promote = True
+            entry = memory.inspect("mem-" + candidate_id.removeprefix("cand-"))
+        elif candidate["status"] == "rejected":
+            actual_promote = False
+            entry = None
+        else:
+            raise RuntimeError(f"unsupported memory candidate state: {candidate['status']}")
         with transaction(immediate=True) as conn:
+            stamp = now_utc()
             changed = conn.execute(
                 "UPDATE delegation_memory SET state=?,reviewed_at=? WHERE delegation_id=? "
-                "AND candidate_id=? AND state='staged' AND reviewed_at=?",
-                ("accepted" if promote else "rejected", now_utc(), delegation_id,
-                 candidate_id, review_token)).rowcount
+                "AND candidate_id=? AND state='staged' AND reviewed_at=? "
+                "AND EXISTS (SELECT 1 FROM resource_leases WHERE "
+                "resource_type='delegation-memory-review' AND resource_key=? "
+                "AND owner_token=? AND expires_at>?)",
+                ("accepted" if actual_promote else "rejected", stamp, delegation_id,
+                 candidate_id, "processing:" + owner.token,
+                 f"{delegation_id}:{candidate_id}", owner.token, stamp)).rowcount
             if changed != 1:
                 raise RuntimeError("child memory review ownership changed")
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_type='delegation-memory-review' "
+                "AND resource_key=? AND owner_token=?",
+                (f"{delegation_id}:{candidate_id}", owner.token),
+            )
+        if actual_promote != bool(promote):
+            raise RuntimeError("child memory candidate was already finalized differently")
     except Exception:
         with transaction(immediate=True) as conn:
             conn.execute(
                 "UPDATE delegation_memory SET reviewed_at=NULL WHERE delegation_id=? "
                 "AND candidate_id=? AND state='staged' AND reviewed_at=?",
-                (delegation_id, candidate_id, review_token))
+                (delegation_id, candidate_id, "processing:" + owner.token))
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_type='delegation-memory-review' "
+                "AND resource_key=? AND owner_token=?",
+                (f"{delegation_id}:{candidate_id}", owner.token),
+            )
         raise
     return entry
