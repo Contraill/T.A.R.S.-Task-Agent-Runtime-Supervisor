@@ -3,12 +3,50 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
 SCHEMA_VERSION = 17
+BASE_SCHEMA_VERSION = 3
+
+# Schema objects were introduced monotonically in the public state-store history.
+# Keeping this provenance explicit lets startup apply one real version transition at
+# a time instead of confusing an idempotent latest-schema bootstrap with migration.
+_SCHEMA_INTRODUCED = {
+    "meta": 3, "conversations": 3, "messages": 3, "idx_messages_conversation_seq": 3,
+    "tasks": 3, "idx_tasks_state_updated": 3, "idx_tasks_conversation": 3,
+    "idx_tasks_schedule": 3, "task_events": 3, "idx_task_events_task_id": 3,
+    "checkpoints": 3, "idx_checkpoints_task_seq": 3,
+    "checkpoints_immutable_update": 3, "checkpoints_immutable_delete": 3,
+    "context_projections": 3, "idx_context_projection_conversation_role": 3,
+    "task_runs": 3, "idx_task_runs_task_created": 3, "idx_task_runs_state": 3,
+    "delegations": 4, "idx_delegations_parent_created": 4, "handoffs": 4,
+    "idx_handoffs_task_created": 4, "routing_decisions": 4,
+    "idx_routing_task_created": 4, "sessions": 5,
+    "idx_sessions_conversation_updated": 5, "state_events": 5,
+    "idx_state_events_session_id": 5, "idx_state_events_task_id": 5,
+    "role_state": 5, "project_refs": 5, "memory_index": 6,
+    "idx_memory_scope_updated": 6, "memory_fts": 6, "memory_candidates": 6,
+    "context_epochs": 7, "idx_context_epochs_task_epoch": 7,
+    "memory_maintenance_runs": 8, "idx_memory_maintenance_created": 8,
+    "policy_rules": 9, "idx_policy_rules_effect_target": 9, "approvals": 9,
+    "idx_approvals_state_created": 9, "action_journal": 9,
+    "idx_action_journal_created": 9, "idx_action_journal_task": 9,
+    "evidence_records": 10, "idx_evidence_task_created": 10,
+    "task_controls": 11, "idx_task_controls_pending": 11,
+    "workspace_checkpoints": 12, "idx_workspace_checkpoints_task_created": 12,
+    "delegation_contracts": 13, "delegation_memory": 13, "mcp_servers": 14,
+    "schedules": 15, "idx_schedules_active_task": 15, "idx_schedules_due": 15,
+    "schedule_runs": 15, "idx_schedule_runs_planned": 15,
+    "idx_schedule_runs_state": 15, "schedule_deliveries": 15,
+    "idx_schedule_deliveries_state": 15, "core_clients": 16,
+    "idx_core_clients_state": 16, "core_pairings": 16,
+    "idx_core_pairings_expiry": 16, "runtime_routes": 17,
+    "idx_runtime_routes_task_created": 17,
+}
 
 
 def now_utc() -> str:
@@ -29,13 +67,26 @@ def json_loads(value, default=None):
 
 
 def connect() -> sqlite3.Connection:
-    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE_DB_PATH.parent, 0o700)
+    if not STATE_DB_PATH.exists():
+        try:
+            fd = os.open(STATE_DB_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
+    os.chmod(STATE_DB_PATH, 0o600)
     conn = sqlite3.connect(STATE_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 10000")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(STATE_DB_PATH) + suffix)
+        if path.exists():
+            os.chmod(path, 0o600)
     return conn
 
 
@@ -620,23 +671,122 @@ def _schema_sql() -> str:
     """
 
 
-def ensure_state_store() -> Path:
-    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = connect()
+def _schema_statements():
+    statement = ""
+    for line in _schema_sql().splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            value = statement.strip()
+            if value:
+                yield value
+            statement = ""
+    if statement.strip():
+        raise RuntimeError("incomplete authoritative schema statement")
+
+
+def _schema_object_name(statement: str) -> str:
+    words = statement.replace("(", " ").split()
     try:
-        conn.executescript(_schema_sql())
-        conn.execute(
-            """UPDATE core_clients SET state='revoked',revoked_at=COALESCE(revoked_at, ?)
-               WHERE state='active' AND token_hash NOT LIKE 'v2$%'""",
-            (now_utc(),),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
-        conn.commit()
+        marker = words.index("EXISTS")
+    except ValueError as exc:
+        raise RuntimeError(f"schema statement lacks IF NOT EXISTS: {statement[:80]}") from exc
+    return words[marker + 1]
+
+
+def _apply_schema_level(conn: sqlite3.Connection, version: int) -> None:
+    names = {name for name, introduced in _SCHEMA_INTRODUCED.items()
+             if introduced == version}
+    applied = set()
+    for statement in _schema_statements():
+        name = _schema_object_name(statement)
+        if name in names:
+            conn.execute(statement)
+            applied.add(name)
+    missing = names - applied
+    if missing:
+        raise RuntimeError(f"migration v{version - 1}->v{version} has no SQL for: "
+                           f"{', '.join(sorted(missing))}")
+
+
+def _expected_schema() -> dict[str, tuple[str, ...]]:
+    expected = {}
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        for statement in _schema_statements():
+            conn.execute(statement)
+        for name in _SCHEMA_INTRODUCED:
+            row = conn.execute(
+                "SELECT type FROM sqlite_master WHERE name=?", (name,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"authoritative schema object missing: {name}")
+            expected[name] = tuple(
+                item[1] for item in conn.execute(f'PRAGMA table_info("{name}")'))
     finally:
         conn.close()
+    return expected
+
+
+def schema_errors(conn: sqlite3.Connection) -> list[str]:
+    errors = []
+    for name, columns in _expected_schema().items():
+        row = conn.execute("SELECT type FROM sqlite_master WHERE name=?", (name,)).fetchone()
+        if row is None:
+            errors.append(f"missing schema object: {name}")
+            continue
+        actual = tuple(item[1] for item in conn.execute(f'PRAGMA table_info("{name}")'))
+        if actual != columns:
+            errors.append(f"schema columns differ for {name}: {actual!r} != {columns!r}")
+    return errors
+
+
+def migrate_connection(conn: sqlite3.Connection) -> int:
+    """Upgrade an opened state database through ordered, atomic schema transitions."""
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "meta" not in tables:
+        version = 0
+    else:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if row is None:
+            raise RuntimeError("state database has a meta table but no schema_version")
+        try:
+            version = int(row[0])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"invalid state schema version: {row[0]!r}") from exc
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"state schema {version} is newer than supported {SCHEMA_VERSION}")
+    if version and version < BASE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"state schema {version} predates the supported SQLite baseline "
+            f"{BASE_SCHEMA_VERSION}")
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if version == 0:
+            _apply_schema_level(conn, BASE_SCHEMA_VERSION)
+            version = BASE_SCHEMA_VERSION
+            conn.execute(
+                "INSERT INTO meta(key,value) VALUES('schema_version',?)", (str(version),))
+        while version < SCHEMA_VERSION:
+            target = version + 1
+            _apply_schema_level(conn, target)
+            conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(target),))
+            version = target
+        errors = schema_errors(conn)
+        if errors:
+            raise RuntimeError("state schema validation failed: " + "; ".join(errors))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return version
+
+
+def ensure_state_store() -> Path:
+    ensure_state_store_no_migration()
     migrate_legacy_task_store()
     return STATE_DB_PATH
 
@@ -665,17 +815,13 @@ def ensure_state_store_no_migration() -> Path:
     STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = connect()
     try:
-        conn.executescript(_schema_sql())
-        conn.execute(
-            """UPDATE core_clients SET state='revoked',revoked_at=COALESCE(revoked_at, ?)
-               WHERE state='active' AND token_hash NOT LIKE 'v2$%'""",
-            (now_utc(),),
-        )
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(SCHEMA_VERSION),),
-        )
-        conn.commit()
+        migrate_connection(conn)
+        with conn:
+            conn.execute(
+                """UPDATE core_clients SET state='revoked',revoked_at=COALESCE(revoked_at, ?)
+                   WHERE state='active' AND token_hash NOT LIKE 'v2$%'""",
+                (now_utc(),),
+            )
     finally:
         conn.close()
     return STATE_DB_PATH
@@ -690,12 +836,14 @@ def health() -> dict:
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()
         version = int(version_row[0]) if version_row else 0
+        shape_errors = schema_errors(conn)
         counts = {}
         for table in ("conversations", "messages", "sessions", "state_events", "tasks", "task_events", "checkpoints", "context_projections", "context_epochs", "task_runs", "delegations", "delegation_contracts", "delegation_memory", "mcp_servers", "handoffs", "routing_decisions", "role_state", "project_refs", "memory_index", "memory_candidates", "memory_maintenance_runs", "policy_rules", "approvals", "action_journal", "evidence_records", "task_controls", "workspace_checkpoints", "schedules", "schedule_runs", "schedule_deliveries", "core_clients", "core_pairings", "runtime_routes"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {
-            "ok": integrity == "ok" and version == SCHEMA_VERSION,
+            "ok": integrity == "ok" and version == SCHEMA_VERSION and not shape_errors,
             "integrity": integrity,
+            "schema_errors": shape_errors,
             "schema_version": version,
             "expected_schema_version": SCHEMA_VERSION,
             "counts": counts,
@@ -722,8 +870,9 @@ def migrate_legacy_task_store() -> None:
     if _legacy_migrated():
         return
 
-    # Import is deliberately best-effort per record. A malformed historical file
-    # never prevents the new state store from opening.
+    # Valid records are committed even when peers are malformed. Failures remain
+    # observable and keep the import retryable; stable event IDs make retries safe.
+    failures = []
     with transaction(immediate=True) as conn:
         if TASK_ROOT.exists():
             for path in sorted(TASK_ROOT.glob("task-*.json")):
@@ -777,36 +926,40 @@ def migrate_legacy_task_store() -> None:
                                 payload, "[]", hashlib.sha256(payload.encode()).hexdigest(),
                             ),
                         )
-                except Exception:
-                    continue
+                except Exception as exc:
+                    failures.append({"source": str(path), "error": str(exc)})
 
         if TASK_EVENTS_ROOT.exists():
-            import uuid
             for path in sorted(TASK_EVENTS_ROOT.glob("task-*.jsonl")):
                 task_id = path.stem
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                for line_number, line in enumerate(
+                        path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
                     try:
                         event = json.loads(line)
                         exists = conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone()
                         if not exists:
-                            continue
+                            raise ValueError(f"unknown legacy task: {task_id}")
+                        import hashlib
+                        event_uuid = "evt-legacy-" + hashlib.sha256(
+                            f"{path.name}:{line_number}:{line}".encode()).hexdigest()
                         conn.execute(
                             """
-                            INSERT INTO task_events(
+                            INSERT OR IGNORE INTO task_events(
                                 event_uuid, task_id, conversation_id, timestamp, type,
                                 source_role, message, payload_json, visibility
                             ) VALUES(?,?,?,?,?,?,?,?,?)
                             """,
                             (
-                                "evt-" + uuid.uuid4().hex,
+                                event_uuid,
                                 task_id, None, event.get("timestamp") or now_utc(),
                                 event.get("type", "status"), event.get("role"),
                                 event.get("message", ""), json_dumps(event.get("data", {})),
                                 "normal",
                             ),
                         )
-                    except Exception:
-                        continue
+                    except Exception as exc:
+                        failures.append({"source": f"{path}:{line_number}",
+                                         "error": str(exc)})
 
         # Preserve active-task pointer if v0.3 had one.
         if TASK_INDEX_PATH.exists():
@@ -818,9 +971,10 @@ def migrate_legacy_task_store() -> None:
                         "INSERT OR REPLACE INTO meta(key,value) VALUES('active_task_id',?)",
                         (active,),
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                failures.append({"source": str(TASK_INDEX_PATH), "error": str(exc)})
 
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('legacy_task_store_migrated','1')"
-        )
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (
+            "legacy_task_store_failures", json_dumps(failures)))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (
+            "legacy_task_store_migrated", "0" if failures else "1"))

@@ -32,7 +32,8 @@ def _from_row(row) -> CheckpointRecord:
     )
 
 
-def create_checkpoint(task_id, state: dict, *, reason="", evidence_refs=None, advance_epoch=False) -> CheckpointRecord:
+def create_checkpoint(task_id, state: dict | None = None, *, reason="", evidence_refs=None,
+                      advance_epoch=False) -> CheckpointRecord:
     """Atomically persist an immutable task snapshot.
 
     The checkpoint row itself can never be UPDATEd or DELETEd due to DB triggers.
@@ -40,14 +41,22 @@ def create_checkpoint(task_id, state: dict, *, reason="", evidence_refs=None, ad
     succeeds in the same SQLite transaction.
     """
     ensure_state_store()
-    payload = json_dumps(state)
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     cp_id = "cp-" + uuid.uuid4().hex
     stamp = now_utc()
     with transaction(immediate=True) as conn:
         task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not task:
             raise KeyError(f"unknown task: {task_id}")
+        if state is None:
+            from .tasks import canonical_task_state_from_row
+            state = canonical_task_state_from_row(task, conn)
+        for key, actual in (("task_id", task_id), ("owner_role", task["owner_role"]),
+                            ("epoch", int(task["epoch"]))):
+            if key in state and state[key] != actual:
+                raise RuntimeError(
+                    f"checkpoint {key} does not match locked task snapshot")
+        payload = json_dumps(state)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         seq = conn.execute(
             "SELECT COALESCE(MAX(seq),0)+1 FROM checkpoints WHERE task_id=?",
             (task_id,),
@@ -61,7 +70,8 @@ def create_checkpoint(task_id, state: dict, *, reason="", evidence_refs=None, ad
             ) VALUES(?,?,?,?,?,?,?,?,?,?)
             """,
             (cp_id, task_id, epoch, seq, stamp, task["owner_role"], reason,
-             payload, json_dumps(list(evidence_refs or [])), digest),
+             payload, json_dumps(list(evidence_refs) if evidence_refs is not None else
+                                 json_loads(task["evidence_refs_json"], [])), digest),
         )
         if advance_epoch:
             conn.execute(

@@ -253,46 +253,46 @@ def update_task(
     return task
 
 
-def canonical_task_state(task_id) -> dict:
-    task = load_task(task_id)
-    from .control_queue import latest_redirect
-    redirect = latest_redirect(task_id)
+def canonical_task_state_from_row(row, conn) -> dict:
+    redirect = conn.execute(
+        "SELECT message FROM task_controls WHERE task_id=? AND kind='redirect' "
+        "AND state='applied' ORDER BY seq DESC LIMIT 1", (row["id"],)).fetchone()
     return {
-        "task_id": task.id,
-        "title": task.title,
-        "goal": task.goal,
-        "current_instruction": redirect.message if redirect else task.goal,
-        "owner_role": task.owner_role,
-        "state": task.state,
-        "kind": task.kind,
-        "phase": task.phase,
-        "progress": task.progress,
-        "epoch": task.epoch,
-        "constraints": list(task.constraints),
-        "decisions": list(task.decisions),
-        "completed": list(task.completed),
-        "open_steps": list(task.open_steps),
-        "failures": list(task.failures),
-        "evidence_refs": list(task.evidence_refs),
-        "parent_task_id": task.parent_task_id,
-        "conversation_id": task.conversation_id,
+        "task_id": row["id"], "title": row["title"], "goal": row["goal"],
+        "current_instruction": redirect["message"] if redirect else row["goal"],
+        "owner_role": row["owner_role"], "state": row["state"], "kind": row["kind"],
+        "phase": row["phase"], "progress": row["progress"], "epoch": row["epoch"],
+        "constraints": json_loads(row["constraints_json"], []),
+        "decisions": json_loads(row["decisions_json"], []),
+        "completed": json_loads(row["completed_json"], []),
+        "open_steps": json_loads(row["open_steps_json"], []),
+        "failures": json_loads(row["failures_json"], []),
+        "evidence_refs": json_loads(row["evidence_refs_json"], []),
+        "parent_task_id": row["parent_task_id"], "conversation_id": row["conversation_id"],
         "schedule": {
-            "kind": task.schedule_kind,
-            "expr": task.schedule_expr,
-            "next_run_at": task.next_run_at,
-            "last_run_at": task.last_run_at,
-            "last_result_status": task.last_result_status,
-            "enabled": task.schedule_enabled,
+            "kind": row["schedule_kind"], "expr": row["schedule_expr"],
+            "next_run_at": row["next_run_at"], "last_run_at": row["last_run_at"],
+            "last_result_status": row["last_result_status"],
+            "enabled": bool(row["schedule_enabled"]),
         },
     }
 
 
+def canonical_task_state(task_id) -> dict:
+    ensure_state_store()
+    conn = connect()
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise KeyError(f"unknown task: {task_id}")
+        return canonical_task_state_from_row(row, conn)
+    finally:
+        conn.close()
+
+
 def checkpoint_task(task_id, *, reason="manual checkpoint", advance_epoch=False):
-    task = load_task(task_id)
-    state = canonical_task_state(task_id)
     return create_checkpoint(
-        task_id, state, reason=reason, evidence_refs=task.evidence_refs,
-        advance_epoch=advance_epoch,
+        task_id, reason=reason, advance_epoch=advance_epoch,
     )
 
 

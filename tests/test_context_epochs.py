@@ -38,6 +38,34 @@ def test_epoch_rollover_checkpoints_archives_and_protects_truth(isolated_state):
     assert state_store.health()["schema_version"] == 17
 
 
+def test_rollover_snapshot_owner_and_epoch_are_read_under_write_lock(
+        monkeypatch, isolated_state):
+    conv = conversation.create_conversation(title="race")
+    task = tasks.create_task("original", "general", conversation_id=conv.id)
+    conversation.add_message(conv.id, "user", "old")
+    conversation.add_message(conv.id, "assistant", "answer")
+    conversation.add_message(conv.id, "user", "latest")
+    original_transaction = context_epochs.transaction
+    changed = False
+
+    def racing_transaction(*, immediate=False):
+        nonlocal changed
+        if not changed:
+            changed = True
+            with state_store.transaction(immediate=True) as conn:
+                conn.execute(
+                    "UPDATE tasks SET owner_role='builder',epoch=2,goal='new truth' WHERE id=?",
+                    (task.id,))
+        return original_transaction(immediate=immediate)
+
+    monkeypatch.setattr(context_epochs, "transaction", racing_transaction)
+    epoch = context_epochs.rollover(task.id)
+    checkpoint = checkpoints.latest_checkpoint(task.id)
+    assert epoch.epoch == checkpoint.epoch == 2
+    assert checkpoint.owner_role == checkpoint.state["owner_role"] == "builder"
+    assert checkpoint.state["goal"] == "new truth"
+
+
 def test_rollover_without_eligible_history_is_safe(isolated_state):
     conv = conversation.create_conversation()
     task = tasks.create_task("short", "general", conversation_id=conv.id)

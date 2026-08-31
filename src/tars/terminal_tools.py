@@ -39,6 +39,8 @@ def _stamp():
 class ProcessManager:
     def __init__(self, *, log_root=None, runtime=None, secret_store=None):
         self.log_root = Path(log_root or (STATE_ROOT / "process-logs"))
+        self.log_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.log_root.chmod(0o700)
         self.runtime = runtime or ToolRuntime()
         self.secret_store = secret_store or SecretStore()
         self._processes = {}
@@ -63,10 +65,12 @@ class ProcessManager:
         )
         process_id = "process-" + uuid.uuid4().hex
         root = self.log_root / process_id
-        root.mkdir(parents=True, exist_ok=False)
+        root.mkdir(parents=True, exist_ok=False, mode=0o700)
         stdout_path, stderr_path = root / "stdout.log", root / "stderr.log"
         stdout_handle = stdout_path.open("wb")
         stderr_handle = stderr_path.open("wb")
+        stdout_path.chmod(0o600)
+        stderr_path.chmod(0o600)
         argv = ["/bin/bash", "-lc", request.argv[0]] if request.shell else list(request.argv)
         environment = os.environ.copy()
         try:
@@ -267,6 +271,8 @@ class TerminalTools:
         self.processes = processes or ProcessManager()
         self.output_limit = output_limit
         self.log_root = Path(log_root or (STATE_ROOT / "process-logs"))
+        self.log_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.log_root.chmod(0o700)
         self.runtime = self.processes.runtime
 
     def run(self, argv, *, cwd=None, target="host", timeout=300, shell=False,

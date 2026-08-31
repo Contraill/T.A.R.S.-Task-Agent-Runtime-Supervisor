@@ -1,4 +1,7 @@
+import json
+import os
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +45,21 @@ def test_schema_session_event_role_and_project_state(monkeypatch, isolated_state
     assert health["counts"]["sessions"] == 1 and health["counts"]["state_events"] == 4
 
 
+def test_state_database_and_directory_permissions_are_repaired(isolated_state):
+    isolated_state.parent.chmod(0o755)
+    state_store.ensure_state_store()
+    isolated_state.chmod(0o644)
+    isolated_state.parent.chmod(0o755)
+    with state_store.connect():
+        pass
+    assert os.stat(isolated_state.parent).st_mode & 0o777 == 0o700
+    assert os.stat(isolated_state).st_mode & 0o777 == 0o600
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(isolated_state) + suffix)
+        if sidecar.exists():
+            assert os.stat(sidecar).st_mode & 0o777 == 0o600
+
+
 def test_append_event_transaction_rolls_back_on_invalid_reference(isolated_state):
     with pytest.raises(Exception):
         state_events.append_state_event("activity", task_id="missing")
@@ -56,6 +74,81 @@ def test_schema_upgrade_preserves_existing_conversation(isolated_state):
     state_store.ensure_state_store()
     assert conversation.load_conversation(conv.id).title == "before upgrade"
     assert state_store.health()["schema_version"] == 17
+
+
+def test_real_v16_layout_is_migrated_in_order(isolated_state):
+    conn = sqlite3.connect(isolated_state)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        for version in range(state_store.BASE_SCHEMA_VERSION,
+                             state_store.SCHEMA_VERSION):
+            state_store._apply_schema_level(conn, version)
+        conn.execute("INSERT INTO meta(key,value) VALUES('schema_version','16')")
+        conn.execute(
+            "INSERT INTO conversations(id,title,created_at,updated_at) VALUES(?,?,?,?)",
+            ("conv-old", "historical", "2026-01-01", "2026-01-01"))
+        conn.commit()
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='runtime_routes'").fetchone() is None
+    finally:
+        conn.close()
+
+    state_store.ensure_state_store_no_migration()
+    conn = sqlite3.connect(isolated_state)
+    try:
+        assert conn.execute(
+            "SELECT title FROM conversations WHERE id='conv-old'").fetchone()[0] == "historical"
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "17"
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='runtime_routes'").fetchone()
+    finally:
+        conn.close()
+
+
+def test_failed_migration_never_advances_version(monkeypatch, isolated_state):
+    conn = sqlite3.connect(isolated_state)
+    state_store._apply_schema_level(conn, state_store.BASE_SCHEMA_VERSION)
+    conn.execute("INSERT INTO meta(key,value) VALUES('schema_version','3')")
+    conn.commit()
+    conn.close()
+    original = state_store._apply_schema_level
+
+    def fail_at_v17(conn, version):
+        if version == 17:
+            raise RuntimeError("injected migration failure")
+        original(conn, version)
+
+    monkeypatch.setattr(state_store, "_apply_schema_level", fail_at_v17)
+    with pytest.raises(RuntimeError, match="injected migration failure"):
+        state_store.ensure_state_store_no_migration()
+    conn = sqlite3.connect(isolated_state)
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "3"
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='runtime_routes'").fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_legacy_import_failures_are_observable_retryable_and_idempotent(isolated_state):
+    state_store.TASK_ROOT.mkdir()
+    valid = {"id": "task-valid", "goal": "keep", "owner_role": "general"}
+    (state_store.TASK_ROOT / "task-valid.json").write_text(json.dumps(valid))
+    malformed = state_store.TASK_ROOT / "task-bad.json"
+    malformed.write_text("{")
+
+    state_store.ensure_state_store()
+    assert state_store.get_meta("legacy_task_store_migrated") == "0"
+    failures = json.loads(state_store.get_meta("legacy_task_store_failures"))
+    assert failures and failures[0]["source"].endswith("task-bad.json")
+
+    malformed.write_text(json.dumps({"id": "task-bad", "goal": "retry"}))
+    state_store.ensure_state_store()
+    assert state_store.get_meta("legacy_task_store_migrated") == "1"
+    with state_store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
 
 
 def test_identity_inheritance_and_prompt_explain(monkeypatch, tmp_path):

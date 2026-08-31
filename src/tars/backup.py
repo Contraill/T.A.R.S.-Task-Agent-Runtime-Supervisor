@@ -249,11 +249,7 @@ def _read_and_validate(bundle, staging):
             raise ValueError(
                 f"database schema {database_schema} does not match manifest "
                 f"{manifest['schema_version']}")
-        conn.executescript(state_store._schema_sql())
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
-            (str(state_store.SCHEMA_VERSION),))
-        conn.commit()
+        state_store.migrate_connection(conn)
     finally:
         conn.close()
     for member in ("config/config.toml", "config/ui.toml",
