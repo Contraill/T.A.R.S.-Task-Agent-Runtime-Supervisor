@@ -36,6 +36,8 @@ Memory           ScopeGuard
 
 **Secrets are references at rest.** SecretStore resolves provider references only at a named consumer boundary. Execution, SSH, MCP, web-service and remote Core client paths receive scoped values at the last responsible moment; values do not enter prompts or durable configuration.
 
+**Portable state is validated before mutation.** Versioned bundles snapshot canonical SQLite state online, checksum every included file and migrate in staging. Heavy model assets and credential values never enter normal bundles; restore reports environmental deltas without claiming reversal of external effects.
+
 **One task has one owner.** Delegation does not change ownership. Handoff does, and must be transactional.
 
 **Security is deterministic.** ScopeGuard and the tool executor decide what can run. The model does not grant itself permission.

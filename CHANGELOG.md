@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.6 - Backup, Restore and Migration
+
+- added checksummed, versioned portable state bundles backed by live SQLite snapshots
+- excluded model weights, secret values, browser state, caches and process logs by design
+- retained portable client metadata while revoking credentials and deleting pairing material
+- validated archive topology, checksums, database integrity and schema compatibility before restore
+- added staged local rollback, schema migration and truthful post-restore reconciliation results
+
 ## 0.8.5 - SecretStore
 
 - added provider-based secret references with explicit consumer scope enforcement

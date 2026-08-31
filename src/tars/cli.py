@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import asdict
 import json
 import shutil
 import ssl
@@ -134,6 +135,7 @@ from .core_api import CoreAPI, CoreServerConfig, make_server
 from .runtime_routing import LocalRuntimeRouter
 from .extensions import ExtensionLoader
 from .secret_store import SecretStore
+from .backup import create_bundle, inspect_bundle, restore_bundle
 
 console = Console()
 
@@ -1802,6 +1804,21 @@ def command_workspace(args):
     return 0 if result.succeeded else 1
 
 
+def command_backup(args):
+    try:
+        if args.backup_command == "create":
+            report = create_bundle(args.path)
+        elif args.backup_command == "inspect":
+            report = inspect_bundle(args.path)
+        else:
+            report = restore_bundle(args.path, replace=args.replace)
+    except (OSError, ValueError, RuntimeError, PermissionError, KeyError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    console.print_json(data=asdict(report))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="tars")
     parser.add_argument("--version", action="version", version=__version__)
@@ -1817,6 +1834,16 @@ def build_parser():
     sub.add_parser("paths")
     sub.add_parser("doctor")
     sub.add_parser("help", help="show top-level help")
+
+    backup = sub.add_parser("backup", help="create, inspect or restore portable state bundles")
+    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    for name in ("create", "inspect"):
+        item = backup_sub.add_parser(name)
+        item.add_argument("path")
+    backup_restore = backup_sub.add_parser("restore")
+    backup_restore.add_argument("path")
+    backup_restore.add_argument("--replace", action="store_true", required=True,
+                                help="explicitly replace local T.A.R.S. state")
 
     scope = sub.add_parser("scope", help="inspect deterministic execution policy")
     scope_sub = scope.add_subparsers(dest="scope_command", required=True)
@@ -2258,14 +2285,17 @@ def build_parser():
 
 
 def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command == "backup":
+        return command_backup(args)
+
     ensure_registry()
     ensure_role_registry()
     ensure_seed_calibrations()
     ensure_task_store()
     ensure_ui_store()
 
-    parser = build_parser()
-    args = parser.parse_args()
     cfg = load_config()
 
     if args.command is None:

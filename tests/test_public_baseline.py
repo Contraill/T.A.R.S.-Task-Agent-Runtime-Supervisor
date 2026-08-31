@@ -4,7 +4,7 @@ from tars import config
 
 
 def test_version():
-    assert __version__ == "0.8.5"
+    assert __version__ == "0.8.6"
 
 
 def test_legacy_role_aliases():

@@ -98,6 +98,9 @@ def test_core_client_cli_surface():
     assert pair.permission == ["task.read"]
     assert parser.parse_args(["client", "revoke", "client-one"]).client_id == "client-one"
     assert parser.parse_args(["extension", "list"]).extension_command == "list"
+    assert parser.parse_args(["backup", "create", "state.tarsbundle"]).backup_command == "create"
+    restored = parser.parse_args(["backup", "restore", "state.tarsbundle", "--replace"])
+    assert restored.backup_command == "restore" and restored.replace
 
 
 def test_policy_approval_and_audit_cli_parsing():

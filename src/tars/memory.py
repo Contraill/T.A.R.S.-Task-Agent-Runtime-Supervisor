@@ -242,13 +242,32 @@ def forget(entry_id):
     return archived
 
 
-def rebuild_index():
-    ensure_state_store()
+def rebuild_index(*, memory_root=None, state_db_path=None):
+    root = Path(memory_root) if memory_root is not None else MEMORY_ROOT
+    if state_db_path is None:
+        ensure_state_store()
     entries = []
     for kind in sorted(MEMORY_KINDS):
-        for path in sorted((MEMORY_ROOT / kind).glob("mem-*.md")):
+        for path in sorted((root / kind).glob("mem-*.md")):
             entries.append(_parse(path))
-    with transaction(immediate=True) as conn:
+    if state_db_path is None:
+        context = transaction(immediate=True)
+    else:
+        from contextlib import contextmanager
+        @contextmanager
+        def local_transaction():
+            conn = sqlite3.connect(state_db_path)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        context = local_transaction()
+    with context as conn:
         conn.execute("DELETE FROM memory_fts")
         conn.execute("DELETE FROM memory_index")
         for entry in entries:

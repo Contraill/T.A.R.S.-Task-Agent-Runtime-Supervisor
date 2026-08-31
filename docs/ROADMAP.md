@@ -299,11 +299,17 @@ Status: implemented.
 
 See [SECRETS.md](SECRETS.md) for reference and consumer behavior.
 
-### Remaining v0.8.x work
+### v0.8.6 — Backup, restore and migration
 
-- versioned backup/restore/migration
+Status: implemented.
 
-Normal portable bundles exclude model weights and include calibration history. Restore performs environment recognition, then Welcome Back.
+- checksummed and versioned `.tarsbundle` format with live SQLite snapshots
+- model weights, secrets, browser state, caches and process logs excluded by default
+- portable client metadata retained without transferable bearer verification material
+- complete pre-mutation validation, schema-aware migration and staged local rollback
+- truthful destination reconciliation for missing model assets and unresolved secrets
+
+The v0.8 family is complete. Installer and interactive Welcome Back presentation remain v0.9 work.
 
 ## v0.9.0 — installer/setup
 
