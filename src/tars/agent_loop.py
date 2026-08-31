@@ -10,7 +10,7 @@ import time
 from .approvals import ApprovalBroker
 from .checkpoints import create_checkpoint
 from .context import ContextManager
-from .control_queue import (annotate, claim_next, enqueue, finish as finish_control,
+from .control_queue import (claim_next, enqueue, finish as finish_control,
                             pending_context, recover_processing)
 from .conversation import add_message
 from .evidence import load as load_evidence
@@ -278,29 +278,25 @@ class AgentLoop:
         self._active_tool = ""
 
     def submit_control(self, kind, message="", *, session_id=None, payload=None):
-        cancellation = None
-        binding = None
-        tool = ""
+        cancellation = {}
         if kind in {"interrupt", "cancel"}:
             with self._active_lock:
                 binding, tool = self._active_binding, self._active_tool
-            cancellation = {"cancellation_requested": False,
-                            "cancellable": bool(binding and binding.cancellable)}
+            cancellation = {"cancellation_requested": False, "cancellable": False}
             if binding is not None:
                 cancellation["active_tool"] = tool
+                cancellation["cancellable"] = binding.cancellable
+                if binding.cancellable:
+                    try:
+                        cancellation["cancellation_result"] = binding.cancel()
+                        cancellation["cancellation_requested"] = True
+                    except Exception as exc:
+                        cancellation["cancellation_error"] = str(exc)
         combined_payload = dict(payload or {})
-        if cancellation is not None:
+        if cancellation:
             combined_payload |= cancellation
         control = enqueue(self.task_id, kind, message,
                           session_id=session_id, payload=combined_payload)
-        if binding is not None and binding.cancellable:
-            try:
-                truth = binding.cancel()
-                cancellation["cancellation_requested"] = True
-                cancellation["cancellation_result"] = truth
-            except Exception as exc:
-                cancellation["cancellation_error"] = str(exc)
-            annotate(control.id, cancellation)
         feedback = QUEUED_MESSAGE if kind == "message" and self._active_binding else "Control queued."
         return control, feedback
 

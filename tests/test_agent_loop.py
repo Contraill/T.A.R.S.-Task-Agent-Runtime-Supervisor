@@ -171,8 +171,16 @@ def test_queued_messages_preserve_order_and_reach_next_inference(loop_state):
     assert [item.state for item in control_queue.list_controls(task.id)] == ["applied", "applied"]
 
 
-@pytest.mark.parametrize("cancellable", [True, False])
-def test_immediate_interrupt_records_actual_cancellation_truth(loop_state, cancellable):
+@pytest.mark.parametrize(
+    ("mode", "expect_requested", "expect_result", "expect_error", "expect_cancel_called"),
+    (
+        ("success", True, True, False, True),
+        ("raises", False, False, True, True),
+        ("non-cancellable", False, False, False, False),
+    ),
+)
+def test_immediate_interrupt_records_durable_cancellation_outcome(
+        loop_state, mode, expect_requested, expect_result, expect_error, expect_cancel_called):
     task, conv = loop_state
     started = threading.Event()
     release = threading.Event()
@@ -181,13 +189,18 @@ def test_immediate_interrupt_records_actual_cancellation_truth(loop_state, cance
     def execute(task_id=None):
         started.set()
         assert release.wait(5)
-        return result_for(task_id, tool="terminal.run",
-                          state="failed" if cancellable else "succeeded",
-                          error="cancelled" if cancellable else "")
+        if mode == "success":
+            return result_for(task_id, tool="terminal.run", state="failed", error="cancelled")
+        if mode == "raises":
+            return result_for(task_id, tool="terminal.run", state="failed", error="cancel failed")
+        return result_for(task_id, tool="terminal.run")
 
     def cancel():
         cancel_called.append(True)
-        release.set()
+        if mode == "raises":
+            release.set()
+            raise RuntimeError("cancel boom")
+        release.set()  # allows immediate boundary completion racing control terminalization
         return {"requested": True, "signal": "TERM"}
 
     decisions = iter((
@@ -195,7 +208,7 @@ def test_immediate_interrupt_records_actual_cancellation_truth(loop_state, cance
         {"type": "finish", "summary": "redirected after interrupt"},
     ))
     dispatcher = agent_loop.ToolDispatcher().register(
-        "terminal.run", execute, cancel=cancel if cancellable else None,
+        "terminal.run", execute, cancel=cancel if mode != "non-cancellable" else None,
         retry_safe=True,
     )
     loop = agent_loop.AgentLoop(
@@ -207,14 +220,23 @@ def test_immediate_interrupt_records_actual_cancellation_truth(loop_state, cance
     thread.start()
     assert started.wait(5)
     control, _ = loop.submit_control("interrupt", "stop and inspect")
-    if not cancellable:
+    if mode == "non-cancellable":
         release.set()
     thread.join(5)
     assert not thread.is_alive()
     recorded = control_queue.load(control.id)
     assert recorded.state == "applied"
-    assert recorded.payload.get("cancellable") is cancellable
-    assert bool(cancel_called) is cancellable
+    assert recorded.payload.get("active_tool") == "terminal.run"
+    assert recorded.payload.get("cancellable") is (mode != "non-cancellable")
+    assert recorded.payload.get("cancellation_requested") is expect_requested
+    assert ("cancellation_result" in recorded.payload) is expect_result
+    assert ("cancellation_error" in recorded.payload) is expect_error
+    if expect_result:
+        assert recorded.payload["cancellation_result"] == {"requested": True, "signal": "TERM"}
+    if expect_error:
+        assert "cancel boom" in recorded.payload["cancellation_error"]
+    assert bool(cancel_called) is expect_cancel_called
+    assert holder["outcome"].state == "completed"
     messages = [item.content for item in conversation.list_messages(conv.id)
                 if item.kind == "control"]
     assert messages == ["stop and inspect"]
