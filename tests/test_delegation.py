@@ -65,6 +65,20 @@ def test_child_authority_can_only_narrow_parent(delegated, tmp_path):
         )
 
 
+def test_child_task_and_contract_creation_roll_back_together(delegated):
+    parent, _, create = delegated
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            """CREATE TRIGGER fail_contract BEFORE INSERT ON delegation_contracts
+               BEGIN SELECT RAISE(ABORT, 'injected contract failure'); END""")
+    with pytest.raises(Exception, match="injected contract failure"):
+        create()
+    with state_store.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE parent_task_id=?", (parent.id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM delegations").fetchone()[0] == 0
+
+
 def test_child_tool_dispatcher_enforces_tool_effect_and_target_ceiling(delegated, tmp_path):
     _, root, create = delegated
     contract = create()

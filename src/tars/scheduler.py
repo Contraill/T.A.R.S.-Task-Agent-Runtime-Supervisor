@@ -242,10 +242,14 @@ def edit_schedule(schedule_id: str, *, expression=None, next_run_at=None,
                   missed_policy=None, max_catch_up=None, concurrency_key=None,
                   max_concurrency=None, delivery_target=None, now=None) -> Schedule:
     schedule = load_schedule(schedule_id)
+    if schedule.removed_at:
+        raise RuntimeError("removed schedule cannot be edited")
+    current_time = _dt(now or now_utc())
     values = {}
     if expression is not None:
-        _initial_next(schedule.kind, expression, next_run_at, _dt(now or now_utc()))
+        recomputed = _initial_next(schedule.kind, expression, next_run_at, current_time)
         values["expression"] = expression
+        values["next_run_at"] = recomputed
     if next_run_at is not None:
         values["next_run_at"] = _iso(next_run_at)
     if missed_policy is not None:
@@ -262,28 +266,35 @@ def edit_schedule(schedule_id: str, *, expression=None, next_run_at=None,
         values["delivery_target"] = delivery_target
     if not values:
         return schedule
-    values["revision"] = schedule.revision + 1
-    values["updated_at"] = _iso(now or now_utc())
+    values["updated_at"] = _iso(current_time)
     with transaction(immediate=True) as conn:
+        current = conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        if not current:
+            raise KeyError(f"unknown schedule: {schedule_id}")
+        if current["removed_at"] is not None:
+            raise RuntimeError("removed schedule cannot be edited")
+        values["revision"] = current["revision"] + 1
         conn.execute("UPDATE schedules SET " + ",".join(f"{key}=?" for key in values) + " WHERE id=?",
                      (*values.values(), schedule_id))
         updated = conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
         conn.execute("UPDATE tasks SET schedule_expr=?,next_run_at=?,updated_at=? WHERE id=?",
-                     (updated["expression"], updated["next_run_at"], values["updated_at"], schedule.task_id))
+                     (updated["expression"], updated["next_run_at"], values["updated_at"],
+                      current["task_id"]))
     notify_scheduler()
     return load_schedule(schedule_id)
 
 
 def set_enabled(schedule_id: str, enabled: bool) -> Schedule:
-    schedule = load_schedule(schedule_id)
-    if schedule.removed_at:
-        raise RuntimeError("removed schedule cannot be resumed")
+    load_schedule(schedule_id)
     stamp = now_utc()
     with transaction(immediate=True) as conn:
-        conn.execute("UPDATE schedules SET enabled=?,revision=revision+1,updated_at=? WHERE id=?",
-                     (1 if enabled else 0, stamp, schedule_id))
+        current = conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        if current["removed_at"] is not None:
+            raise RuntimeError("removed schedule cannot be resumed")
+        conn.execute("UPDATE schedules SET enabled=?,revision=revision+1,updated_at=? WHERE id=? "
+                     "AND removed_at IS NULL", (1 if enabled else 0, stamp, schedule_id))
         conn.execute("UPDATE tasks SET schedule_enabled=?,updated_at=? WHERE id=?",
-                     (1 if enabled else 0, stamp, schedule.task_id))
+                     (1 if enabled else 0, stamp, current["task_id"]))
     notify_scheduler()
     return load_schedule(schedule_id)
 
@@ -394,40 +405,55 @@ class Scheduler:
                 while (planned_slots[-1] + step <= current and
                        len(planned_slots) < schedule.max_catch_up):
                     planned_slots.append(planned_slots[-1] + step)
-            for planned in planned_slots:
+            for slot_index, planned in enumerate(planned_slots):
                 if len(claimed) >= self.max_concurrency:
                     break
-                checkpoint = latest_checkpoint(schedule.task_id)
                 with transaction(immediate=True) as conn:
+                    current_row = conn.execute(
+                        "SELECT * FROM schedules WHERE id=?", (schedule.id,)).fetchone()
+                    if (not current_row or current_row["removed_at"] is not None
+                            or not current_row["enabled"]
+                            or current_row["revision"] != schedule.revision
+                            or (slot_index == 0
+                                and current_row["next_run_at"] != schedule.next_run_at)):
+                        continue
+                    locked_schedule = _schedule(current_row)
+                    checkpoint = conn.execute(
+                        "SELECT id FROM checkpoints WHERE task_id=? ORDER BY seq DESC LIMIT 1",
+                        (locked_schedule.task_id,)).fetchone()
                     global_active = conn.execute("SELECT COUNT(*) FROM schedule_runs WHERE state IN ('claimed','running')").fetchone()[0]
                     keyed = conn.execute(
                         "SELECT COUNT(*) FROM schedule_runs r JOIN schedules s ON s.id=r.schedule_id "
                         "WHERE r.state IN ('claimed','running') AND s.concurrency_key=?",
-                        (schedule.concurrency_key,)).fetchone()[0]
-                    if global_active >= self.max_concurrency or keyed >= schedule.max_concurrency:
+                        (locked_schedule.concurrency_key,)).fetchone()[0]
+                    if (global_active >= self.max_concurrency
+                            or keyed >= locked_schedule.max_concurrency):
                         break
                     late = planned < current
                     state = "skipped" if late and schedule.missed_policy == "skip" else "claimed"
                     run_id = "sjr-" + uuid.uuid4().hex
-                    key = f"{schedule.id}:{_iso(planned)}:r{schedule.revision}"
+                    key = f"{schedule.id}:{_iso(planned)}:r{locked_schedule.revision}"
                     try:
                         conn.execute(
                             """INSERT INTO schedule_runs(id,schedule_id,task_id,planned_for,
                                idempotency_key,state,attempt,checkpoint_id,claimed_at,finished_at)
                                VALUES(?,?,?,?,?,?,1,?,?,?)""",
-                            (run_id, schedule.id, schedule.task_id, _iso(planned), key, state,
-                             checkpoint.id if checkpoint else None, _iso(current),
+                            (run_id, locked_schedule.id, locked_schedule.task_id,
+                             _iso(planned), key, state,
+                             checkpoint["id"] if checkpoint else None, _iso(current),
                              _iso(current) if state == "skipped" else None),
                         )
                     except Exception as exc:
                         if "UNIQUE" in str(exc):
                             continue
                         raise
-                    next_run = _advance(schedule, planned, current)
+                    next_run = _advance(locked_schedule, planned, current)
                     conn.execute("UPDATE schedules SET next_run_at=?,enabled=?,updated_at=? WHERE id=?",
-                                 (next_run, 0 if next_run is None else 1, _iso(current), schedule.id))
+                                 (next_run, 0 if next_run is None else 1, _iso(current),
+                                  locked_schedule.id))
                     conn.execute("UPDATE tasks SET next_run_at=?,schedule_enabled=?,updated_at=? WHERE id=?",
-                                 (next_run, 0 if next_run is None else 1, _iso(current), schedule.task_id))
+                                 (next_run, 0 if next_run is None else 1, _iso(current),
+                                  locked_schedule.task_id))
                 if state == "claimed":
                     claimed.append(load_run(run_id))
                 else:

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from tars import activity, conversation, identity, prompt_compiler, projects, role_state, sessions
-from tars import state_events, state_store
+from tars import runner, state_events, state_store, tasks
 
 
 @pytest.fixture
@@ -64,6 +64,17 @@ def test_append_event_transaction_rolls_back_on_invalid_reference(isolated_state
     with pytest.raises(Exception):
         state_events.append_state_event("activity", task_id="missing")
     assert state_store.health()["counts"]["state_events"] == 0
+
+
+def test_paused_run_blocks_second_run_and_run_provenance_is_locked(
+        monkeypatch, isolated_state):
+    monkeypatch.setattr(tasks, "resolve_role_id", lambda value: value)
+    conv = conversation.create_conversation()
+    task = tasks.create_task("durable", "general", conversation_id=conv.id)
+    first = runner.create_run(task.id)
+    runner._set_run(first.id, state="paused")
+    with pytest.raises(RuntimeError, match="active run"):
+        runner.create_run(task.id)
 
 
 def test_schema_upgrade_preserves_existing_conversation(isolated_state):

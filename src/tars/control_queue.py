@@ -109,17 +109,23 @@ def claim_next(task_id):
 
 
 def finish(control_id, *, success=True, payload=None):
-    current = load(control_id)
-    if current.state not in {"pending", "processing"}:
-        raise RuntimeError(f"control {control_id} is already {current.state}")
-    merged = current.payload | (payload or {})
     state = "applied" if success else "failed"
     stamp = now_utc()
     with transaction(immediate=True) as conn:
-        conn.execute(
-            "UPDATE task_controls SET state=?,payload_json=?,applied_at=? WHERE id=?",
+        row = conn.execute("SELECT * FROM task_controls WHERE id=?", (control_id,)).fetchone()
+        if not row:
+            raise KeyError(f"unknown control: {control_id}")
+        current = _from_row(row)
+        if current.state not in {"pending", "processing"}:
+            raise RuntimeError(f"control {control_id} is already {current.state}")
+        merged = current.payload | (payload or {})
+        changed = conn.execute(
+            "UPDATE task_controls SET state=?,payload_json=?,applied_at=? WHERE id=? "
+            "AND state IN ('pending','processing')",
             (state, json_dumps(merged), stamp, control_id),
-        )
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"control {control_id} changed concurrently")
     append_state_event(
         "interrupt" if current.kind == "interrupt" else
         current.kind if current.kind in {"cancel", "redirect", "pause", "resume"} else
@@ -132,11 +138,15 @@ def finish(control_id, *, success=True, payload=None):
 
 
 def annotate(control_id, payload):
-    current = load(control_id)
-    if current.state not in {"pending", "processing"}:
-        return current
     with transaction(immediate=True) as conn:
-        conn.execute("UPDATE task_controls SET payload_json=? WHERE id=?",
+        row = conn.execute("SELECT * FROM task_controls WHERE id=?", (control_id,)).fetchone()
+        if not row:
+            raise KeyError(f"unknown control: {control_id}")
+        current = _from_row(row)
+        if current.state not in {"pending", "processing"}:
+            return current
+        conn.execute("UPDATE task_controls SET payload_json=? WHERE id=? "
+                     "AND state IN ('pending','processing')",
                      (json_dumps(current.payload | dict(payload)), control_id))
     return load(control_id)
 

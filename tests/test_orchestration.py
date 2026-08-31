@@ -85,6 +85,20 @@ def test_delegation_preserves_parent_owner(isolated_state):
     assert tasks.load_task(child.id).state == "completed"
 
 
+def test_delegation_completion_rolls_back_if_child_transition_fails(isolated_state):
+    parent = tasks.create_task("parent", "maker", make_active=False)
+    item = orch.create_delegation(parent.id, "child", role="ops")
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            f"""CREATE TRIGGER fail_child_completion BEFORE UPDATE ON tasks
+                WHEN OLD.id='{item.child_task_id}'
+                BEGIN SELECT RAISE(ABORT, 'injected child failure'); END""")
+    with pytest.raises(Exception, match="injected child failure"):
+        orch.complete_delegation(item.id, status="success", summary="done")
+    assert orch.load_delegation(item.id).state == "requested"
+    assert tasks.load_task(item.child_task_id).state == "pending"
+
+
 def test_handoff_requires_verified_checkpoint_and_changes_owner(isolated_state):
     task = tasks.create_task("Own this task", "maker", make_active=False)
     handoff = orch.handoff_task(task.id, "ops", reason="system execution phase")
@@ -101,3 +115,32 @@ def test_handoff_requires_verified_checkpoint_and_changes_owner(isolated_state):
         assert row["owner_role"] == "maker"
     finally:
         conn.close()
+
+
+def test_handoff_active_run_check_and_checkpoint_are_one_transaction(
+        monkeypatch, isolated_state):
+    task = tasks.create_task("race", "maker", make_active=False)
+    original_transaction = orch.transaction
+    inserted = False
+
+    def racing_transaction(*, immediate=False):
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            with state_store.transaction(immediate=True) as conn:
+                conn.execute(
+                    """INSERT INTO task_runs(id,task_id,role_id,state,epoch,created_at,
+                       metadata_json) VALUES('run-race',?,'maker','running',1,?,'{}')""",
+                    (task.id, state_store.now_utc()))
+        return original_transaction(immediate=immediate)
+
+    monkeypatch.setattr(orch, "transaction", racing_transaction)
+    with pytest.raises(RuntimeError, match="active run"):
+        orch.handoff_task(task.id, "ops")
+    with state_store.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE task_id=?", (task.id,)).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM handoffs WHERE task_id=?", (task.id,)).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT owner_role FROM tasks WHERE id=?", (task.id,)).fetchone()[0] == "maker"

@@ -66,3 +66,17 @@ def test_invalid_candidate_does_not_enter_corpus(isolated_memory):
     with pytest.raises(ValueError):
         memory.stage_candidate("")
     assert memory.doctor()["files"] == 0
+
+
+def test_candidate_review_claim_is_released_after_promotion_failure(
+        monkeypatch, isolated_memory):
+    candidate = memory.stage_candidate("retry me", scope="profile")
+    original = memory.remember
+    monkeypatch.setattr(
+        memory, "remember",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected write failure")))
+    with pytest.raises(RuntimeError, match="injected write failure"):
+        memory.decide_candidate(candidate, promote=True)
+    assert memory.review_candidates()[0]["status"] == "staged"
+    monkeypatch.setattr(memory, "remember", original)
+    assert memory.decide_candidate(candidate, promote=True).content == "retry me"

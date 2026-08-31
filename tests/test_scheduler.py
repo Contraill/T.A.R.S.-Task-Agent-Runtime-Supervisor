@@ -38,6 +38,31 @@ def test_one_shot_claim_is_deduplicated_and_model_free(scheduled_state):
     assert tasks.load_task(task.id).schedule_enabled is False
 
 
+def test_claim_does_not_overwrite_a_concurrent_schedule_edit(
+        monkeypatch, scheduled_state):
+    task = make_task()
+    item = scheduler.create_schedule(
+        task.id, "recurring", "every 1h", next_run_at=utc(), now=utc(11))
+    original_transaction = scheduler.transaction
+    edited = False
+
+    def racing_transaction(*, immediate=False):
+        nonlocal edited
+        if not edited:
+            edited = True
+            with state_store.transaction(immediate=True) as conn:
+                conn.execute(
+                    "UPDATE schedules SET expression='every 2h',next_run_at=?,revision=revision+1 "
+                    "WHERE id=?", (utc(14).isoformat().replace("+00:00", "Z"), item.id))
+        return original_transaction(immediate=immediate)
+
+    monkeypatch.setattr(scheduler, "transaction", racing_transaction)
+    assert scheduler.Scheduler().claim_due(now=utc()) == []
+    current = scheduler.load_schedule(item.id)
+    assert current.expression == "every 2h"
+    assert current.next_run_at == "2026-08-31T14:00:00Z"
+
+
 def test_recurring_missed_policies_and_bounded_catch_up(scheduled_state):
     skipped_task = make_task()
     skipped = scheduler.create_schedule(
@@ -125,6 +150,8 @@ def test_pause_edit_remove_preserves_run_journal(scheduled_state):
     assert scheduler.load_run(run.id).state == "succeeded"
     with pytest.raises(RuntimeError, match="removed"):
         scheduler.set_enabled(item.id, True)
+    with pytest.raises(RuntimeError, match="removed"):
+        scheduler.edit_schedule(item.id, expression="every 3h", now=utc(15))
 
 
 def test_wait_calculation_has_no_model_or_busy_polling(scheduled_state):

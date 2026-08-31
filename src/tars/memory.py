@@ -127,7 +127,7 @@ def _index_entry(entry: MemoryEntry, conn):
 
 
 def remember(content, *, kind="profile", scope="global", title="", source="user",
-             confidence=1.0, supersedes=None, expiry=None, tags=()):
+             confidence=1.0, supersedes=None, expiry=None, tags=(), _entry_id=None):
     ensure_state_store()
     _validate_kind(kind)
     content = str(content).strip()
@@ -144,7 +144,7 @@ def remember(content, *, kind="profile", scope="global", title="", source="user"
     if duplicate:
         return duplicate
     stamp = now_utc()
-    entry_id = "mem-" + uuid.uuid4().hex
+    entry_id = _entry_id or "mem-" + uuid.uuid4().hex
     path = _entry_path(entry_id, kind)
     entry = MemoryEntry(entry_id, kind, str(scope), str(title), content, str(source),
                         stamp, stamp, confidence, supersedes, expiry,
@@ -314,22 +314,38 @@ def decide_candidate(candidate_id, *, promote: bool, reason=""):
         row = conn.execute(
             "SELECT * FROM memory_candidates WHERE id=? AND status='staged'", (candidate_id,)
         ).fetchone()
-    if not row:
-        raise KeyError(f"unknown staged memory candidate: {candidate_id}")
-    entry = None
-    status = "rejected"
-    if promote:
+        if not row:
+            raise KeyError(f"unknown staged memory candidate: {candidate_id}")
+        status = "reviewing" if promote else "rejected"
+        changed = conn.execute(
+            "UPDATE memory_candidates SET status=?,reason=?,reviewed_at=? "
+            "WHERE id=? AND status='staged'",
+            (status, reason, now_utc(), candidate_id)).rowcount
+        if changed != 1:
+            raise RuntimeError(f"memory candidate {candidate_id} changed concurrently")
+    if not promote:
+        return None
+    entry_id = "mem-" + candidate_id.removeprefix("cand-")
+    try:
         entry = remember(
             row["content"], kind=row["kind"], scope=row["scope"], title=row["title"],
             source=row["source"], confidence=row["confidence"],
             tags=json_loads(row["tags_json"], []),
+            _entry_id=entry_id,
         )
-        status = "promoted"
-    with transaction(immediate=True) as conn:
-        conn.execute(
-            "UPDATE memory_candidates SET status=?,reason=?,reviewed_at=? WHERE id=?",
-            (status, reason, now_utc(), candidate_id),
-        )
+        with transaction(immediate=True) as conn:
+            changed = conn.execute(
+                "UPDATE memory_candidates SET status='promoted',reason=?,reviewed_at=? "
+                "WHERE id=? AND status='reviewing'",
+                (reason, now_utc(), candidate_id)).rowcount
+            if changed != 1:
+                raise RuntimeError(f"memory candidate {candidate_id} lost review ownership")
+    except Exception:
+        with transaction(immediate=True) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET status='staged',reviewed_at=NULL "
+                "WHERE id=? AND status='reviewing'", (candidate_id,))
+        raise
     return entry
 
 

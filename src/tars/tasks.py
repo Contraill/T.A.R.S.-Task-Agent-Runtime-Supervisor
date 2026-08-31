@@ -77,6 +77,37 @@ def ensure_task_store():
     return ensure_state_store()
 
 
+def create_task_in_transaction(conn, goal, owner_role, *, task_id=None, kind="primary",
+                               parent_task_id=None, source="cli", conversation_id=None,
+                               title="", constraints=(), evidence_refs=(), phase="created",
+                               schedule_kind=None, schedule_expr=None, next_run_at=None,
+                               make_active=False, created_at=None):
+    """Insert a task as part of a caller-owned authoritative transaction."""
+    if kind not in TASK_KINDS:
+        raise ValueError(f"invalid task kind: {kind}")
+    if parent_task_id is not None and not conn.execute(
+            "SELECT 1 FROM tasks WHERE id=?", (parent_task_id,)).fetchone():
+        raise KeyError(f"unknown task: {parent_task_id}")
+    task_id = task_id or _new_task_id()
+    stamp = created_at or now_utc()
+    conn.execute(
+        """INSERT INTO tasks(
+           id,conversation_id,title,goal,owner_role,state,kind,phase,progress,
+           parent_task_id,source,epoch,constraints_json,decisions_json,completed_json,
+           open_steps_json,failures_json,evidence_refs_json,schedule_kind,schedule_expr,
+           next_run_at,last_run_at,last_result_status,schedule_enabled,created_at,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (task_id, conversation_id, title, goal, owner_role, "pending", kind, phase, None,
+         parent_task_id, source, 1, json_dumps(list(constraints)), "[]", "[]", "[]", "[]",
+         json_dumps(list(evidence_refs)), schedule_kind, schedule_expr, next_run_at, None, None,
+         1, stamp, stamp))
+    if make_active:
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('active_task_id',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (task_id,))
+    return task_id
+
+
 def create_task(
     goal,
     owner_role,
@@ -93,38 +124,14 @@ def create_task(
 ):
     ensure_state_store()
     role = resolve_role_id(owner_role)
-    if kind not in TASK_KINDS:
-        raise ValueError(f"invalid task kind: {kind}")
-    if parent_task_id is not None:
-        load_task(parent_task_id)
     if conversation_id is None:
         conv = active_conversation()
         conversation_id = conv.id if conv else None
-    now = now_utc()
-    task_id = _new_task_id()
     with transaction(immediate=True) as conn:
-        conn.execute(
-            """
-            INSERT INTO tasks(
-                id,conversation_id,title,goal,owner_role,state,kind,phase,progress,
-                parent_task_id,source,epoch,constraints_json,decisions_json,
-                completed_json,open_steps_json,failures_json,evidence_refs_json,
-                schedule_kind,schedule_expr,next_run_at,last_run_at,last_result_status,
-                schedule_enabled,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                task_id, conversation_id, title, goal, role, "pending", kind, "created", None,
-                parent_task_id, source, 1, "[]", "[]", "[]", "[]", "[]", "[]",
-                schedule_kind, schedule_expr, next_run_at, None, None, 1, now, now,
-            ),
-        )
-        if make_active:
-            conn.execute(
-                "INSERT INTO meta(key,value) VALUES('active_task_id',?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (task_id,),
-            )
+        task_id = create_task_in_transaction(
+            conn, goal, role, kind=kind, parent_task_id=parent_task_id, source=source,
+            conversation_id=conversation_id, title=title, schedule_kind=schedule_kind,
+            schedule_expr=schedule_expr, next_run_at=next_run_at, make_active=make_active)
     append_event(task_id, "status", f"Task created with owner {role}", role=role,
                  data={"state": "pending", "kind": kind})
     return load_task(task_id)

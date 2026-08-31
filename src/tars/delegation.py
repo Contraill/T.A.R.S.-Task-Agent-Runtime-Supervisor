@@ -194,15 +194,12 @@ def create_child(parent_task_id, goal, *, role=None, required_capabilities=(),
         scope=child_authority, constraints=constraints, permissions=child_tools,
         evidence_refs=evidence_refs,
         expected_result=json_dumps(normalized_completion),
+        _contract_values=(
+            parent_delegation_id, json_dumps(child_tools), json_dumps(child_authority),
+            json_dumps(normalized_budget), json_dumps(normalized_workspace),
+            json_dumps(normalized_completion), "created", None, "", None, None, None,
+            now_utc()),
     )
-    with transaction(immediate=True) as conn:
-        conn.execute(
-            "INSERT INTO delegation_contracts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (delegation.id, parent_delegation_id, json_dumps(child_tools),
-             json_dumps(child_authority), json_dumps(normalized_budget),
-             json_dumps(normalized_workspace), json_dumps(normalized_completion), "created",
-             None, "", None, None, None, now_utc()),
-        )
     return load_contract(delegation.id)
 
 
@@ -371,23 +368,30 @@ def review_child_memory(delegation_id, candidate_id, *, promote, reason=""):
     contract = load_contract(delegation_id)
     if promote and contract.accepted is not True:
         raise PermissionError("child memory cannot be promoted before parent acceptance")
-    conn = connect()
-    try:
-        owned = conn.execute(
-            "SELECT 1 FROM delegation_memory WHERE delegation_id=? AND candidate_id=? "
-            "AND state='staged'", (delegation_id, candidate_id),
-        ).fetchone()
-    finally:
-        conn.close()
-    if not owned:
-        raise KeyError("unknown staged child memory candidate")
-    entry = memory.decide_candidate(candidate_id, promote=promote, reason=reason)
+    review_token = "processing:" + now_utc()
     with transaction(immediate=True) as conn:
         changed = conn.execute(
-            "UPDATE delegation_memory SET state=?,reviewed_at=? WHERE delegation_id=? "
-            "AND candidate_id=? AND state='staged'",
-            ("accepted" if promote else "rejected", now_utc(), delegation_id, candidate_id),
+            "UPDATE delegation_memory SET reviewed_at=? WHERE delegation_id=? "
+            "AND candidate_id=? AND state='staged' AND reviewed_at IS NULL",
+            (review_token, delegation_id, candidate_id),
         ).rowcount
     if not changed:
         raise KeyError("unknown staged child memory candidate")
+    try:
+        entry = memory.decide_candidate(candidate_id, promote=promote, reason=reason)
+        with transaction(immediate=True) as conn:
+            changed = conn.execute(
+                "UPDATE delegation_memory SET state=?,reviewed_at=? WHERE delegation_id=? "
+                "AND candidate_id=? AND state='staged' AND reviewed_at=?",
+                ("accepted" if promote else "rejected", now_utc(), delegation_id,
+                 candidate_id, review_token)).rowcount
+            if changed != 1:
+                raise RuntimeError("child memory review ownership changed")
+    except Exception:
+        with transaction(immediate=True) as conn:
+            conn.execute(
+                "UPDATE delegation_memory SET reviewed_at=NULL WHERE delegation_id=? "
+                "AND candidate_id=? AND state='staged' AND reviewed_at=?",
+                (delegation_id, candidate_id, review_token))
+        raise
     return entry

@@ -10,7 +10,7 @@ from .events import append_event
 from .roles import get_role
 from .runtime import chat_completion_stream
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
-from .tasks import attach_conversation, canonical_task_state, load_task, update_task
+from .tasks import canonical_task_state, load_task, update_task
 
 RUN_STATES = {"queued", "running", "paused", "completed", "failed", "cancelled"}
 CONTROL_ACTIONS = {"pause", "resume", "cancel", ""}
@@ -59,14 +59,25 @@ def create_run(task_id: str, conversation_id: str | None = None) -> TaskRun:
             title=f"Task {task.id}", source="task-runner", make_active=False
         )
         conversation_id = conv.id
-    if task.conversation_id is None:
-        task = attach_conversation(task.id, conversation_id)
     run_id = "run-" + uuid.uuid4().hex
     now = now_utc()
     with transaction(immediate=True) as conn:
+        current = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not current:
+            raise KeyError(f"unknown task: {task_id}")
+        if current["state"] in {"completed", "cancelled"}:
+            raise RuntimeError(f"task {task_id} is {current['state']}")
+        if not conn.execute(
+                "SELECT 1 FROM conversations WHERE id=?", (conversation_id,)).fetchone():
+            raise KeyError(f"unknown conversation: {conversation_id}")
+        if current["conversation_id"] is None:
+            conn.execute("UPDATE tasks SET conversation_id=?,updated_at=? WHERE id=?",
+                         (conversation_id, now, task_id))
+        elif current["conversation_id"] != conversation_id:
+            raise RuntimeError("run conversation does not match task provenance")
         existing = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id=? AND state IN ('queued','running') LIMIT 1",
-            (task.id,),
+            "SELECT id FROM task_runs WHERE task_id=? "
+            "AND state IN ('queued','running','paused') LIMIT 1", (task_id,),
         ).fetchone()
         if existing:
             raise RuntimeError(f"task {task.id} already has active run {existing['id']}")
@@ -77,10 +88,11 @@ def create_run(task_id: str, conversation_id: str | None = None) -> TaskRun:
                 created_at,metadata_json
             ) VALUES(?,?,?,?,?,?,?,?,?)
             """,
-            (run_id, task.id, conversation_id, task.owner_role, "queued", "", task.epoch, now, "{}"),
+            (run_id, task_id, conversation_id, current["owner_role"], "queued", "",
+             current["epoch"], now, "{}"),
         )
         row = conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
-    append_event(task.id, "status", f"Runner queued {run_id}", role=task.owner_role,
+    append_event(task_id, "status", f"Runner queued {run_id}", role=current["owner_role"],
                  data={"run_id": run_id, "state": "queued"}, visibility="verbose")
     return _from_row(row)
 

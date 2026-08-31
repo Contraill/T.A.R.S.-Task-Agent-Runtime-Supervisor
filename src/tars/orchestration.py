@@ -3,13 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import uuid
 
-from .checkpoints import verify_checkpoint
+from .checkpoints import (_from_row as _checkpoint_from_row,
+                          create_checkpoint_in_transaction, verify_checkpoint)
 from .events import append_event
 from .roles import default_role_id, get_role, list_roles, resolve_role_id
 from .runtime_backends import backend_binding_ready
 from .registry import get_model
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
-from .tasks import canonical_task_state, checkpoint_task, create_task, load_task, update_task
+from .tasks import (canonical_task_state, create_task_in_transaction, load_task,
+                    update_task)
 
 DELEGATION_STATES = {"requested", "running", "completed", "failed", "cancelled"}
 DELEGATION_RESULT_STATUSES = {"success", "partial", "failed", "cancelled"}
@@ -179,6 +181,7 @@ def create_delegation(
     permissions=(),
     evidence_refs=(),
     expected_result: str = "",
+    _contract_values: tuple | None = None,
 ) -> DelegationRecord:
     """Create a bounded child task while preserving parent ownership."""
     ensure_state_store()
@@ -198,27 +201,21 @@ def create_delegation(
                 f"role {target.id!r} lacks required capabilities: {', '.join(sorted(missing))}"
             )
 
-    child = create_task(
-        goal,
-        target.id,
-        kind="delegation",
-        parent_task_id=parent.id,
-        source="orchestration",
-        make_active=False,
-        conversation_id=parent.conversation_id,
-        title=f"Delegation from {parent.title or parent.id}",
-    )
-    if constraints or evidence_refs:
-        child = update_task(
-            child.id,
-            constraints=tuple(constraints),
-            evidence_refs=tuple(evidence_refs),
-            phase="delegated",
-        )
-
     now = now_utc()
     delegation_id = _new_id("dlg")
     with transaction(immediate=True) as conn:
+        current_parent = conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (parent.id,)).fetchone()
+        if not current_parent:
+            raise KeyError(f"unknown task: {parent.id}")
+        if current_parent["state"] in {"completed", "cancelled"}:
+            raise RuntimeError(
+                f"cannot delegate from {current_parent['state']} task {parent.id}")
+        child_id = create_task_in_transaction(
+            conn, goal, target.id, kind="delegation", parent_task_id=parent.id,
+            source="orchestration", conversation_id=current_parent["conversation_id"],
+            title=f"Delegation from {current_parent['title'] or parent.id}",
+            constraints=constraints, evidence_refs=evidence_refs, phase="delegated")
         conn.execute(
             """
             INSERT INTO delegations(
@@ -228,27 +225,35 @@ def create_delegation(
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                delegation_id, parent.id, child.id, target.id, "requested", goal,
+                delegation_id, parent.id, child_id, target.id, "requested", goal,
                 json_dumps(scope or {}), json_dumps(list(constraints)),
                 json_dumps(list(permissions)), json_dumps(list(evidence_refs)),
                 expected_result, None, "", "{}", now, now, None,
             ),
         )
+        if _contract_values is not None:
+            conn.execute(
+                "INSERT INTO delegation_contracts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (delegation_id, *_contract_values))
         row = conn.execute("SELECT * FROM delegations WHERE id=?", (delegation_id,)).fetchone()
 
+    append_event(
+        child_id, "status", f"Task created with owner {target.id}", role=target.id,
+        data={"state": "pending", "kind": "delegation"}, visibility="verbose",
+    )
     append_event(
         parent.id, "delegation", f"Delegated to {target.display_name}: {goal}",
         role=parent.owner_role,
         data={
             "delegation_id": delegation_id,
-            "child_task_id": child.id,
+            "child_task_id": child_id,
             "requested_role": target.id,
             "parent_owner_unchanged": parent.owner_role,
         },
         visibility="normal",
     )
     append_event(
-        child.id, "delegation", f"Delegation received from {parent.id}", role=target.id,
+        child_id, "delegation", f"Delegation received from {parent.id}", role=target.id,
         data={"delegation_id": delegation_id, "parent_task_id": parent.id},
         visibility="normal",
     )
@@ -295,28 +300,34 @@ def complete_delegation(
     status = status.strip().lower()
     if status not in DELEGATION_RESULT_STATUSES:
         raise ValueError("delegation result status must be success, partial, failed or cancelled")
-    delegation = load_delegation(delegation_id)
-    if delegation.state in {"completed", "failed", "cancelled"}:
-        raise RuntimeError(f"delegation {delegation.id} is already {delegation.state}")
-
     state = "completed" if status in {"success", "partial"} else status
+    child_state = "completed" if status in {"success", "partial"} else status
     now = now_utc()
     with transaction(immediate=True) as conn:
-        conn.execute(
+        current = conn.execute(
+            "SELECT * FROM delegations WHERE id=?", (delegation_id,)).fetchone()
+        if not current:
+            raise KeyError(f"unknown delegation: {delegation_id}")
+        if current["state"] in {"completed", "failed", "cancelled"}:
+            raise RuntimeError(
+                f"delegation {delegation_id} is already {current['state']}")
+        changed = conn.execute(
             """
             UPDATE delegations
             SET state=?,result_status=?,result_summary=?,result_json=?,updated_at=?,completed_at=?
-            WHERE id=?
+            WHERE id=? AND state NOT IN ('completed','failed','cancelled')
             """,
-            (state, status, summary, json_dumps(result or {}), now, now, delegation.id),
-        )
-    child_state = "completed" if status in {"success", "partial"} else status
-    update_task(
-        delegation.child_task_id,
-        state=child_state,
-        phase="delegation-complete",
-        progress=1.0 if child_state == "completed" else None,
-    )
+            (state, status, summary, json_dumps(result or {}), now, now, delegation_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"delegation {delegation_id} changed concurrently")
+        conn.execute(
+            """UPDATE tasks SET state=?,phase='delegation-complete',
+               progress=CASE WHEN ?='completed' THEN 1.0 ELSE progress END,updated_at=?
+               WHERE id=?""",
+            (child_state, child_state, now, current["child_task_id"]),)
+        delegation = _delegation_from_row(conn.execute(
+            "SELECT * FROM delegations WHERE id=?", (delegation_id,)).fetchone())
     append_event(
         delegation.parent_task_id, "delegation", f"Delegation result ({status}): {summary}",
         role=delegation.requested_role,
@@ -373,35 +384,27 @@ def handoff_task(task_id: str, to_role: str, *, reason: str = "manual handoff") 
     if task.state in {"completed", "cancelled"}:
         raise RuntimeError(f"cannot hand off {task.state} task {task.id}")
 
-    conn = connect()
-    try:
-        active = conn.execute(
-            "SELECT id,state FROM task_runs WHERE task_id=? AND state IN ('queued','running') LIMIT 1",
-            (task.id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    if active:
-        raise RuntimeError(
-            f"task {task.id} has active run {active['id']} ({active['state']}); pause it before handoff"
-        )
-
-    checkpoint = checkpoint_task(
-        task.id,
-        reason=f"pre-handoff {task.owner_role} -> {target.id}: {reason}",
-        advance_epoch=False,
-    )
-    if not verify_checkpoint(checkpoint.id):
-        raise RuntimeError(f"handoff checkpoint verification failed: {checkpoint.id}")
-
     handoff_id = _new_id("handoff")
     now = now_utc()
     with transaction(immediate=True) as conn:
-        current = conn.execute("SELECT owner_role,state FROM tasks WHERE id=?", (task.id,)).fetchone()
+        current = conn.execute("SELECT * FROM tasks WHERE id=?", (task.id,)).fetchone()
         if not current:
             raise KeyError(f"unknown task: {task.id}")
         if current["owner_role"] != task.owner_role:
             raise RuntimeError("task owner changed while preparing handoff")
+        if current["state"] in {"completed", "cancelled"}:
+            raise RuntimeError(f"cannot hand off {current['state']} task {task.id}")
+        active = conn.execute(
+            "SELECT id,state FROM task_runs WHERE task_id=? "
+            "AND state IN ('queued','running','paused') LIMIT 1", (task.id,)).fetchone()
+        if active:
+            raise RuntimeError(
+                f"task {task.id} has active run {active['id']} ({active['state']}); "
+                "finish or cancel it before handoff")
+        checkpoint_row = create_checkpoint_in_transaction(
+            conn, task.id,
+            reason=f"pre-handoff {task.owner_role} -> {target.id}: {reason}")
+        checkpoint = _checkpoint_from_row(checkpoint_row)
         conn.execute(
             """
             INSERT INTO handoffs(id,task_id,from_role,to_role,checkpoint_id,reason,created_at)
