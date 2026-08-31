@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass
 from pathlib import Path
 import textwrap
@@ -71,6 +72,16 @@ STATIC_COMMANDS = [
     ("/help", "Show all commands"),
     ("/quit", "Exit chat"),
 ]
+
+
+def write_terminal_clipboard(output, text, *, max_bytes=100_000):
+    """Write a bounded selection through OSC 52; never reads clipboard state."""
+    payload = str(text).encode("utf-8")
+    if len(payload) > max_bytes:
+        raise ValueError("transcript selection is too large for terminal clipboard copy")
+    encoded = base64.b64encode(payload).decode("ascii")
+    output.write_raw(f"\x1b]52;c;{encoded}\x07")
+    output.flush()
 
 
 @dataclass
@@ -314,6 +325,7 @@ class ChatTUI:
             if event.current_buffer is self.output.buffer and self.output.buffer.selection_state:
                 data = self.output.buffer.copy_selection()
                 event.app.clipboard.set_data(data)
+                write_terminal_clipboard(event.app.output, data.text)
                 self.activity = "Transcript selection copied"
                 event.app.invalidate()
                 return
@@ -1311,6 +1323,39 @@ class ChatTUI:
             raise error
         return result
 
+    async def _stream_temporary(self, item):
+        self._reset_live_stream(item.role_id, "temporary")
+        queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def producer():
+            try:
+                for event in self.temporary.stream(
+                        item.text, thinking=item.thinking or "auto"):
+                    loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+        producer_task = asyncio.create_task(asyncio.to_thread(producer))
+        finish = None
+        error = None
+        while True:
+            typ, payload = await queue.get()
+            if typ == "event":
+                self._consume_stream_event(payload)
+                if payload.get("finish_reason") is not None:
+                    finish = payload["finish_reason"]
+            elif typ == "error":
+                error = payload
+            else:
+                break
+        await producer_task
+        if error:
+            raise error
+        return self.live_content, self.live_reasoning, finish or "unknown"
+
     # ---------- model worker ----------
     @staticmethod
     def _response_parts(response):
@@ -1355,15 +1400,12 @@ class ChatTUI:
                 elif item.kind == "temporary":
                     if self.temporary is None:
                         raise RuntimeError("temporary mode ended before queued inference")
-                    response = await asyncio.to_thread(
-                        self.temporary.send, item.text, thinking=item.thinking or "auto")
-                    content, raw, finish = self._response_parts(response)
+                    content, raw, finish = await self._stream_temporary(item)
+                    self._finish_stream(fallback=f"[no final content · {finish}]")
                     if self.reasoning == "raw" and raw:
                         self._append(f"{role_name} · raw", raw[-16000:])
                     if finish == "length" and not content:
                         self._append_system("Generation exhausted its ceiling before final content.")
-                    else:
-                        self._append_assistant(item.role_id, content or f"[no final content · {finish}]")
 
                 elif item.kind == "sideband":
                     task = active_task()

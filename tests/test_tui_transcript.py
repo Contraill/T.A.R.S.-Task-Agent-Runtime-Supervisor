@@ -1,3 +1,5 @@
+import base64
+import inspect
 from types import SimpleNamespace
 
 from prompt_toolkit.selection import SelectionState
@@ -68,5 +70,33 @@ def test_render_preserves_selection_and_stops_following(monkeypatch):
 
 
 def test_stream_flush_is_chunk_buffered():
-    source = __import__("inspect").getsource(chat_tui.ChatTUI._consume_stream_event)
+    source = inspect.getsource(chat_tui.ChatTUI._consume_stream_event)
     assert "call_later" in source and "0.04" in source
+
+
+def test_terminal_clipboard_is_bounded_write_only_osc52():
+    class Output:
+        def __init__(self):
+            self.raw = ""
+            self.flushed = False
+
+        def write_raw(self, value):
+            self.raw += value
+
+        def flush(self):
+            self.flushed = True
+
+    output = Output()
+    chat_tui.write_terminal_clipboard(output, "selected text")
+    assert output.raw.startswith("\x1b]52;c;") and output.raw.endswith("\x07")
+    encoded = output.raw.removeprefix("\x1b]52;c;").removesuffix("\x07")
+    assert base64.b64decode(encoded).decode() == "selected text"
+    assert output.flushed and not hasattr(output, "read")
+    with __import__("pytest").raises(ValueError, match="too large"):
+        chat_tui.write_terminal_clipboard(output, "12345", max_bytes=4)
+
+
+def test_tui_temporary_path_uses_buffered_transcript_stream():
+    source = inspect.getsource(chat_tui.ChatTUI._stream_temporary)
+    assert "self.temporary.stream" in source
+    assert "self._consume_stream_event(payload)" in source

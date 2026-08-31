@@ -121,7 +121,8 @@ from .skills import SkillRegistry
 from .mcp import (MCPClient, list_servers as list_mcp_servers,
                   register as register_mcp_server, set_enabled as set_mcp_enabled)
 from .scheduler import (Scheduler, create_schedule, edit_schedule, list_runs as list_schedule_runs,
-                        health as scheduler_health, list_schedules, load_schedule, remove_schedule,
+                        condition_registry, health as scheduler_health, list_schedules,
+                        load_schedule, remove_schedule, require_condition_support,
                         set_enabled as set_schedule_enabled)
 
 console = Console()
@@ -151,7 +152,11 @@ def command_schedule_show(schedule_id):
     })
 
 
-def command_schedule_add(args):
+def command_schedule_add(cfg, args):
+    if args.kind == "condition":
+        name = args.expression.split("@", 1)[0].strip()
+        if name not in condition_registry(cfg):
+            raise ValueError(f"condition is not configured: {name}")
     item = create_schedule(
         args.task_id, args.kind, args.expression, next_run_at=args.next,
         missed_policy=args.missed, max_catch_up=args.max_catch_up,
@@ -171,7 +176,10 @@ def command_schedule_runs(schedule_id, limit):
 
 
 def command_schedule_run_due(cfg):
-    engine = Scheduler(max_concurrency=int(cfg.get("scheduler", {}).get("max_concurrency", 1)))
+    conditions = condition_registry(cfg)
+    require_condition_support(conditions)
+    engine = Scheduler(max_concurrency=int(cfg.get("scheduler", {}).get("max_concurrency", 1)),
+                       conditions=conditions)
     recovered = engine.recover()
     claimed = engine.claim_due()
 
@@ -2240,13 +2248,13 @@ def main():
         if args.schedule_command == "list":
             return command_schedule_list()
         if args.schedule_command == "status":
-            report = scheduler_health()
+            report = scheduler_health(condition_registry(cfg))
             console.print_json(data=report)
             return 0 if report["ok"] else 1
         if args.schedule_command == "show":
             return command_schedule_show(args.schedule_id)
         if args.schedule_command == "add":
-            return command_schedule_add(args)
+            return command_schedule_add(cfg, args)
         if args.schedule_command == "pause":
             set_schedule_enabled(args.schedule_id, False)
             return 0

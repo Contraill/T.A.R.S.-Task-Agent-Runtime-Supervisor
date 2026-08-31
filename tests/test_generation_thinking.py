@@ -94,7 +94,7 @@ def test_ordinary_tui_and_agent_paths_do_not_hardcode_unrelated_1k_limit():
     from tars.agent_loop import RuntimeModelAdapter
     assert inspect.signature(RuntimeModelAdapter).parameters["max_tokens"].default is None
     worker = inspect.getsource(chat_tui.ChatTUI._worker)
-    assert "self.temporary.send, item.text, thinking=" in worker
+    assert "self._stream_temporary(item)" in worker
     assert "requested_output_tokens=SIDEBAND_GENERATION_TOKENS" in worker
 
 

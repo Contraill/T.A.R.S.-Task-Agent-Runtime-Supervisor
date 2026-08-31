@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import re
+import select
+import socket
 import threading
 import uuid
 from typing import Callable, Mapping
 
 from .checkpoints import latest_checkpoint
+from . import state_store as _state_store
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import append_event, load_task
 
@@ -16,6 +20,63 @@ SCHEDULE_KINDS = {"one-shot", "recurring", "condition"}
 MISSED_POLICIES = {"skip", "run-once", "catch-up"}
 RUNNING_STATES = {"claimed", "running"}
 _INTERVAL = re.compile(r"^(?:every\s+|interval:)(\d+)([smhd]?)$", re.I)
+
+
+def _wake_path() -> Path:
+    return _state_store.STATE_DB_PATH.with_name("scheduler-wake.sock")
+
+
+def notify_scheduler() -> bool:
+    """Wake a live scheduler through a write-only local datagram."""
+    path = _wake_path()
+    if not path.exists():
+        return False
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(b"schedule-changed", str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def condition_registry(cfg: Mapping | None) -> dict[str, Callable[[], bool]]:
+    """Build explicitly configured, model-free condition predicates."""
+    scheduler_cfg = (cfg or {}).get("scheduler", {})
+    definitions = scheduler_cfg.get("conditions", {}) if isinstance(scheduler_cfg, Mapping) else {}
+    if not isinstance(definitions, Mapping):
+        raise ValueError("scheduler.conditions must be a table")
+    result = {}
+    for name, definition in definitions.items():
+        if not isinstance(definition, Mapping):
+            raise ValueError(f"condition {name} must be a table")
+        kind = str(definition.get("type", ""))
+        if kind == "path-exists":
+            path = Path(str(definition.get("path", ""))).expanduser()
+            if not str(definition.get("path", "")).strip():
+                raise ValueError(f"condition {name} requires path")
+            result[str(name)] = lambda path=path: path.exists()
+        elif kind == "task-state":
+            task_id = str(definition.get("task_id", "")).strip()
+            expected = str(definition.get("state", "completed")).strip()
+            if not task_id:
+                raise ValueError(f"condition {name} requires task_id")
+            result[str(name)] = lambda task_id=task_id, expected=expected: (
+                load_task(task_id).state == expected)
+        else:
+            raise ValueError(f"condition {name} has unsupported type: {kind or '(missing)'}")
+    return result
+
+
+def require_condition_support(conditions: Mapping[str, Callable[[], bool]]) -> None:
+    missing = sorted({
+        item.expression.split("@", 1)[0].strip()
+        for item in list_schedules(enabled=True) if item.kind == "condition"
+        and item.expression.split("@", 1)[0].strip() not in conditions
+    })
+    if missing:
+        raise RuntimeError("unavailable schedule conditions: " + ", ".join(missing))
 
 
 def _dt(value: str | datetime) -> datetime:
@@ -144,6 +205,7 @@ def create_schedule(task_id: str, kind: str, expression: str, *, next_run_at=Non
         )
     append_event(task.id, "status", f"Schedule {schedule_id} registered", role=task.owner_role,
                  data={"schedule_id": schedule_id, "kind": kind, "next_run_at": due})
+    notify_scheduler()
     return load_schedule(schedule_id)
 
 
@@ -208,6 +270,7 @@ def edit_schedule(schedule_id: str, *, expression=None, next_run_at=None,
         updated = conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
         conn.execute("UPDATE tasks SET schedule_expr=?,next_run_at=?,updated_at=? WHERE id=?",
                      (updated["expression"], updated["next_run_at"], values["updated_at"], schedule.task_id))
+    notify_scheduler()
     return load_schedule(schedule_id)
 
 
@@ -221,6 +284,7 @@ def set_enabled(schedule_id: str, enabled: bool) -> Schedule:
                      (1 if enabled else 0, stamp, schedule_id))
         conn.execute("UPDATE tasks SET schedule_enabled=?,updated_at=? WHERE id=?",
                      (1 if enabled else 0, stamp, schedule.task_id))
+    notify_scheduler()
     return load_schedule(schedule_id)
 
 
@@ -261,8 +325,34 @@ class Scheduler:
     def __init__(self, *, max_concurrency=1, conditions: Mapping[str, Callable[[], bool]] | None = None):
         self.max_concurrency = max(1, int(max_concurrency))
         self.conditions = dict(conditions or {})
-        self._wake = threading.Event()
+        self._wake_socket = None
         ensure_state_store()
+
+    def _open_wake_socket(self):
+        path = _wake_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        if path.exists():
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            try:
+                probe.sendto(b"probe", str(path))
+            except OSError:
+                path.unlink(missing_ok=True)
+            else:
+                sock.close()
+                raise RuntimeError(f"scheduler wake endpoint is already active: {path}")
+            finally:
+                probe.close()
+        sock.bind(str(path))
+        sock.setblocking(False)
+        self._wake_socket = sock
+        return sock
+
+    def _close_wake_socket(self):
+        if self._wake_socket is not None:
+            self._wake_socket.close()
+            self._wake_socket = None
+        _wake_path().unlink(missing_ok=True)
 
     def recover(self) -> int:
         """Reclaim interrupted work with the same idempotency key and checkpoint."""
@@ -428,6 +518,9 @@ class Scheduler:
 
     def next_wake_seconds(self, *, now=None, maximum=3600.0) -> float:
         current = _dt(now or now_utc())
+        with connect() as conn:
+            if conn.execute("SELECT 1 FROM schedule_runs WHERE state='claimed' LIMIT 1").fetchone():
+                return 0.0
         enabled = [item for item in list_schedules(enabled=True) if item.next_run_at]
         if not enabled:
             return maximum
@@ -436,15 +529,26 @@ class Scheduler:
 
     def run_forever(self, executor, *, deliver=None, stop: threading.Event | None = None):
         stop = stop or threading.Event()
-        self.recover()
-        while not stop.is_set():
-            self.claim_due()
-            self.execute_claimed(executor, deliver=deliver)
-            self._wake.wait(self.next_wake_seconds())
-            self._wake.clear()
+        wake_socket = self._open_wake_socket()
+        try:
+            self.recover()
+            require_condition_support(self.conditions)
+            while not stop.is_set():
+                self.claim_due()
+                self.execute_claimed(executor, deliver=deliver)
+                readable, _, _ = select.select(
+                    [wake_socket], [], [], self.next_wake_seconds())
+                if readable:
+                    try:
+                        while wake_socket.recv(4096):
+                            pass
+                    except BlockingIOError:
+                        pass
+        finally:
+            self._close_wake_socket()
 
     def wake(self):
-        self._wake.set()
+        notify_scheduler()
 
 
 def load_run(run_id: str) -> ScheduleRun:

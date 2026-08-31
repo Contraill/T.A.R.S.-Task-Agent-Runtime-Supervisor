@@ -10,6 +10,10 @@
 - added idempotent run journals, missed-run policies, checkpoint-aware restart recovery and bounded concurrency
 - added durable delivery state plus schedule pause, resume, edit, archive, health and run inspection controls
 - kept scheduler waiting event-driven and independent of inference model residency
+- streamed Temporary-mode TUI responses through the same buffered Conversation entries
+- added bounded write-only OSC 52 export for selected transcript text
+- wired typed model-free condition predicates into CLI execution with truthful rejection when unavailable
+- added cross-process scheduler wake notifications and immediate claimed-backlog handling
 
 ## 0.7.6 - Skills, MCP and Generation Policy
 

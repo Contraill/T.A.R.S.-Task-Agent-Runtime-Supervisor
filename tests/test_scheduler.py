@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
+import threading
+import time
 
 import pytest
 
-from tars import checkpoints, scheduler, state_store, tasks
+from tars import checkpoints, cli, scheduler, state_store, tasks
 
 
 @pytest.fixture
@@ -142,3 +144,77 @@ def test_health_reports_unavailable_condition_without_running_it(scheduled_state
         task.id, "condition", "network-online@every 1m", next_run_at=utc(), now=utc(11))
     report = scheduler.health()
     assert not report["ok"] and report["missing_conditions"] == ["network-online"]
+
+
+def test_configured_condition_registry_is_truthful_and_model_free(scheduled_state):
+    marker = scheduled_state / "ready"
+    cfg = {"scheduler": {"conditions": {
+        "workspace-ready": {"type": "path-exists", "path": str(marker)},
+    }}}
+    registry = scheduler.condition_registry(cfg)
+    assert not registry["workspace-ready"]()
+    marker.write_text("ready")
+    assert registry["workspace-ready"]()
+    with pytest.raises(ValueError, match="unsupported type"):
+        scheduler.condition_registry({"scheduler": {"conditions": {
+            "bad": {"type": "model-prompt"}}}})
+
+
+def test_unavailable_condition_is_rejected_before_execution(scheduled_state):
+    task = make_task()
+    scheduler.create_schedule(
+        task.id, "condition", "missing@every 1m", next_run_at=utc(), now=utc(11))
+    with pytest.raises(RuntimeError, match="unavailable schedule conditions: missing"):
+        scheduler.require_condition_support({})
+    with pytest.raises(RuntimeError, match="unavailable schedule conditions: missing"):
+        cli.command_schedule_run_due({})
+
+
+def test_cli_condition_add_requires_registered_predicate(scheduled_state):
+    task = make_task()
+    args = type("Args", (), {
+        "task_id": task.id, "kind": "condition",
+        "expression": "ready@every 1m", "next": None,
+        "missed": "run-once", "max_catch_up": 1,
+        "concurrency_key": "default", "max_concurrency": 1,
+        "delivery_target": "",
+    })()
+    with pytest.raises(ValueError, match="not configured"):
+        cli.command_schedule_add({}, args)
+    marker = scheduled_state / "ready"
+    created = cli.command_schedule_add({"scheduler": {"conditions": {
+        "ready": {"type": "path-exists", "path": str(marker)}}}}, args)
+    assert created is None and scheduler.schedule_for_task(task.id).kind == "condition"
+
+
+def test_claimed_backlog_wakes_immediately(scheduled_state):
+    task = make_task()
+    scheduler.create_schedule(task.id, "one-shot", utc().isoformat(), now=utc(11))
+    engine = scheduler.Scheduler()
+    assert engine.claim_due(now=utc())
+    assert engine.next_wake_seconds(now=utc()) == 0.0
+
+
+def test_external_schedule_change_wakes_long_lived_scheduler(scheduled_state):
+    engine = scheduler.Scheduler()
+    stopped = threading.Event()
+    executed = []
+
+    def execute(run):
+        executed.append(run.id)
+        stopped.set()
+        engine.wake()
+        return {"ok": True}
+
+    thread = threading.Thread(
+        target=engine.run_forever, args=(execute,), kwargs={"stop": stopped}, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while not scheduler._wake_path().exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert scheduler._wake_path().exists()
+    task = make_task()
+    scheduler.create_schedule(
+        task.id, "one-shot", datetime.now(timezone.utc).isoformat())
+    thread.join(timeout=2)
+    assert executed and not thread.is_alive()

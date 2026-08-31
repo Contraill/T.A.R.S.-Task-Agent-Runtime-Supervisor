@@ -6,7 +6,7 @@ from .context import budget_for_role, estimate_messages_tokens
 from .memory import search as search_memory
 from .prompt_compiler import PromptCompiler
 from .roles import resolve_role_id
-from .runtime import chat_completion
+from .runtime import chat_completion, chat_completion_stream
 
 
 TEMPORARY_NOTICE = (
@@ -81,6 +81,37 @@ class TemporarySession:
             return response
         self.turns.append({"role": "assistant", "content": content})
         return response
+
+    def stream(self, text, *, requested_output_tokens=None,
+               stream=chat_completion_stream, thinking="auto"):
+        """Yield backend events while retaining all new state only in memory."""
+        if self.closed:
+            raise RuntimeError("temporary session is closed")
+        text = str(text).strip()
+        if not text:
+            raise ValueError("temporary message cannot be empty")
+        self.turns.append({"role": "user", "content": text})
+        content_parts = []
+        finish = None
+        committed = False
+        try:
+            messages = self._messages(
+                text, requested_output_tokens=requested_output_tokens)
+            for event in stream(
+                    self.cfg, self.role_id, messages,
+                    max_tokens=requested_output_tokens, thinking=thinking,
+                    operation="temporary"):
+                content_parts.append(str(event.get("content") or ""))
+                if event.get("finish_reason") is not None:
+                    finish = event["finish_reason"]
+                yield event
+            content = "".join(content_parts)
+            if not (finish == "length" and not content):
+                self.turns.append({"role": "assistant", "content": content})
+            committed = True
+        finally:
+            if not committed and self.turns and self.turns[-1].get("role") == "user":
+                self.turns.pop()
 
     def close(self):
         self.turns.clear()

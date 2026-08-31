@@ -8,9 +8,9 @@ Claimed work captures the latest immutable task checkpoint. A scheduler restart 
 
 Successful runs create durable delivery state. Delivery adapters can retry failed delivery independently without rerunning inference or changing the run result.
 
-Condition callbacks are explicit lightweight predicates. An unavailable predicate is reported by scheduler health and is never replaced with model polling. Watches fire on a false-to-true edge and sleep until their next check.
+Condition callbacks are explicit lightweight predicates. CLI schedules use named predicates from `scheduler.conditions`; supported built-ins inspect path existence or canonical task state without inference. An unavailable predicate is rejected before execution and is never replaced with model polling. Watches fire on a false-to-true edge and sleep until their next check.
 
-`tars schedule run-due` performs recovery, claims due work and invokes the existing task runner. When nothing is due, schedule listing, health checks and waiting do not contact a runtime or load a model. The event-driven service loop waits until the next timestamp or an explicit wake event.
+`tars schedule run-due` performs recovery, validates condition availability, claims due work and invokes the existing task runner. When nothing is due, schedule listing, health checks and waiting do not contact a runtime or load a model. The event-driven service loop waits until the next timestamp or an explicit wake event. Schedule add, edit and resume operations notify a local Unix datagram endpoint, including from another process, so earlier work interrupts the current wait. Already-claimed recovery backlog always produces an immediate wake.
 
 Useful commands:
 

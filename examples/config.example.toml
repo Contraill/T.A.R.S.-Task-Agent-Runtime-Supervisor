@@ -26,3 +26,15 @@ allow_dgpu_sleep = true
 default_visibility = "hidden"
 persist_raw = false
 separate_tool_trace = true
+
+[scheduler]
+max_concurrency = 1
+
+[scheduler.conditions.workspace_ready]
+type = "path-exists"
+path = "~/TARS-Workspace/.ready"
+
+# [scheduler.conditions.prerequisite_done]
+# type = "task-state"
+# task_id = "task-..."
+# state = "completed"

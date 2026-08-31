@@ -73,6 +73,36 @@ def test_temporary_failure_and_close_discard_state(isolated_environment):
     assert counts["sessions"] == counts["tasks"] == counts["checkpoints"] == 0
 
 
+def test_temporary_stream_is_chunked_coherent_and_ephemeral(isolated_environment):
+    before = state_store.health()["counts"].copy()
+    prompts = []
+
+    def stream(cfg, role, messages, **kwargs):
+        prompts.append(messages)
+        yield {"content": "chunk ", "reasoning": "real", "finish_reason": None}
+        yield {"content": "two", "reasoning": "", "finish_reason": "stop"}
+
+    session = temporary.TemporarySession({}, "general")
+    assert [event["content"] for event in session.stream("hello", stream=stream)] == [
+        "chunk ", "two"]
+    assert [turn["content"] for turn in session.turns] == ["hello", "chunk two"]
+    assert temporary.TEMPORARY_NOTICE in prompts[0][0]["content"]
+    session.close()
+    assert state_store.health()["counts"] == before
+
+
+def test_abandoned_temporary_stream_rolls_back_user_turn(isolated_environment):
+    def stream(*args, **kwargs):
+        yield {"content": "partial", "finish_reason": None}
+        yield {"content": "never consumed", "finish_reason": "stop"}
+
+    session = temporary.TemporarySession({}, "general")
+    response = session.stream("do not retain partial", stream=stream)
+    next(response)
+    response.close()
+    assert session.turns == []
+
+
 def test_temporary_context_is_bounded_without_persistent_projection(monkeypatch, isolated_environment):
     monkeypatch.setattr(temporary, "budget_for_role", lambda *args, **kwargs: SimpleNamespace(
         usable_input=180
