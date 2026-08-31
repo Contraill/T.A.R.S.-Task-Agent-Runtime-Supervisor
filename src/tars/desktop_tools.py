@@ -24,7 +24,7 @@ class NotificationTools:
         if urgency not in {"low", "normal", "critical"}:
             raise ValueError("invalid notification urgency")
         request = ScopeRequest("notify.send", "write", "desktop-notification",
-                               {"summary": summary, "body_bytes": len(body.encode()),
+                               {"summary": summary, "body": body,
                                 "urgency": urgency}, task_id=task_id, session_id=session_id)
         actions = self.runtime.authorize((("write", request),), {"write": approval_id})
         if not self.binary:

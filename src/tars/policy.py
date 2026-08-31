@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from ipaddress import ip_address
 from pathlib import Path
 import re
@@ -89,6 +90,10 @@ def redact(value):
         }
     if isinstance(value, (list, tuple)):
         return [redact(item) for item in value]
+    if isinstance(value, bytes):
+        return {"sha256": hashlib.sha256(value).hexdigest(), "bytes": len(value)}
+    if isinstance(value, Path):
+        return str(value)
     return value
 
 
@@ -124,6 +129,43 @@ def redact_arguments(arguments):
             result.append(inline.sub(r"\1[REDACTED]", text))
     safe["argv"] = result
     return safe
+
+
+def _intent_value(value, *, sensitive=False):
+    if sensitive:
+        encoded = json_dumps(value).encode("utf-8") if not isinstance(value, bytes) else value
+        return {"sha256": hashlib.sha256(encoded).hexdigest(), "bytes": len(encoded),
+                "protected": True}
+    if isinstance(value, bytes):
+        return {"sha256": hashlib.sha256(value).hexdigest(), "bytes": len(value)}
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _intent_value(item, sensitive=_sensitive_key(key))
+                for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_intent_value(item) for item in value]
+    if isinstance(value, str) and len(value.encode("utf-8")) > 1024:
+        encoded = value.encode("utf-8")
+        return {"sha256": hashlib.sha256(encoded).hexdigest(), "bytes": len(encoded)}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def canonical_intent(request: ScopeRequest, decision: PolicyDecision) -> dict:
+    paths = sorted({canonical_path(path) for path in request.allowed_paths})
+    hosts = sorted({normalize_network_target(host)[1] for host in request.allowed_hosts})
+    intent = {
+        "tool": request.tool, "effect": decision.effect, "risk_class": decision.risk_class,
+        "target": decision.target, "task_id": request.task_id, "session_id": request.session_id,
+        "allowed_paths": paths, "allowed_hosts": hosts,
+        "destructive": bool(request.destructive), "elevated": bool(request.elevated),
+        "sandbox_escape": bool(request.sandbox_escape),
+        "arguments": _intent_value(request.arguments),
+    }
+    encoded = json_dumps(intent).encode("utf-8")
+    return {"version": 1, "sha256": hashlib.sha256(encoded).hexdigest(), "value": intent}
 
 
 def canonical_path(value: str) -> str:
@@ -220,7 +262,10 @@ def list_rules():
     ensure_state_store()
     conn = connect()
     try:
-        return [dict(row) | {"metadata": json_loads(row["metadata_json"], {})}
+        current = now_utc()
+        return [dict(row) | {"metadata": json_loads(row["metadata_json"], {}),
+                             "expired": bool(row["expires_at"] and row["expires_at"] <= current),
+                             "active": not row["expires_at"] or row["expires_at"] > current}
                 for row in conn.execute(
                     "SELECT * FROM policy_rules ORDER BY created_at DESC"
                 ).fetchall()]

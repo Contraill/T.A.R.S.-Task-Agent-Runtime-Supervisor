@@ -85,9 +85,10 @@ class WorkspaceRecovery:
         self.max_bytes = int(max_bytes)
 
     def _authorize(self, tool, effect, target, *, approval_id=None, task_id=None,
-                   destructive=False):
+                   destructive=False, arguments=None):
         request = ScopeRequest(
-            tool, effect, str(target), task_id=task_id, allowed_paths=self.roots,
+            tool, effect, str(target), arguments or {}, task_id=task_id,
+            allowed_paths=self.roots,
             destructive=destructive,
         )
         return self.runtime.authorize((("action", request),), {"action": approval_id})
@@ -277,7 +278,8 @@ class WorkspaceRecovery:
         checkpoint = load(checkpoint_id)
         root = Path(checkpoint.root)
         actions = self._authorize("workspace.rollback", "destructive", root,
-                                  approval_id=approval_id, task_id=task_id, destructive=True)
+                                  approval_id=approval_id, task_id=task_id, destructive=True,
+                                  arguments={"checkpoint_id": checkpoint_id})
         preview = self.preview(checkpoint_id, task_id=task_id)
         if not preview.data["supported"]:
             data = preview.data | {"restored": False}

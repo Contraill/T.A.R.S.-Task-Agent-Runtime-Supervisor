@@ -144,7 +144,8 @@ class FilesystemTools:
             target.write_bytes(payload)
             return {"path": str(target), "bytes": len(payload),
                     "sha256": hashlib.sha256(payload).hexdigest()}
-        return self._mutate("fs.write", path, operation, arguments={"bytes": len(payload)},
+        return self._mutate("fs.write", path, operation,
+                            arguments={"content": payload, "create": bool(create)},
                             approval_id=approval_id, task_id=task_id, session_id=session_id)
 
     def patch(self, path, replacements, *, approval_id=None, task_id=None, session_id=None):
@@ -163,7 +164,11 @@ class FilesystemTools:
                     "before_sha256": hashlib.sha256(original.encode()).hexdigest(),
                     "after_sha256": hashlib.sha256(updated.encode()).hexdigest()}
         return self._mutate("fs.patch", path, operation,
-                            arguments={"replacements": len(replacements)},
+                            arguments={"replacements": [
+                                {"old_sha256": hashlib.sha256(old.encode()).hexdigest(),
+                                 "new_sha256": hashlib.sha256(new.encode()).hexdigest(),
+                                 "old_bytes": len(old.encode()), "new_bytes": len(new.encode())}
+                                for old, new in replacements]},
                             approval_id=approval_id, task_id=task_id, session_id=session_id)
 
     def copy(self, source, destination, *, approval_ids=None, task_id=None, session_id=None):

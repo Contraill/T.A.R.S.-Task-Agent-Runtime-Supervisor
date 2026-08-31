@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -67,7 +68,9 @@ class DocumentTools:
         actions, reads, writes = self.artifacts.authorize(
             "document.edit", (path,), (path,), approval_ids={"write-0": approval_id},
             task_id=task_id, session_id=session_id,
-            arguments={"replacements": len(replacements)},
+            arguments={"replacements_sha256": hashlib.sha256(json.dumps(
+                list(replacements), ensure_ascii=False, separators=(",", ":")
+            ).encode()).hexdigest()},
         )
         target = writes[0]
         if target.suffix.casefold() not in self.TEXT_FORMATS:
@@ -210,7 +213,11 @@ class SpreadsheetTools:
                     task_id=None, session_id=None):
         actions, reads, writes = self.artifacts.authorize(
             "spreadsheet.write_range", (path,), (path,), approval_ids={"write-0": approval_id},
-            task_id=task_id, session_id=session_id, arguments={"range": cell_range},
+            task_id=task_id, session_id=session_id,
+            arguments={"range": cell_range, "sheet": sheet,
+                       "values_sha256": hashlib.sha256(json.dumps(
+                           values, ensure_ascii=False, separators=(",", ":"), default=str
+                       ).encode()).hexdigest()},
         )
         target = writes[0]
         row1, col1, row2, col2 = self._range(cell_range)
@@ -273,7 +280,7 @@ class SpreadsheetTools:
                task_id=None, session_id=None):
         actions, reads, writes = self.artifacts.authorize(
             "spreadsheet.export", (path,), (output,), approval_ids=approval_ids,
-            task_id=task_id, session_id=session_id,
+            task_id=task_id, session_id=session_id, arguments={"sheet": sheet},
         )
         source, destination = reads[0], writes[0]
         if destination.suffix.casefold() != ".csv":
@@ -311,7 +318,9 @@ class SpreadsheetTools:
         actions, _, writes = self.artifacts.authorize(
             "spreadsheet.formulas", (path,), (path,), approval_ids={"write-0": approval_id},
             task_id=task_id, session_id=session_id,
-            arguments={"cells": sorted(formulas)},
+            arguments={"sheet": sheet, "formulas_sha256": hashlib.sha256(json.dumps(
+                formulas, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+            ).encode()).hexdigest()},
         )
         from openpyxl import load_workbook
         target = writes[0]

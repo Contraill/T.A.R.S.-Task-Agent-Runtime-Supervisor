@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import uuid
 
-from .policy import PolicyDecision, ScopeRequest, add_rule, redact
+from .policy import PolicyDecision, ScopeRequest, add_rule, canonical_intent, redact
 from .state_events import insert_state_event
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 
@@ -56,6 +56,7 @@ class ApprovalBroker:
             "effect": decision.effect,
             "arguments": decision.normalized_arguments,
             "policy_reason": decision.reason,
+            "intent": canonical_intent(request, decision),
         }
         with transaction(immediate=True) as conn:
             conn.execute(
@@ -73,16 +74,23 @@ class ApprovalBroker:
             )
         return self.load(approval_id)
 
-    def decide(self, approval_id: str, *, approve: bool, reason="") -> Approval:
+    def decide(self, approval_id: str, *, approve: bool, reason="", task_id=None,
+               session_id=None) -> Approval:
         approval = self.load(approval_id)
         if approval.state != "pending":
             raise RuntimeError(f"approval is already {approval.state}")
+        if task_id is not None and approval.task_id != task_id:
+            raise PermissionError("approval belongs to another task")
+        if session_id is not None and approval.session_id != session_id:
+            raise PermissionError("approval belongs to another session")
         state = "approved" if approve else "denied"
         with transaction(immediate=True) as conn:
-            conn.execute(
-                "UPDATE approvals SET state=?,decision_reason=?,decided_at=? WHERE id=?",
-                (state, reason, now_utc(), approval_id),
-            )
+            changed = conn.execute(
+                "UPDATE approvals SET state=?,decision_reason=?,decided_at=? "
+                "WHERE id=? AND state='pending'",
+                (state, reason, now_utc(), approval_id)).rowcount
+            if changed != 1:
+                raise RuntimeError("approval changed concurrently")
             insert_state_event(
                 conn, "approval", f"{approval.tool}: {state}",
                 task_id=approval.task_id, session_id=approval.session_id,
@@ -93,6 +101,7 @@ class ApprovalBroker:
         if approve and decided.scope == "persistent":
             add_rule(decided.request["effect"], "allow", target=decided.target,
                      target_kind="path" if decided.tool.startswith("fs.") else None,
+                     expires_at=decided.expires_at,
                      metadata={"approval_id": decided.id, "reason": reason})
         return decided
 
@@ -119,6 +128,7 @@ class ApprovalBroker:
 
     def load(self, approval_id):
         ensure_state_store()
+        self._expire()
         conn = connect()
         try:
             row = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
@@ -130,6 +140,7 @@ class ApprovalBroker:
 
     def list(self, *, state=None, limit=50):
         ensure_state_store()
+        self._expire()
         conn = connect()
         try:
             sql = "SELECT * FROM approvals"
@@ -157,10 +168,30 @@ class ApprovalBroker:
             return False
         if approval.expires_at and approval.expires_at <= now_utc():
             return False
-        if approval.scope == "call" and approval.request.get("arguments") != decision.normalized_arguments:
+        intent = approval.request.get("intent")
+        current_intent = canonical_intent(request, decision)
+        if not intent:
             return False
+        if approval.scope in {"call", "task", "session"}:
+            if intent.get("sha256") != current_intent["sha256"]:
+                return False
+        else:
+            approved_authority = dict(intent.get("value", {}))
+            current_authority = dict(current_intent["value"])
+            approved_authority.pop("arguments", None)
+            current_authority.pop("arguments", None)
+            if approved_authority != current_authority:
+                return False
         if approval.scope == "task":
             return approval.task_id == request.task_id
         if approval.scope == "session":
             return approval.session_id == request.session_id
         return True
+
+    @staticmethod
+    def _expire():
+        with transaction(immediate=True) as conn:
+            conn.execute(
+                "UPDATE approvals SET state='expired',decided_at=COALESCE(decided_at,?) "
+                "WHERE state IN ('pending','approved') AND expires_at IS NOT NULL "
+                "AND expires_at<=?", (now_utc(), now_utc()))

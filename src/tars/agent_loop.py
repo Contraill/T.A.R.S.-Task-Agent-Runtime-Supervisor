@@ -308,7 +308,7 @@ class AgentLoop:
                     if not approval_id or "approve" not in control.payload:
                         raise ValueError("approval control requires approval_id and approve")
                     self.broker.decide(approval_id, approve=bool(control.payload["approve"]),
-                                       reason=control.message)
+                                       reason=control.message, task_id=self.task_id)
                 elif control.kind in {"message", "redirect", "interrupt"}:
                     if task.conversation_id:
                         add_message(

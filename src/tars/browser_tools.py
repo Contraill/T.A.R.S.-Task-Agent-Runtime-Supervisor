@@ -30,7 +30,7 @@ class PlaywrightDriver:
             except ValueError:
                 route.abort("blockedbyclient")
                 return
-            if self.allowed_hosts and host not in self.allowed_hosts:
+            if host not in self.allowed_hosts:
                 route.abort("blockedbyclient")
                 return
             route.continue_()
@@ -118,10 +118,14 @@ class BrowserTools:
         normalized, host = normalize_network_target(url, resolve_dns=True)
         destinations = tuple(allowed_hosts) or (host,)
         request = ScopeRequest(
-            "browser.navigate", "network", normalized, {"profile": "dedicated-tars"},
+            "browser.navigate", "network", normalized,
+            {"profile": "dedicated-tars", "allowed_hosts": sorted(destinations)},
             task_id=task_id, session_id=session_id, allowed_hosts=destinations,
         )
         actions = self.runtime.authorize((("network", request),), {"network": approval_id})
+        retain_hosts = approval_id is None
+        if approval_id is not None:
+            retain_hosts = self.runtime.broker.load(approval_id).scope in {"session", "persistent"}
         try:
             driver = self._driver()
             if hasattr(driver, "set_allowed_hosts"):
@@ -133,8 +137,12 @@ class BrowserTools:
             }:
                 raise PermissionError("browser navigation left the authorized destination set")
         except Exception as exc:
+            if 'driver' in locals() and hasattr(driver, "set_allowed_hosts") and not retain_hosts:
+                driver.set_allowed_hosts(())
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
+        if hasattr(driver, "set_allowed_hosts") and not retain_hosts:
+            driver.set_allowed_hosts(())
         self.runtime.finish(actions, state="succeeded", result=data)
         evidence = self.runtime.evidence("browser", normalized, repr(data), task_id=task_id,
                                          event_uuid=actions[0].event_uuid)

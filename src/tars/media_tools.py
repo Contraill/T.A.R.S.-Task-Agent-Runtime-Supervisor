@@ -51,6 +51,8 @@ class ImageTools:
         actions, reads, writes = self.artifacts.authorize(
             f"image.{operation}", (source,), (output,), approval_ids=approval_ids,
             task_id=task_id, session_id=session_id,
+            arguments={"operation": operation, "size": size, "box": box, "angle": angle,
+                       "format": format, "quality": quality},
         )
         try:
             Image = self._image()

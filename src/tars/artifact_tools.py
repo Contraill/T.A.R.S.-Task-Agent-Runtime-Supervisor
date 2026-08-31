@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
@@ -170,7 +171,7 @@ class ArchiveTools:
                 session_id=None):
         actions, reads, writes = self.artifacts.authorize(
             "archive.extract", (path,), (destination,), approval_ids=approval_ids,
-            task_id=task_id, session_id=session_id,
+            task_id=task_id, session_id=session_id, arguments={"archive": str(path)},
         )
         source, root = reads[0], writes[0]
         try:
@@ -226,6 +227,7 @@ class ArchiveTools:
         actions, reads, writes = self.artifacts.authorize(
             "archive.create", tuple(sources), (output,), approval_ids=approval_ids,
             task_id=task_id, session_id=session_id,
+            arguments={"sources": [str(item) for item in sources], "format": format},
         )
         destination = writes[0]
         kind = format or ("zip" if destination.suffix.casefold() == ".zip" else "tar")
@@ -348,7 +350,8 @@ class PDFTools:
                task_id=None, session_id=None):
         actions, reads, writes = self.artifacts.authorize(
             "pdf.render", (path,), (output_dir,), approval_ids=approval_ids,
-            task_id=task_id, session_id=session_id, arguments={"dpi": dpi},
+            task_id=task_id, session_id=session_id,
+            arguments={"dpi": dpi, "pages": pages},
         )
         target, destination = reads[0], writes[0]
         binary = shutil.which("pdftoppm")
@@ -388,6 +391,12 @@ class PDFTools:
         actions, reads, writes = self.artifacts.authorize(
             f"pdf.{operation}", tuple(inputs), (output,), approval_ids=approval_ids,
             task_id=task_id, session_id=session_id,
+            arguments={
+                "operation": operation, "pages": pages, "rotations": rotations,
+                "form_values_sha256": hashlib.sha256(json.dumps(
+                    form_values or {}, sort_keys=True, ensure_ascii=False,
+                    separators=(",", ":"), default=str).encode()).hexdigest(),
+            },
         )
         destination = writes[0]
         try:
@@ -455,7 +464,7 @@ class PDFTools:
         actions, reads, writes = self.artifacts.authorize(
             "pdf.split", (path,), (output_dir,), approval_ids=approval_ids,
             task_id=task_id, session_id=session_id,
-            arguments={"parts": len(page_groups)},
+            arguments={"page_groups": page_groups},
         )
         source, output_root = reads[0], writes[0]
         try:

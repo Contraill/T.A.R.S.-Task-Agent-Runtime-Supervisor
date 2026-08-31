@@ -10,6 +10,10 @@ class FakeBrowser:
     def __init__(self):
         self.calls = []
         self.closed = False
+        self.allowed_hosts = None
+
+    def set_allowed_hosts(self, hosts):
+        self.allowed_hosts = tuple(hosts)
 
     def call(self, operation, **kwargs):
         self.calls.append((operation, kwargs))
@@ -58,9 +62,11 @@ def test_browser_uses_dedicated_profile_stable_actions_and_evidence(web_environm
     )
     navigate_request = policy.ScopeRequest(
         "browser.navigate", "network", "https://example.com/",
-        {"profile": "dedicated-tars"}, allowed_hosts=("example.com",),
+        {"profile": "dedicated-tars", "allowed_hosts": ["example.com"]},
+        allowed_hosts=("example.com",),
     )
     navigation = browser.navigate("https://example.com", approval_id=_approve(navigate_request))
+    assert driver.allowed_hosts == ()
     snapshot = browser.action("snapshot")
     click_request = policy.ScopeRequest("browser.click", "write", "browser-session", {"ref": "e1"})
     click = browser.action("click", ref="e1", approval_id=_approve(click_request))

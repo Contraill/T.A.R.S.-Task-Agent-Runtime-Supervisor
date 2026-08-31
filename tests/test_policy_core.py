@@ -122,6 +122,53 @@ def test_one_call_approval_is_consumed_and_cannot_authorize_another_call(isolate
         action_journal.begin_action(request, decision, approval_id=approved.id, broker=broker)
 
 
+def test_call_approval_rejects_same_size_different_payload_and_hides_secret(
+        monkeypatch, isolated_policy):
+    monkeypatch.setattr(tasks, "resolve_role_id", lambda value: value)
+    owner = tasks.create_task("owner", "general", make_active=False)
+    other = tasks.create_task("other", "general", make_active=False)
+    target = isolated_policy / "file"
+    first = policy.ScopeRequest(
+        "fs.write", "write", str(target),
+        {"content": b"one", "authorization": "Bearer private-value"},
+        allowed_paths=(str(isolated_policy),), task_id=owner.id)
+    guard = policy.ScopeGuard()
+    broker = approvals.ApprovalBroker()
+    pending = broker.request(first, guard.evaluate(first))
+    assert "private-value" not in str(pending.request)
+    approved = broker.decide(pending.id, approve=True, task_id=owner.id)
+    changed = policy.ScopeRequest(
+        "fs.write", "write", str(target),
+        {"content": b"two", "authorization": "Bearer private-value"},
+        allowed_paths=(str(isolated_policy),), task_id=owner.id)
+    with pytest.raises(PermissionError, match="does not match"):
+        broker.authorize(changed, guard.evaluate(changed), approved.id)
+    with pytest.raises(PermissionError, match="another task"):
+        broker.decide(broker.request(first, guard.evaluate(first)).id,
+                      approve=False, task_id=other.id)
+
+
+def test_persistent_approval_propagates_expiry_and_reports_expired_state(
+        isolated_policy):
+    broker = approvals.ApprovalBroker()
+    request = policy.ScopeRequest("http.get", "network", "https://example.com/")
+    decision = policy.ScopeGuard().evaluate(request)
+    expires = "2999-01-01T00:00:00+00:00"
+    pending = broker.request(request, decision, scope="persistent", expires_at=expires)
+    broker.decide(pending.id, approve=True)
+    rule = next(item for item in policy.list_rules()
+                if item["metadata"].get("approval_id") == pending.id)
+    assert rule["expires_at"] == expires and rule["active"] and not rule["expired"]
+    expired = broker.request(
+        policy.ScopeRequest("fs.write", "write", str(isolated_policy / "old"),
+                            allowed_paths=(str(isolated_policy),)),
+        policy.ScopeGuard().evaluate(policy.ScopeRequest(
+            "fs.write", "write", str(isolated_policy / "old"),
+            allowed_paths=(str(isolated_policy),))),
+        expires_at="2000-01-01T00:00:00+00:00")
+    assert broker.load(expired.id).state == "expired"
+
+
 def test_approval_scope_and_persistent_rule(isolated_policy):
     request = policy.ScopeRequest("http.get", "network", "https://example.com/docs")
     decision = policy.ScopeGuard().evaluate(request)

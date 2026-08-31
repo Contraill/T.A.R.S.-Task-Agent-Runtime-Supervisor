@@ -213,7 +213,7 @@ class ProcessManager:
     def write(self, process_id, data, *, approval_id=None, task_id=None, session_id=None):
         record = self._get(process_id)
         request = ScopeRequest(
-            "process.write", "execute", process_id, {"bytes": len(data.encode())},
+            "process.write", "execute", process_id, {"data": data.encode()},
             task_id=task_id, session_id=session_id,
         )
         actions = self.runtime.authorize((("execute", request),), {"execute": approval_id})

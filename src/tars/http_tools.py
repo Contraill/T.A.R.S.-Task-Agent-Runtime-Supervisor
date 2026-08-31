@@ -72,12 +72,13 @@ class HTTPTools:
                 safe_headers.setdefault("If-Modified-Since", cached.headers["Last-Modified"])
         requests = [("network", ScopeRequest(
             "http.request", "network", current,
-            {"method": method, "headers": safe_headers, "body_bytes": len(body or b"")},
+            {"method": method, "headers": safe_headers, "body": body or b""},
             task_id=task_id, session_id=session_id, allowed_hosts=(approved_host,),
         ))]
         if method not in {"GET", "HEAD"}:
             requests.append(("write", ScopeRequest(
-                "http.request", "write", current, {"method": method},
+                "http.request", "write", current,
+                {"method": method, "headers": safe_headers, "body": body or b""},
                 task_id=task_id, session_id=session_id,
             )))
         output_path = None
