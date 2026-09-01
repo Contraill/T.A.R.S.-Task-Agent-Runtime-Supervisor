@@ -3,6 +3,7 @@ import time
 import multiprocessing
 import os
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -40,8 +41,77 @@ def _start_background_then_exit(database, state_root, log_root, cwd, output):
         if business_pid_path.exists() and descendant_pid_path.exists():
             break
         time.sleep(0.01)
-    output.put((result.data["pid"], int(business_pid_path.read_text()),
-                int(descendant_pid_path.read_text())))
+    output.put((result.data["supervisor_pid"], result.data["pid"],
+                int(business_pid_path.read_text()), int(descendant_pid_path.read_text())))
+
+
+def _start_background_signal_then_wait(database, state_root, log_root, cwd,
+                                       output, commands, acknowledged):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(state_root) / "legacy"
+    state_store.TASK_EVENTS_ROOT = Path(state_root) / "events"
+    state_store.TASK_INDEX_PATH = Path(state_root) / "index"
+    policy.add_rule("sandbox_escape", "allow", target="host")
+    manager = terminal_tools.ProcessManager(log_root=log_root)
+    business_pid_path = Path(state_root) / "signal-business.pid"
+    descendant_pid_path = Path(state_root) / "signal-descendant.pid"
+    ignored = "(signal.SIGTERM,signal.SIGINT,signal.SIGHUP,signal.SIGUSR1,signal.SIGUSR2)"
+    descendant_code = (
+        "import os,signal,time; from pathlib import Path; "
+        f"[signal.signal(value,signal.SIG_IGN) for value in {ignored}]; "
+        f"Path({str(descendant_pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    business_code = (
+        "import os,signal,subprocess,sys,time; from pathlib import Path; "
+        f"[signal.signal(value,signal.SIG_IGN) for value in {ignored}]; "
+        f"subprocess.Popen([sys.executable,'-c',{descendant_code!r}]); "
+        f"Path({str(business_pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    result = manager.start(execution.ExecutionRequest(
+        (sys.executable, "-c", business_code), cwd=cwd, allowed_paths=(cwd,)))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if business_pid_path.exists() and descendant_pid_path.exists():
+            break
+        time.sleep(0.01)
+    output.put((result.data["process_id"], result.data["supervisor_pid"],
+                result.data["pid"], int(descendant_pid_path.read_text())))
+    signal_name = commands.get(timeout=10)
+    approval = _approve(
+        "process.signal", "execute", result.data["process_id"],
+        {"signal": signal_name})
+    truth = manager.signal(
+        result.data["process_id"], signal_name, approval_id=approval)
+    acknowledged.put(truth.data)
+    threading.Event().wait(60)
+
+
+def _process_state(pid):
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return ""
+    return value[value.rfind(")") + 2:].split()[0]
+
+
+def _assert_processes_gone(pids):
+    remaining = set(pids)
+    for _ in range(200):
+        for pid in tuple(remaining):
+            state = _process_state(pid)
+            if not state or state == "Z":
+                remaining.discard(pid)
+        if not remaining:
+            return
+        time.sleep(0.01)
+    for pid in remaining:
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+    pytest.fail(f"managed process topology survived its owner: {remaining}")
 
 
 @pytest.fixture
@@ -240,20 +310,29 @@ def test_background_process_dies_with_owning_manager_process(tmp_path):
     managed_pids = output.get(timeout=10)
     process.join(timeout=10)
     assert process.exitcode == 0
-    remaining = set(managed_pids)
-    for _ in range(200):
-        for pid in tuple(remaining):
-            try:
-                os.kill(pid, 0)
-                stat = Path(f"/proc/{pid}/stat").read_text()
-                if stat[stat.rfind(")") + 2:].split()[0] == "Z":
-                    remaining.discard(pid)
-            except (ProcessLookupError, FileNotFoundError):
-                remaining.discard(pid)
-        if not remaining:
-            break
-        time.sleep(0.01)
-    if remaining:
-        for pid in remaining:
-            os.kill(pid, 9)
-        pytest.fail(f"managed process group survived its owning process: {remaining}")
+    _assert_processes_gone(managed_pids)
+
+
+@pytest.mark.parametrize(
+    "signal_name", ["TERM", "INT", "HUP", "USR1", "USR2", "STOP", "CONT"])
+def test_user_signal_cannot_disable_owner_death_cleanup(tmp_path, signal_name):
+    context = multiprocessing.get_context("spawn")
+    output, commands, acknowledged = context.Queue(), context.Queue(), context.Queue()
+    manager = context.Process(
+        target=_start_background_signal_then_wait,
+        args=(tmp_path / "state.sqlite3", tmp_path, tmp_path / "logs",
+              str(tmp_path), output, commands, acknowledged),
+    )
+    manager.start()
+    process_id, supervisor_pid, business_pid, descendant_pid = output.get(timeout=10)
+    assert process_id.startswith("process-")
+    commands.put(signal_name)
+    truth = acknowledged.get(timeout=10)
+    assert truth["requested"] is True and truth["signal"] == signal_name
+    if signal_name == "STOP":
+        assert _process_state(business_pid) in {"T", "t"}
+        assert _process_state(supervisor_pid) not in {"T", "t"}
+    manager.terminate()
+    manager.join(timeout=10)
+    assert manager.exitcode is not None
+    _assert_processes_gone((supervisor_pid, business_pid, descendant_pid))

@@ -30,11 +30,20 @@ expected_parent = int(sys.argv[1])
 ready_fd = int(sys.argv[2])
 libc = ctypes.CDLL(None, use_errno=True)
 owner_death_signal = signal.SIGRTMIN
+signal.pthread_sigmask(signal.SIG_BLOCK, {owner_death_signal})
 if libc.prctl(1, owner_death_signal) != 0:
     raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+if libc.prctl(36, 1) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
+child_pgid = 0
 def parent_died(_signum=None, _frame=None):
     signal.signal(owner_death_signal, signal.SIG_IGN)
-    os.killpg(os.getpgrp(), signal.SIGKILL)
+    if child_pgid:
+        try:
+            os.killpg(child_pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    os._exit(128 + owner_death_signal)
 signal.signal(owner_death_signal, parent_died)
 def user_signal(_signum=None, _frame=None):
     pass
@@ -44,10 +53,17 @@ for user_signal_number in (
     signal.signal(user_signal_number, user_signal)
 if os.getppid() != expected_parent:
     parent_died()
-child = subprocess.Popen(sys.argv[3:])
-os.write(ready_fd, b"1")
+child = subprocess.Popen(sys.argv[3:], start_new_session=True)
+child_pgid = child.pid
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {owner_death_signal})
+os.write(ready_fd, (str(child_pgid) + "\n").encode("ascii"))
 os.close(ready_fd)
 returncode = child.wait()
+while True:
+    try:
+        os.wait()
+    except ChildProcessError:
+        break
 raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
 """
 
@@ -67,6 +83,8 @@ _USER_PROCESS_SIGNALS = {
 class ManagedProcess:
     id: str
     process: subprocess.Popen
+    business_pid: int
+    process_group_id: int
     argv: tuple[str, ...]
     cwd: str
     target: str
@@ -128,6 +146,7 @@ class ProcessManager:
                         str(os.getpid()), str(ready_write), *argv]
         environment = os.environ.copy()
         process = None
+        business_pid = None
         try:
             resolved = self.secret_store.resolve_many(
                 request.environment_refs, consumer="execution:background")
@@ -141,15 +160,27 @@ class ProcessManager:
             os.close(ready_write)
             ready_write = -1
             readable, _, _ = select.select((ready_read,), (), (), 5.0)
-            if not readable or os.read(ready_read, 1) != b"1":
+            ready_payload = os.read(ready_read, 64) if readable else b""
+            try:
+                business_pid = int(ready_payload.strip())
+            except (TypeError, ValueError):
+                business_pid = None
+            if not business_pid or business_pid <= 1:
                 raise RuntimeError("managed process wrapper did not confirm child startup")
         except Exception as exc:
             if process is not None and process.poll() is None:
                 try:
-                    os.killpg(process.pid, signals.SIGKILL)
+                    os.kill(process.pid, signals.SIGRTMIN)
                 except ProcessLookupError:
                     pass
-                process.wait(timeout=5)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.kill(process.pid, signals.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
             stdout_handle.close()
             stderr_handle.close()
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
@@ -159,8 +190,8 @@ class ProcessManager:
             if ready_write >= 0:
                 os.close(ready_write)
         record = ManagedProcess(
-            process_id, process, request.argv, cwd, "host", _stamp(), stdout_path,
-            stderr_path, actions[-1].id,
+            process_id, process, business_pid, business_pid, request.argv, cwd,
+            "host", _stamp(), stdout_path, stderr_path, actions[-1].id,
         )
         def pump(source, destination):
             try:
@@ -187,7 +218,9 @@ class ProcessManager:
         )
         watcher.start()
         data = {
-            "process_id": process_id, "pid": process.pid, "target": "host", "cwd": cwd,
+            "process_id": process_id, "pid": business_pid,
+            "process_group_id": business_pid, "supervisor_pid": process.pid,
+            "target": "host", "cwd": cwd,
             "state": "running", "cancellable": True,
             "stdout_ref": str(stdout_path), "stderr_ref": str(stderr_path),
         }
@@ -263,7 +296,9 @@ class ProcessManager:
 
     def _status(self, record):
         code = self._refresh(record)
-        return {"process_id": record.id, "pid": record.process.pid,
+        return {"process_id": record.id, "pid": record.business_pid,
+                "process_group_id": record.process_group_id,
+                "supervisor_pid": record.process.pid,
                 "state": "running" if code is None else "exited", "exit_code": code,
                 "cancellable": record.cancellable, "started_at": record.started_at,
                 "completed_at": record.completed_at,
@@ -360,7 +395,7 @@ class ProcessManager:
         requested = False
         if record.process.poll() is None:
             try:
-                os.killpg(record.process.pid, number)
+                os.killpg(record.process_group_id, number)
                 requested = True
             except ProcessLookupError:
                 requested = False
