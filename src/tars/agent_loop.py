@@ -22,7 +22,8 @@ from .conversation import add_message
 from .evidence import load as load_evidence
 from .events import append_event
 from .policy import ScopeRequest
-from .ownership import Heartbeat, Owner, active as lease_active, claim, release as release_lease
+from .ownership import (Heartbeat, Owner, active as lease_active, current_owner,
+                        held_by, task_execution_scope)
 from .runtime import chat_completion
 from .state_events import append_state_event
 from .tasks import canonical_task_state, load_task, update_task
@@ -292,7 +293,7 @@ class AgentLoop:
         self.completion = completion or CompletionContract()
         self.broker = broker or ApprovalBroker()
         self.clock = clock
-        self.owner = Owner.create("agent-loop")
+        self.owner = current_owner() or Owner.create("agent-loop")
         self._active_lock = threading.Lock()
         self._active_binding = None
         self._active_tool = ""
@@ -300,6 +301,7 @@ class AgentLoop:
         self._cancellation_condition = threading.Condition()
         self._cancellation_outcomes = {}
         self._cancellation_threads = set()
+        self._run_lock = threading.Lock()
 
     def submit_control(self, kind, message="", *, session_id=None, payload=None):
         kind = str(kind).casefold()
@@ -483,18 +485,28 @@ class AgentLoop:
                                          sort_keys=True, default=str).encode()).hexdigest()
 
     def run(self):
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError(f"task {self.task_id} already has an active agent loop")
+        try:
+            return self._run_once()
+        finally:
+            self._run_lock.release()
+
+    def _run_once(self):
         task = load_task(self.task_id)
         if task.state in {"completed", "cancelled"}:
             raise RuntimeError(f"task {task.id} is {task.state}")
-        if not claim("task-execution", task.id, self.owner, lease_seconds=30,
-                     metadata={"engine": "agent-loop"}):
-            raise RuntimeError(f"task {task.id} already has a live execution owner")
-        try:
+        inherited_execution = held_by("task-execution", task.id, self.owner)
+        with task_execution_scope(
+                task.id, engine="agent-loop", owner=self.owner, lease_seconds=30):
+            task = load_task(self.task_id)
+            if task.state in {"completed", "cancelled"}:
+                raise RuntimeError(f"task {task.id} is {task.state}")
             # Reconcile dead control owners even when task execution itself is
             # ambiguous and must fail closed rather than replay.
             recover_processing(task.id, self.owner)
             recover_cancellations(task.id, self.owner)
-            if task.state == "running":
+            if task.state == "running" and not inherited_execution:
                 update_task(task.id, state="failed", phase="execution-owner-lost",
                             failures=[*task.failures,
                                       "previous execution outcome is ambiguous"])
@@ -505,13 +517,12 @@ class AgentLoop:
                 if task.id in _ACTIVE_LOOPS:
                     raise RuntimeError(f"task {task.id} already has an active agent loop")
                 _ACTIVE_LOOPS[task.id] = self
-            with Heartbeat("task-execution", task.id, self.owner, lease_seconds=30):
+            try:
                 return self._run_registered(task)
-        finally:
-            with _ACTIVE_LOOPS_LOCK:
-                if _ACTIVE_LOOPS.get(task.id) is self:
-                    del _ACTIVE_LOOPS[task.id]
-            release_lease("task-execution", task.id, self.owner)
+            finally:
+                with _ACTIVE_LOOPS_LOCK:
+                    if _ACTIVE_LOOPS.get(task.id) is self:
+                        del _ACTIVE_LOOPS[task.id]
 
     def _run_registered(self, task):
         update_task(task.id, state="running", phase="agent-loop")

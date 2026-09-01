@@ -26,6 +26,10 @@ _LOCK = threading.RLock()
 _RUNS: dict[str, tuple[Future, threading.Event, Owner]] = {}
 
 
+class _TaskExecutionConflict(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class DelegationContract:
     delegation_id: str
@@ -230,7 +234,8 @@ def _set_state(delegation_id, state, *, expected=None, owner=None, **fields):
             raise RuntimeError(f"delegation {delegation_id} changed concurrently")
 
 
-def _finish_execution(delegation_id, owner, contract_state, *, status, summary, result):
+def _finish_execution(delegation_id, owner, contract_state, *, status, summary, result,
+                      update_child=True):
     stamp = now_utc()
     delegation = load_delegation(delegation_id)
     delegation_state = "completed" if status in {"success", "partial"} else status
@@ -260,10 +265,12 @@ def _finish_execution(delegation_id, owner, contract_state, *, status, summary, 
         ).rowcount
         if changed != 1:
             raise RuntimeError(f"delegation {delegation_id} result changed concurrently")
-        conn.execute(
-            "UPDATE tasks SET state=?,phase=?,updated_at=? WHERE id=?",
-            (child_state, f"delegation-{contract_state}", stamp, delegation.child_task_id),
-        )
+        if update_child:
+            conn.execute(
+                "UPDATE tasks SET state=?,phase=?,updated_at=? WHERE id=?",
+                (child_state, f"delegation-{contract_state}", stamp,
+                 delegation.child_task_id),
+            )
         conn.execute(
             "DELETE FROM resource_leases WHERE resource_type='delegation' "
             "AND resource_key=? AND owner_token=?", (delegation_id, owner.token),
@@ -362,6 +369,14 @@ def start(delegation_id, executor):
                     delegation_id, owner, "cancelled", status="cancelled",
                     summary="cancelled before start", result={"cancelled": True})
             resource_lease = max(30.0, float(contract.budget["max_seconds"]) + 5)
+            if not claim(
+                "task-execution", delegation.child_task_id, owner,
+                lease_seconds=resource_lease,
+                metadata={"engine": "delegation", "delegation_id": delegation_id},
+            ):
+                raise _TaskExecutionConflict(
+                    f"task {delegation.child_task_id} already has a live execution owner")
+            acquired.append(("task-execution", delegation.child_task_id))
             if contract.workspace.get("exclusive") and contract.workspace.get("root"):
                 workspace_key = contract.workspace["root"]
                 deadline_stamp = time.monotonic() + contract.budget["max_seconds"]
@@ -418,6 +433,7 @@ def start(delegation_id, executor):
                         delegation_id, owner,
                         "timed_out" if timed_out.is_set() else "failed", status="failed",
                         summary=str(exc), result={"error": str(exc)},
+                        update_child=not isinstance(exc, _TaskExecutionConflict),
                     )
                 except RuntimeError:
                     pass

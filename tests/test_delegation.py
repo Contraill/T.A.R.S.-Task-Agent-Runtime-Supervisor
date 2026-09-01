@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tars import delegation, evidence, fs_tools, memory, orchestration, state_store, tasks
+from tars import (agent_loop, delegation, evidence, fs_tools, memory, orchestration,
+                  ownership, runner, state_store, tasks)
 from tars.agent_loop import ToolDispatcher
 from tars.tool_core import ToolResult
 from tars.cli import build_parser
@@ -33,6 +34,26 @@ def _run_delegation_process(database, scratch, memory_root, history_root,
         return {"summary": "process complete"}
     future = delegation.start(delegation_id, execute)
     future.result(timeout=15)
+
+
+def _run_agent_task_process(database, scratch, task_id, entered, release, output):
+    _configure_child_state(database, scratch, Path(scratch) / "memory",
+                           Path(scratch) / "history")
+
+    def model(current, controls):
+        entered.set()
+        release.wait(10)
+        return {"type": "finish", "summary": "agent complete"}
+
+    try:
+        outcome = agent_loop.AgentLoop(
+            task_id, model, agent_loop.ToolDispatcher(),
+            completion=agent_loop.CompletionContract(require_evidence=False),
+        ).run()
+    except Exception as exc:
+        output.put(("error", str(exc)))
+    else:
+        output.put(("ok", outcome.state))
 
 
 def _strand_memory_review(database, scratch, memory_root, history_root, candidate_id):
@@ -163,6 +184,23 @@ def test_child_run_join_and_parent_evidence_acceptance(delegated):
         "requested": False, "state": "accepted", "cancelled": False}
 
 
+def test_delegation_can_compose_agent_loop_under_same_task_owner(delegated):
+    _, _, create = delegated
+    contract = create()
+
+    def execute(context):
+        outcome = agent_loop.AgentLoop(
+            context["task_id"],
+            lambda current, controls: {"type": "finish", "summary": "child done"},
+            agent_loop.ToolDispatcher(),
+            completion=agent_loop.CompletionContract(require_evidence=False),
+        ).run()
+        return {"summary": outcome.reason}
+
+    future = delegation.start(contract.delegation_id, execute)
+    assert future.result(timeout=10).state == "completed"
+
+
 def test_delegation_has_one_live_executor_across_processes(delegated):
     _, root, create = delegated
     (root / "value.txt").write_text("value")
@@ -185,6 +223,74 @@ def test_delegation_has_one_live_executor_across_processes(delegated):
     process.join(timeout=10)
     assert process.exitcode == 0
     assert delegation.load_contract(contract.delegation_id).state == "completed"
+
+
+def test_delegation_child_lease_blocks_runner_and_cross_process_agent(delegated):
+    _, _, create = delegated
+    contract = create()
+    child_id = orchestration.load_delegation(contract.delegation_id).child_task_id
+    entered, release = threading.Event(), threading.Event()
+
+    def execute(context):
+        entered.set()
+        assert release.wait(10)
+        return {"summary": "delegation complete"}
+
+    future = delegation.start(contract.delegation_id, execute)
+    assert entered.wait(5)
+    with pytest.raises(RuntimeError, match="live execution owner"):
+        runner.create_run(child_id)
+
+    context = multiprocessing.get_context("spawn")
+    agent_entered, agent_release = context.Event(), context.Event()
+    output = context.Queue()
+    process = context.Process(
+        target=_run_agent_task_process,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              child_id, agent_entered, agent_release, output),
+    )
+    process.start()
+    assert output.get(timeout=10) == (
+        "error", f"task {child_id} already has a live execution owner")
+    process.join(timeout=10)
+    assert process.exitcode == 0 and not agent_entered.is_set()
+
+    release.set()
+    assert future.result(timeout=10).state == "completed"
+    assert not ownership.active("task-execution", child_id)
+
+
+def test_live_cross_process_agent_blocks_delegation_without_clobbering_task(delegated):
+    _, _, create = delegated
+    contract = create()
+    child_id = orchestration.load_delegation(contract.delegation_id).child_task_id
+    context = multiprocessing.get_context("spawn")
+    entered, release = context.Event(), context.Event()
+    output = context.Queue()
+    process = context.Process(
+        target=_run_agent_task_process,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              child_id, entered, release, output),
+    )
+    process.start()
+    assert entered.wait(5)
+
+    calls = []
+    future = delegation.start(
+        contract.delegation_id,
+        lambda child_context: calls.append(True) or {"summary": "duplicate"},
+    )
+    with pytest.raises(RuntimeError, match="live execution owner"):
+        future.result(timeout=10)
+    assert calls == []
+    assert delegation.load_contract(contract.delegation_id).state == "failed"
+    assert tasks.load_task(child_id).state == "running"
+
+    release.set()
+    assert output.get(timeout=10) == ("ok", "completed")
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    assert not ownership.active("task-execution", child_id)
 
 
 def test_dead_running_delegation_is_not_replayed(delegated):

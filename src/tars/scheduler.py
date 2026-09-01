@@ -13,7 +13,7 @@ from typing import Callable, Mapping
 from .checkpoints import latest_checkpoint
 from . import state_store as _state_store
 from .ownership import (Heartbeat, Owner, claim, claim_in_transaction,
-                        release as release_lease)
+                        release as release_lease, task_execution_scope)
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import append_event, load_task
 
@@ -542,7 +542,11 @@ class Scheduler:
             try:
                 with Heartbeat("schedule-run", run.id, self.owner,
                                lease_seconds=self.lease_seconds):
-                    result = executor(load_run(run.id)) or {}
+                    with task_execution_scope(
+                            run.task_id, engine="scheduler", owner=self.owner,
+                            lease_seconds=self.lease_seconds,
+                            metadata={"schedule_run_id": run.id}):
+                        result = executor(load_run(run.id)) or {}
             except Exception as exc:
                 checkpoint = latest_checkpoint(run.task_id)
                 self._finish(run.id, "failed", error=str(exc),

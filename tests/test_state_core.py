@@ -93,6 +93,22 @@ def test_dead_running_task_owner_is_terminalized_before_new_run(
     assert recovered.state == "failed" and recovered.finish_reason == "owner-lost"
 
 
+def test_task_execution_scope_borrows_exact_owner_without_releasing_outer(
+        monkeypatch, isolated_state):
+    monkeypatch.setattr(tasks, "resolve_role_id", lambda value: value)
+    task = tasks.create_task("reentrant owner", "general", make_active=False)
+    owner = ownership.Owner.create("outer-engine")
+    with ownership.task_execution_scope(
+            task.id, engine="outer", owner=owner) as outer:
+        assert outer == owner
+        assert ownership.held_by("task-execution", task.id, owner)
+        with ownership.task_execution_scope(
+                task.id, engine="nested", owner=owner) as nested:
+            assert nested == owner
+        assert ownership.held_by("task-execution", task.id, owner)
+    assert not ownership.active("task-execution", task.id)
+
+
 def test_schema_upgrade_preserves_existing_conversation(isolated_state):
     state_store.ensure_state_store()
     conv = conversation.create_conversation(title="before upgrade")

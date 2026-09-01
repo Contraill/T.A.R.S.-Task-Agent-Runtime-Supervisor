@@ -130,6 +130,30 @@ def test_agent_loop_has_one_live_owner_across_processes(loop_state):
     assert process.exitcode == 0
 
 
+def test_same_agent_loop_instance_cannot_borrow_its_owner_concurrently(loop_state):
+    task, _ = loop_state
+    entered, release = threading.Event(), threading.Event()
+
+    def model(current, controls):
+        entered.set()
+        assert release.wait(5)
+        return {"type": "finish", "summary": "done"}
+
+    loop = agent_loop.AgentLoop(
+        task.id, model, agent_loop.ToolDispatcher(),
+        completion=agent_loop.CompletionContract(require_evidence=False),
+    )
+    holder = {}
+    thread = threading.Thread(target=lambda: holder.setdefault("outcome", loop.run()))
+    thread.start()
+    assert entered.wait(5)
+    with pytest.raises(RuntimeError, match="active agent loop"):
+        loop.run()
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive() and holder["outcome"].state == "completed"
+
+
 def test_dead_agent_loop_owner_is_not_automatically_replayed(loop_state):
     task, _ = loop_state
     context = multiprocessing.get_context("spawn")

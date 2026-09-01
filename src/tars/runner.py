@@ -7,8 +7,8 @@ from .checkpoints import create_checkpoint
 from .context import ContextManager
 from .conversation import active_conversation, add_message, create_conversation
 from .events import append_event
-from .ownership import (Heartbeat, Owner, claim, claim_in_transaction,
-                        release as release_lease)
+from .ownership import (Owner, claim_in_transaction, current_owner,
+                        task_execution_scope)
 from .roles import get_role
 from .runtime import chat_completion_stream
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
@@ -63,7 +63,7 @@ def create_run(task_id: str, conversation_id: str | None = None) -> TaskRun:
         conversation_id = conv.id
     run_id = "run-" + uuid.uuid4().hex
     now = now_utc()
-    recovery_owner = Owner.create("task-run-create")
+    recovery_owner = current_owner() or Owner.create("task-run-create")
     with transaction(immediate=True) as conn:
         current = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not current:
@@ -82,7 +82,14 @@ def create_run(task_id: str, conversation_id: str | None = None) -> TaskRun:
             "SELECT id,state FROM task_runs WHERE task_id=? "
             "AND state IN ('queued','running','paused') LIMIT 1", (task_id,),
         ).fetchone()
-        can_claim = claim_in_transaction(
+        lease = conn.execute(
+            "SELECT owner_token,expires_at FROM resource_leases "
+            "WHERE resource_type='task-execution' AND resource_key=?", (task_id,),
+        ).fetchone()
+        borrowed = bool(
+            lease and lease["owner_token"] == recovery_owner.token
+            and lease["expires_at"] > now)
+        can_claim = borrowed or claim_in_transaction(
             conn, "task-execution", task_id, recovery_owner, lease_seconds=30,
             metadata={"operation": "create-run"},
         )
@@ -90,20 +97,22 @@ def create_run(task_id: str, conversation_id: str | None = None) -> TaskRun:
             raise RuntimeError(f"task {task.id} already has a live execution owner")
         if existing:
             if existing["state"] != "running":
-                conn.execute(
-                    "DELETE FROM resource_leases WHERE resource_type='task-execution' "
-                    "AND resource_key=? AND owner_token=?", (task_id, recovery_owner.token),
-                )
+                if not borrowed:
+                    conn.execute(
+                        "DELETE FROM resource_leases WHERE resource_type='task-execution' "
+                        "AND resource_key=? AND owner_token=?", (task_id, recovery_owner.token),
+                    )
                 raise RuntimeError(f"task {task.id} already has active run {existing['id']}")
             conn.execute(
                 "UPDATE task_runs SET state='failed',finished_at=?,finish_reason='owner-lost',"
                 "error='previous execution outcome is ambiguous' WHERE id=? AND state='running'",
                 (now, existing["id"]),
             )
-        conn.execute(
-            "DELETE FROM resource_leases WHERE resource_type='task-execution' "
-            "AND resource_key=? AND owner_token=?", (task_id, recovery_owner.token),
-        )
+        if not borrowed:
+            conn.execute(
+                "DELETE FROM resource_leases WHERE resource_type='task-execution' "
+                "AND resource_key=? AND owner_token=?", (task_id, recovery_owner.token),
+            )
         conn.execute(
             """
             INSERT INTO task_runs(
@@ -235,11 +244,11 @@ def _apply_boundary_control(run: TaskRun) -> TaskRun:
 
 def run_task_epoch(cfg, run_id: str, *, on_stream=None, max_tokens=None) -> dict:
     run = load_run(run_id)
-    owner = Owner.create("task-runner")
-    if not claim("task-execution", run.task_id, owner, lease_seconds=30,
-                 metadata={"engine": "reasoning-epoch", "run_id": run.id}):
-        raise RuntimeError(f"task {run.task_id} already has a live execution owner")
-    try:
+    owner = current_owner() or Owner.create("task-runner")
+    with task_execution_scope(
+            run.task_id, engine="reasoning-epoch", owner=owner, lease_seconds=30,
+            metadata={"run_id": run.id}):
+        run = load_run(run_id)
         if run.state == "running":
             _set_run(
                 run.id, state="failed", finished_at=now_utc(),
@@ -248,10 +257,7 @@ def run_task_epoch(cfg, run_id: str, *, on_stream=None, max_tokens=None) -> dict
             update_task(run.task_id, state="failed", phase="execution-owner-lost")
             raise RuntimeError(
                 f"run {run.id} lost its previous owner; automatic replay is unsafe")
-        with Heartbeat("task-execution", run.task_id, owner, lease_seconds=30):
-            return _run_task_epoch(cfg, run_id, on_stream=on_stream, max_tokens=max_tokens)
-    finally:
-        release_lease("task-execution", run.task_id, owner)
+        return _run_task_epoch(cfg, run_id, on_stream=on_stream, max_tokens=max_tokens)
 
 
 def _run_task_epoch(cfg, run_id: str, *, on_stream=None, max_tokens=None) -> dict:

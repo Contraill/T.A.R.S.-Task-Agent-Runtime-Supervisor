@@ -171,6 +171,37 @@ def active(resource_type, resource_key) -> bool:
                 and owner_alive(row["owner_pid"], row["owner_start"]))
 
 
+@contextmanager
+def task_execution_scope(task_id, *, engine, owner=None, lease_seconds=30.0,
+                         metadata=None):
+    """Own one task across execution engines, borrowing an exact outer owner token."""
+    selected = owner or current_owner() or Owner.create(str(engine))
+    scoped = current_owner()
+    borrowed = bool(
+        scoped and scoped.token == selected.token
+        and held_by("task-execution", task_id, selected)
+    )
+    details = {"engine": str(engine)} | dict(metadata or {})
+    if not claim(
+        "task-execution", task_id, selected,
+        lease_seconds=lease_seconds, metadata=details,
+    ):
+        raise RuntimeError(f"task {task_id} already has a live execution owner")
+    try:
+        with owner_scope(selected):
+            if borrowed:
+                yield selected
+            else:
+                with Heartbeat(
+                    "task-execution", task_id, selected,
+                    lease_seconds=lease_seconds,
+                ):
+                    yield selected
+    finally:
+        if not borrowed:
+            release("task-execution", task_id, selected)
+
+
 def acquire(resource_type, resource_key, owner: Owner, *, lease_seconds=30.0,
             timeout=0.0, cancel_event=None, metadata=None) -> bool:
     deadline = datetime.now(timezone.utc).timestamp() + max(0.0, float(timeout))

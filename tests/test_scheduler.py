@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from tars import checkpoints, cli, scheduler, state_store, tasks
+from tars import checkpoints, cli, ownership, runner, scheduler, state_store, tasks
 
 
 @pytest.fixture
@@ -197,6 +197,51 @@ def test_live_scheduler_run_is_not_reclaimed_by_second_process(scheduled_state):
     assert process.exitcode == 0
     assert contender.recover() == 1
     assert scheduler.load_run(run_id).state == "failed"
+
+
+def test_scheduler_task_owner_is_reentrant_for_nested_runner_creation(scheduled_state):
+    task = make_task()
+    scheduler.create_schedule(task.id, "one-shot", utc().isoformat(), now=utc(11))
+    engine = scheduler.Scheduler()
+    engine.claim_due(now=utc())
+    observed = []
+
+    def execute(scheduled_run):
+        assert ownership.current_owner() == engine.owner
+        assert ownership.held_by("task-execution", task.id, engine.owner)
+        task_run = runner.create_run(task.id)
+        assert ownership.held_by("task-execution", task.id, engine.owner)
+        runner._set_run(
+            task_run.id, state="completed", finished_at=state_store.now_utc(),
+            finish_reason="test-boundary",
+        )
+        observed.append(task_run.id)
+        return {"task_run_id": task_run.id}
+
+    completed = engine.execute_claimed(execute)
+    assert completed[0].state == "succeeded" and observed
+    assert not ownership.active("task-execution", task.id)
+
+
+def test_scheduler_does_not_invoke_executor_while_task_has_live_owner(scheduled_state):
+    task = make_task()
+    scheduler.create_schedule(task.id, "one-shot", utc().isoformat(), now=utc(11))
+    engine = scheduler.Scheduler()
+    engine.claim_due(now=utc())
+    live_owner = ownership.Owner.create("other-engine")
+    assert ownership.claim(
+        "task-execution", task.id, live_owner, lease_seconds=30,
+        metadata={"engine": "other"})
+    called = []
+    try:
+        completed = engine.execute_claimed(
+            lambda scheduled_run: called.append(True) or {"duplicate": True})
+    finally:
+        ownership.release("task-execution", task.id, live_owner)
+    assert called == []
+    assert completed[0].state == "failed"
+    assert "live execution owner" in completed[0].error
+    assert tasks.load_task(task.id).state == "pending"
 
 
 def test_delivery_has_one_owner_and_ambiguous_failures_are_not_replayed(scheduled_state):
