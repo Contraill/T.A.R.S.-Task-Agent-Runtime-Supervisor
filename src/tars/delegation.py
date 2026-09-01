@@ -353,7 +353,12 @@ def _execute_bounded(executor, context, maximum, cancel_event):
         if (loop.limits.max_iterations > maximum
                 or loop.limits.max_seconds > limits.max_seconds):
             raise PermissionError("delegated AgentLoop widened its execution budget")
-        outcome = loop.run()
+        try:
+            outcome = loop.run()
+        finally:
+            quiescent = loop.close(timeout=1.0)
+        if not quiescent:
+            raise RuntimeError("delegated AgentLoop cancellation did not quiesce")
         if outcome.iterations > maximum:
             raise RuntimeError("child exceeded delegated iteration budget")
         if (outcome.state == "paused"

@@ -73,6 +73,17 @@ def claim_in_transaction(conn, resource_type, resource_key, owner: Owner, *,
         "SELECT * FROM resource_leases WHERE resource_type=? AND resource_key=?",
         (resource_type, resource_key),
     ).fetchone()
+    if resource_type == "task-execution":
+        fence = conn.execute(
+            "SELECT 1 FROM resource_leases "
+            "WHERE resource_type='task-execution-fence' AND resource_key=?",
+            (resource_key,),
+        ).fetchone()
+        task = conn.execute(
+            "SELECT phase FROM tasks WHERE id=?", (resource_key,),
+        ).fetchone()
+        if fence or (task and task["phase"] == "cancellation-recovery-required"):
+            return False
     if (row and row["owner_token"] != owner.token and row["expires_at"] > stamp
             and owner_alive(row["owner_pid"], row["owner_start"])):
         return False
@@ -181,6 +192,18 @@ def active(resource_type, resource_key) -> bool:
                 and owner_alive(row["owner_pid"], row["owner_start"]))
 
 
+def task_execution_fenced(task_id) -> bool:
+    ensure_state_store()
+    with connect() as conn:
+        fence = conn.execute(
+            "SELECT 1 FROM resource_leases "
+            "WHERE resource_type='task-execution-fence' AND resource_key=?",
+            (task_id,),
+        ).fetchone()
+        task = conn.execute("SELECT phase FROM tasks WHERE id=?", (task_id,)).fetchone()
+    return bool(fence or (task and task["phase"] == "cancellation-recovery-required"))
+
+
 @contextmanager
 def model_execution_scope(*, operation, lease_seconds=30.0, timeout=30.0,
                           metadata=None):
@@ -216,6 +239,15 @@ def task_execution_scope(task_id, *, engine, owner=None, lease_seconds=30.0,
                          metadata=None):
     """Own one task across execution engines, borrowing an exact outer owner token."""
     selected = owner or current_owner() or Owner.create(str(engine))
+    # Recovery never invokes the external callback. It resolves an unattempted
+    # dead owner or atomically places an attempted outcome into fail-closed state.
+    from .control_queue import recover_cancellations
+    recover_cancellations(task_id, selected, lease_seconds=lease_seconds)
+    with connect() as conn:
+        task = conn.execute("SELECT phase FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if task and task["phase"] == "cancellation-recovery-required":
+        raise RuntimeError(
+            f"task {task_id} requires explicit recovery after ambiguous cancellation")
     scoped = current_owner()
     borrowed = bool(
         scoped and scoped.token == selected.token

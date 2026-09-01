@@ -12,6 +12,8 @@ from .approvals import ApprovalBroker
 from .checkpoints import create_checkpoint
 from .context import ContextManager
 from .control_queue import (claim_next, enqueue, enqueue_cancellation,
+                            abandon_cancellation,
+                            CANCELLATION_RECOVERY_PHASE,
                             finish as finish_control, pending_context,
                             recover_cancellations, recover_processing,
                             reconcile_cancellation, begin_cancellation,
@@ -23,7 +25,7 @@ from .evidence import load as load_evidence
 from .events import append_event
 from .policy import ScopeRequest
 from .ownership import (Heartbeat, Owner, active as lease_active, current_owner,
-                        held_by, task_execution_scope)
+                        held_by, task_execution_fenced, task_execution_scope)
 from .runtime import chat_completion
 from .state_events import append_state_event
 from .tasks import canonical_task_state, load_task, update_task
@@ -55,7 +57,8 @@ def submit_task_control(task_id, kind, message="", *, session_id=None, payload=N
 def is_task_loop_active(task_id):
     with _ACTIVE_LOOPS_LOCK:
         local = task_id in _ACTIVE_LOOPS
-    return local or lease_active("task-execution", task_id)
+    return (local or lease_active("task-execution", task_id)
+            or task_execution_fenced(task_id))
 
 
 @dataclass(frozen=True)
@@ -308,9 +311,21 @@ class AgentLoop:
         self._cancellation_condition = threading.Condition()
         self._cancellation_outcomes = {}
         self._cancellation_threads = set()
+        self._cancellation_control_ids = {}
+        self._cancellation_heartbeats = {}
+        self._closing = False
+        self._lifecycle_lock = threading.Lock()
         self._run_lock = threading.Lock()
 
     def submit_control(self, kind, message="", *, session_id=None, payload=None):
+        with self._lifecycle_lock:
+            return self._submit_control(
+                kind, message, session_id=session_id, payload=payload)
+
+    def _submit_control(self, kind, message="", *, session_id=None, payload=None):
+        with self._cancellation_condition:
+            if self._closing:
+                raise RuntimeError("agent loop is closing")
         kind = str(kind).casefold()
         if kind not in {"interrupt", "cancel"}:
             control = enqueue(
@@ -371,6 +386,7 @@ class AgentLoop:
                         )
                         with self._cancellation_condition:
                             self._cancellation_threads.add(thread)
+                            self._cancellation_control_ids[thread] = control.id
                         try:
                             thread.start()
                         except Exception:
@@ -378,6 +394,7 @@ class AgentLoop:
                                 self._cancellation_outcomes[control.id] = (
                                     False, "cancellation-worker-start-failed", False)
                                 self._cancellation_threads.discard(thread)
+                                self._cancellation_control_ids.pop(thread, None)
                                 self._cancellation_condition.notify_all()
                             self._retry_cancellation_reconciliations()
         return control, "Control queued."
@@ -386,9 +403,12 @@ class AgentLoop:
         result = None
         error = ""
         ambiguous = False
+        heartbeat = Heartbeat(
+            "control-cancellation", control_id, self.owner, lease_seconds=30)
+        with self._cancellation_condition:
+            self._cancellation_heartbeats[control_id] = heartbeat
         try:
-            with Heartbeat("control-cancellation", control_id, self.owner,
-                           lease_seconds=30):
+            with heartbeat:
                 returned = binding.cancel()
                 if isinstance(returned, dict):
                     value = dict.get(returned, "requested")
@@ -406,7 +426,45 @@ class AgentLoop:
         finally:
             with self._cancellation_condition:
                 self._cancellation_threads.discard(threading.current_thread())
+                self._cancellation_control_ids.pop(threading.current_thread(), None)
+                self._cancellation_heartbeats.pop(control_id, None)
                 self._cancellation_condition.notify_all()
+
+    def close(self, timeout=1.0):
+        """Bound shutdown waiting and report whether cancellation work quiesced."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._lifecycle_lock:
+            with self._cancellation_condition:
+                self._closing = True
+                threads = tuple(self._cancellation_threads)
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._cancellation_condition:
+            alive = tuple(thread for thread in self._cancellation_threads if thread.is_alive())
+            controls = tuple(
+                self._cancellation_control_ids.get(thread) for thread in alive)
+            for control_id in controls:
+                heartbeat = self._cancellation_heartbeats.get(control_id)
+                if heartbeat is not None:
+                    heartbeat.stop_event.set()
+        for control_id in filter(None, controls):
+            try:
+                abandon_cancellation(
+                    control_id, self.owner, error="shutdown-not-quiescent")
+            except Exception:
+                pass
+        try:
+            recover_cancellations(self.task_id, self.owner)
+        except Exception:
+            pass
+        self._retry_cancellation_reconciliations()
+        try:
+            unresolved = unreconciled_cancellation(self.task_id)
+        except Exception:
+            unresolved = True
+        with self._cancellation_condition:
+            pending_outcomes = bool(self._cancellation_outcomes)
+        return not alive and not pending_outcomes and unresolved is None
 
     def _retry_cancellation_reconciliations(self):
         with self._cancellation_condition:
@@ -452,7 +510,11 @@ class AgentLoop:
             try:
                 with Heartbeat("task-control", control.id, self.owner, lease_seconds=30):
                     task = load_task(self.task_id)
-                    if control.kind == "approval":
+                    if control.payload.get("cancellation_phase") == "ambiguous":
+                        update_task(
+                            task.id, state="failed", phase=CANCELLATION_RECOVERY_PHASE)
+                        stop = "failed"
+                    elif control.kind == "approval":
                         approval_id = control.payload.get("approval_id")
                         if not approval_id or "approve" not in control.payload:
                             raise ValueError("approval control requires approval_id and approve")
@@ -492,6 +554,9 @@ class AgentLoop:
                                          sort_keys=True, default=str).encode()).hexdigest()
 
     def run(self):
+        with self._cancellation_condition:
+            if self._closing:
+                raise RuntimeError("agent loop is closing")
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError(f"task {self.task_id} already has an active agent loop")
         try:
