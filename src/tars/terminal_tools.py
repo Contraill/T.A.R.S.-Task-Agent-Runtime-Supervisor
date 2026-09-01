@@ -15,7 +15,7 @@ import uuid
 from .config import STATE_ROOT
 from .execution_backends import ExecutionRequest, GuardedExecutor, HostBackend, ResourceLimits
 from .action_journal import load_action
-from .ownership import Heartbeat, Owner, claim, owner_alive, process_start, release
+from .ownership import Heartbeat, Owner, claim, owner_gone, process_start, release
 from .policy import ScopeRequest, canonical_path
 from .state_store import connect, ensure_state_store, json_loads, now_utc, transaction
 from .tool_core import ToolResult, ToolRuntime
@@ -166,7 +166,7 @@ class ProcessManager:
                 "FROM resource_leases WHERE resource_type='managed-process'"
             ).fetchall()
             for row in rows:
-                if owner_alive(row["owner_pid"], row["owner_start"]):
+                if not owner_gone(row["owner_pid"], row["owner_start"]):
                     continue
                 conn.execute(
                     "DELETE FROM resource_leases WHERE resource_type='managed-process' "

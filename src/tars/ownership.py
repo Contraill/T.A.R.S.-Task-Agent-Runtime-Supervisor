@@ -18,11 +18,15 @@ _MODEL_EXECUTION_OWNER = ContextVar("tars_model_execution_owner", default=None)
 MODEL_EXECUTION_RESOURCE = ("gpu-slot", "local-inference:0")
 
 
+def _read_process_start(pid: int) -> str:
+    value = Path(f"/proc/{int(pid)}/stat").read_text()
+    fields = value[value.rfind(")") + 2:].split()
+    return fields[19]
+
+
 def process_start(pid: int) -> str:
     try:
-        value = Path(f"/proc/{pid}/stat").read_text()
-        fields = value[value.rfind(")") + 2:].split()
-        return fields[19]
+        return _read_process_start(pid)
     except (OSError, IndexError):
         return ""
 
@@ -60,6 +64,24 @@ def owner_alive(pid: int, expected_start: str) -> bool:
     return bool(expected_start and process_start(int(pid)) == expected_start)
 
 
+def owner_gone(pid: int, expected_start: str) -> bool:
+    """Return true only when PID absence/reuse proves this identity cannot act."""
+    if not expected_start:
+        return False
+    try:
+        return _read_process_start(int(pid)) != expected_start
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    except (OSError, IndexError):
+        return False
+
+
+def _same_owner(row, owner: Owner) -> bool:
+    return bool(row and row["owner_token"] == owner.token
+                and row["owner_pid"] == owner.pid
+                and row["owner_start"] == owner.process_start)
+
+
 def _expiry(seconds: float, *, now=None) -> str:
     current = now or datetime.now(timezone.utc)
     return (current + timedelta(seconds=max(1.0, float(seconds)))).isoformat()
@@ -84,17 +106,19 @@ def claim_in_transaction(conn, resource_type, resource_key, owner: Owner, *,
         ).fetchone()
         if fence or (task and task["phase"] == "cancellation-recovery-required"):
             return False
-    if (row and row["owner_token"] != owner.token and row["expires_at"] > stamp
-            and owner_alive(row["owner_pid"], row["owner_start"])):
+    if row and not _same_owner(row, owner) and not owner_gone(
+            row["owner_pid"], row["owner_start"]):
         return False
     if row:
         changed = conn.execute(
             """UPDATE resource_leases SET owner_token=?,owner_pid=?,owner_start=?,
                acquired_at=?,heartbeat_at=?,expires_at=?,metadata_json=?
-               WHERE resource_type=? AND resource_key=? AND owner_token=? AND expires_at=?""",
+               WHERE resource_type=? AND resource_key=? AND owner_token=?
+               AND owner_pid=? AND owner_start=? AND expires_at=?""",
             (owner.token, owner.pid, owner.process_start, stamp, stamp, expires,
              json_dumps(metadata or {}), resource_type, resource_key,
-             row["owner_token"], row["expires_at"]),
+             row["owner_token"], row["owner_pid"], row["owner_start"],
+             row["expires_at"]),
         ).rowcount
         return changed == 1
     try:
@@ -123,7 +147,6 @@ def claim(resource_type, resource_key, owner: Owner, *, lease_seconds=30.0,
 def claim_workspace(resource_key, owner: Owner, *, lease_seconds=30.0,
                     metadata=None) -> bool:
     key = str(Path(resource_key).resolve(strict=False))
-    stamp = now_utc()
     with transaction(immediate=True) as conn:
         rows = conn.execute(
             "SELECT * FROM resource_leases WHERE resource_type='workspace'"
@@ -132,14 +155,14 @@ def claim_workspace(resource_key, owner: Owner, *, lease_seconds=30.0,
             other = row["resource_key"]
             overlaps = (key == other or key.startswith(other.rstrip("/") + "/")
                         or other.startswith(key.rstrip("/") + "/"))
-            if not overlaps or row["owner_token"] == owner.token:
+            if not overlaps or _same_owner(row, owner):
                 continue
-            if (row["expires_at"] > stamp
-                    and owner_alive(row["owner_pid"], row["owner_start"])):
+            if not owner_gone(row["owner_pid"], row["owner_start"]):
                 return False
             conn.execute(
                 "DELETE FROM resource_leases WHERE resource_type='workspace' "
-                "AND resource_key=? AND owner_token=?", (other, row["owner_token"]),
+                "AND resource_key=? AND owner_token=? AND owner_pid=? AND owner_start=?",
+                (other, row["owner_token"], row["owner_pid"], row["owner_start"]),
             )
         return claim_in_transaction(
             conn, "workspace", key, owner, lease_seconds=lease_seconds,
@@ -152,8 +175,10 @@ def heartbeat(resource_type, resource_key, owner: Owner, *, lease_seconds=30.0) 
     with transaction(immediate=True) as conn:
         changed = conn.execute(
             """UPDATE resource_leases SET heartbeat_at=?,expires_at=?
-               WHERE resource_type=? AND resource_key=? AND owner_token=?""",
-            (stamp, _expiry(lease_seconds), resource_type, resource_key, owner.token),
+               WHERE resource_type=? AND resource_key=? AND owner_token=?
+               AND owner_pid=? AND owner_start=?""",
+            (stamp, _expiry(lease_seconds), resource_type, resource_key, owner.token,
+             owner.pid, owner.process_start),
         ).rowcount
     return changed == 1
 
@@ -162,7 +187,8 @@ def release(resource_type, resource_key, owner: Owner) -> bool:
     with transaction(immediate=True) as conn:
         changed = conn.execute(
             "DELETE FROM resource_leases WHERE resource_type=? AND resource_key=? "
-            "AND owner_token=?", (resource_type, resource_key, owner.token),
+            "AND owner_token=? AND owner_pid=? AND owner_start=?",
+            (resource_type, resource_key, owner.token, owner.pid, owner.process_start),
         ).rowcount
     return changed == 1
 
@@ -170,14 +196,17 @@ def release(resource_type, resource_key, owner: Owner) -> bool:
 def held_by(resource_type, resource_key, owner: Owner) -> bool:
     ensure_state_store()
     with connect() as conn:
-        row = conn.execute(
-            "SELECT owner_token,owner_pid,owner_start,expires_at FROM resource_leases "
-            "WHERE resource_type=? AND resource_key=?", (resource_type, resource_key),
-        ).fetchone()
-    return bool(row and row["owner_token"] == owner.token
-                and row["owner_pid"] == owner.pid
-                and row["owner_start"] == owner.process_start
-                and row["expires_at"] > now_utc()
+        return held_by_in_transaction(conn, resource_type, resource_key, owner)
+
+
+def held_by_in_transaction(conn, resource_type, resource_key, owner: Owner, *,
+                           require_unexpired=True) -> bool:
+    row = conn.execute(
+        "SELECT owner_token,owner_pid,owner_start,expires_at FROM resource_leases "
+        "WHERE resource_type=? AND resource_key=?", (resource_type, resource_key),
+    ).fetchone()
+    return bool(_same_owner(row, owner)
+                and (not require_unexpired or row["expires_at"] > now_utc())
                 and owner_alive(row["owner_pid"], row["owner_start"]))
 
 
@@ -188,8 +217,7 @@ def active(resource_type, resource_key) -> bool:
             "SELECT owner_pid,owner_start,expires_at FROM resource_leases "
             "WHERE resource_type=? AND resource_key=?", (resource_type, resource_key),
         ).fetchone()
-    return bool(row and row["expires_at"] > now_utc()
-                and owner_alive(row["owner_pid"], row["owner_start"]))
+    return bool(row and not owner_gone(row["owner_pid"], row["owner_start"]))
 
 
 def task_execution_fenced(task_id) -> bool:

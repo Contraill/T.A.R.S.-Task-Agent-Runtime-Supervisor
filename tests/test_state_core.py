@@ -1,13 +1,29 @@
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
 
 from tars import activity, conversation, identity, prompt_compiler, projects, role_state, sessions
 from tars import ownership, runner, state_events, state_store, tasks
+
+
+def _hold_expired_lease(database, scratch, ready):
+    state_store.STATE_DB_PATH = Path(database)
+    state_store.TASK_ROOT = Path(scratch) / "legacy-tasks"
+    state_store.TASK_EVENTS_ROOT = Path(scratch) / "legacy-events"
+    state_store.TASK_INDEX_PATH = Path(scratch) / "legacy-index.json"
+    owner = ownership.Owner.create("stalled-owner")
+    assert ownership.claim("gpu-slot", "fencing-test", owner, lease_seconds=300)
+    assert ownership.claim_workspace(
+        str(Path(scratch) / "workspace"), owner, lease_seconds=300)
+    ready.send((owner.token, owner.pid, owner.process_start))
+    ready.close()
+    threading.Event().wait()
 
 
 @pytest.fixture
@@ -58,6 +74,82 @@ def test_state_database_and_directory_permissions_are_repaired(isolated_state):
         sidecar = Path(str(isolated_state) + suffix)
         if sidecar.exists():
             assert os.stat(sidecar).st_mode & 0o777 == 0o600
+
+
+def test_expiry_never_reassigns_authority_while_owner_process_is_alive(isolated_state):
+    state_store.ensure_state_store()
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    holder = context.Process(
+        target=_hold_expired_lease,
+        args=(str(isolated_state), str(isolated_state.parent), sender),
+    )
+    holder.start()
+    token, pid, started = receiver.recv()
+    receiver.close()
+    owner = ownership.Owner(token, pid, started)
+    workspace = str(isolated_state.parent / "workspace")
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE resource_leases SET expires_at='1970-01-01T00:00:00+00:00' "
+            "WHERE (resource_type='gpu-slot' AND resource_key='fencing-test') "
+            "OR resource_type='workspace'"
+        )
+
+    contender = ownership.Owner.create("contender")
+    copied_token = ownership.Owner(token, contender.pid, contender.process_start)
+    try:
+        assert ownership.active("gpu-slot", "fencing-test")
+        assert not ownership.held_by("gpu-slot", "fencing-test", owner)
+        assert not ownership.claim("gpu-slot", "fencing-test", contender)
+        assert not ownership.claim("gpu-slot", "fencing-test", copied_token)
+        assert not ownership.heartbeat("gpu-slot", "fencing-test", copied_token)
+        assert not ownership.release("gpu-slot", "fencing-test", copied_token)
+        assert not ownership.claim_workspace(workspace + "/child", contender)
+    finally:
+        holder.terminate()
+        holder.join(timeout=10)
+    assert holder.exitcode is not None
+    assert not ownership.active("gpu-slot", "fencing-test")
+    assert ownership.claim("gpu-slot", "fencing-test", contender)
+    assert ownership.claim_workspace(workspace + "/child", contender)
+
+
+def test_expired_owner_remains_the_only_same_process_renewal_authority(isolated_state):
+    state_store.ensure_state_store()
+    first = ownership.Owner.create("first-owner")
+    second = ownership.Owner.create("second-owner")
+    assert ownership.claim("action", "same-process", first)
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE resource_leases SET expires_at='1970-01-01T00:00:00+00:00' "
+            "WHERE resource_type='action' AND resource_key='same-process'"
+        )
+    assert ownership.active("action", "same-process")
+    assert not ownership.claim("action", "same-process", second)
+    assert ownership.heartbeat("action", "same-process", first)
+    assert ownership.held_by("action", "same-process", first)
+    assert ownership.release("action", "same-process", first)
+    assert ownership.claim("action", "same-process", second)
+
+
+def test_unverifiable_process_identity_remains_fenced(isolated_state, monkeypatch):
+    state_store.ensure_state_store()
+    first = ownership.Owner.create("unverifiable-owner")
+    second = ownership.Owner.create("blocked-owner")
+    assert ownership.claim("gpu-slot", "unverifiable", first)
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE resource_leases SET expires_at='1970-01-01T00:00:00+00:00' "
+            "WHERE resource_type='gpu-slot' AND resource_key='unverifiable'"
+        )
+
+    def unreadable(_pid):
+        raise PermissionError("identity unavailable")
+
+    monkeypatch.setattr(ownership, "_read_process_start", unreadable)
+    assert ownership.active("gpu-slot", "unverifiable")
+    assert not ownership.claim("gpu-slot", "unverifiable", second)
 
 
 def test_append_event_transaction_rolls_back_on_invalid_reference(isolated_state):

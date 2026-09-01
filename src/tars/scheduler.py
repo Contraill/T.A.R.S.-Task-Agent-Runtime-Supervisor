@@ -379,7 +379,7 @@ class Scheduler:
         _wake_path().unlink(missing_ok=True)
 
     def recover(self) -> int:
-        """Reclaim only work whose durable execution lease is absent or stale."""
+        """Reclaim only work whose durable execution owner is provably gone."""
         stamp = now_utc()
         recovered = []
         with transaction(immediate=True) as conn:

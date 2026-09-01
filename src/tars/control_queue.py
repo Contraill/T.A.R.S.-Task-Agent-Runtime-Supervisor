@@ -481,12 +481,52 @@ def recover_cancellations(task_id, owner: Owner, *, lease_seconds=30.0):
         ).fetchall()
         for row in rows:
             existing = conn.execute(
-                "SELECT owner_pid,owner_start,expires_at FROM resource_leases "
+                "SELECT owner_token,owner_pid,owner_start,expires_at FROM resource_leases "
                 "WHERE resource_type='control-cancellation' AND resource_key=?",
                 (row["id"],),
             ).fetchone()
-            if (existing and existing["expires_at"] > stamp
+            if (existing
                     and owner_alive(existing["owner_pid"], existing["owner_start"])):
+                if (existing["expires_at"] > stamp
+                        or row["cancellation_state"] == "intent"):
+                    continue
+                payload = json_loads(row["payload_json"], {})
+                payload.update({
+                    "cancellation_phase": "ambiguous",
+                    "cancellation_requested": None,
+                    "cancellation_outcome": "ambiguous",
+                    "cancellation_result": {"requested": None},
+                    "cancellation_error": (
+                        "cancellation heartbeat expired after attempt began; "
+                        "the live callback outcome is unknown"),
+                })
+                changed = conn.execute(
+                    """UPDATE control_cancellations SET state='ambiguous',result_json=?,
+                       error=?,reconciled_at=? WHERE control_id=? AND state='attempting'""",
+                    (json_dumps({"requested": None}), payload["cancellation_error"],
+                     stamp, row["id"]),
+                ).rowcount
+                if changed:
+                    conn.execute(
+                        "UPDATE task_controls SET payload_json=? "
+                        "WHERE id=? AND state='pending'",
+                        (json_dumps(payload), row["id"]),
+                    )
+                    _fail_task_for_ambiguous_cancellation(
+                        conn, task_id, row["id"], payload["cancellation_error"])
+                    recovered += 1
+                    conn.execute(
+                        "DELETE FROM resource_leases "
+                        "WHERE resource_type='control-cancellation' AND resource_key=? "
+                        "AND owner_token=? AND owner_pid=? AND owner_start=?",
+                        (row["id"], existing["owner_token"], existing["owner_pid"],
+                         existing["owner_start"]),
+                    )
+                    conn.execute(
+                        "DELETE FROM resource_leases "
+                        "WHERE resource_type='task-execution-fence' AND resource_key=?",
+                        (task_id,),
+                    )
                 continue
             if not claim_in_transaction(
                 conn, "control-cancellation", row["id"], owner,
@@ -693,7 +733,7 @@ def annotate(control_id, payload, *, owner: Owner | None = None):
 
 
 def recover_processing(task_id, owner: Owner, *, lease_seconds=30.0):
-    """Return only controls whose previous durable owner is gone or stale."""
+    """Return only controls whose previous durable owner is provably gone."""
     recovered = 0
     with transaction(immediate=True) as conn:
         rows = conn.execute(

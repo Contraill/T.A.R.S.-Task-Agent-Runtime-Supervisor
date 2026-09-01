@@ -980,7 +980,7 @@ def test_redirect_updates_canonical_instruction_and_priority_preempts_message(lo
     assert control_queue.claim_next(task.id, owner).id == message.id
 
 
-def test_processing_control_recovers_after_client_or_process_disconnect(loop_state):
+def test_live_processing_control_is_not_reclaimed_only_because_lease_expired(loop_state):
     task, _ = loop_state
     queued = control_queue.enqueue(task.id, "message", "survive reconnect")
     first_owner = ownership.Owner.create("test-control")
@@ -991,9 +991,10 @@ def test_processing_control_recovers_after_client_or_process_disconnect(loop_sta
         conn.execute(
             "UPDATE resource_leases SET expires_at='2000-01-01T00:00:00+00:00' "
             "WHERE resource_type='task-control' AND resource_key=?", (queued.id,))
-    assert control_queue.recover_processing(task.id, recovery_owner) == 1
-    recovered = control_queue.load(queued.id)
-    assert recovered.state == "pending" and recovered.payload["recovered_after_disconnect"]
+    assert control_queue.recover_processing(task.id, recovery_owner) == 0
+    assert control_queue.load(queued.id).state == "processing"
+    assert ownership.heartbeat("task-control", queued.id, first_owner)
+    assert control_queue.finish(queued.id, first_owner).state == "applied"
 
 
 def test_processing_control_owned_by_dead_process_is_recovered(loop_state):
