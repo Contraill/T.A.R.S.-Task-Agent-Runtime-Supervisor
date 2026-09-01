@@ -22,7 +22,7 @@ Tavily is optional and mock-tested in the current reference environment because 
 
 Browser automation uses a dedicated T.A.R.S. profile and download directory. Personal profiles require explicit opt-in. Navigation and subresources remain inside authorized public destinations. Snapshots expose stable element references. Raw evaluation is elevated and unavailable under the default policy. The reference environment completed a live Chromium navigation, snapshot and screenshot check; installations without Playwright/Chromium report the capability unavailable.
 
-MCP tools remain externally supplied capabilities. Server-qualified names cannot shadow native tools. Connections and calls pass through the same policy, approval, audit and evidence path as native tools; unknown effects default to elevated denial. Streamable HTTP destinations and redirects receive SSRF validation. Registry configuration stores secret references rather than resolved values.
+MCP tools remain externally supplied capabilities. Server-qualified names cannot shadow native tools. Connections and calls pass through the same policy, approval, audit and evidence path as native tools; unknown effects default to elevated denial. Trusted registry contracts derive call effects and targets from the validated argument snapshot actually sent to the server. A parallel caller-supplied target is not accepted. Streamable HTTP destinations and redirects receive SSRF validation. Registry configuration stores secret references rather than resolved values.
 
 ```text
 tars tool list

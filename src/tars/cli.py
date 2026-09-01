@@ -1528,8 +1528,13 @@ def command_mcp(args, cfg=None):
                     data = client.discover_tools()
                 else:
                     arguments = json.loads(args.arguments_json)
-                    result = client.call_tool(args.tool, arguments, target=args.target,
-                                              approval_id=args.approval)
+                    approval_ids = json.loads(args.approvals_json)
+                    if not isinstance(approval_ids, dict):
+                        raise ValueError("MCP approval mapping must be a JSON object")
+                    result = client.call_tool(
+                        args.tool, arguments, approval_id=args.approval,
+                        approval_ids=approval_ids or None,
+                    )
                     data = {"tool": result.tool, "state": result.state,
                             "data": result.data, "error": result.error,
                             "action_ids": list(result.action_ids),
@@ -1945,8 +1950,8 @@ def build_parser():
     mcp_call.add_argument("name")
     mcp_call.add_argument("tool")
     mcp_call.add_argument("--arguments-json", default="{}")
-    mcp_call.add_argument("--target", default="")
     mcp_call.add_argument("--approval")
+    mcp_call.add_argument("--approvals-json", default="{}")
     mcp_call.add_argument("--connect-approval")
 
     model = sub.add_parser("model")

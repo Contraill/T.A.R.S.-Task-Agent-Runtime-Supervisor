@@ -1,3 +1,5 @@
+import pytest
+
 from tars.cli import build_parser
 
 
@@ -116,3 +118,17 @@ def test_policy_approval_and_audit_cli_parsing():
     assert audit.state == "denied"
     backend = parser.parse_args(["execution-backend", "container"])
     assert backend.backend == "container"
+
+
+def test_mcp_call_cli_has_no_parallel_authority_target():
+    parser = build_parser()
+    call = parser.parse_args([
+        "mcp", "call", "files", "write", "--arguments-json", '{"path":"/work/a"}',
+        "--approvals-json", '{"output":"approval-one"}',
+    ])
+    assert call.approvals_json == '{"output":"approval-one"}'
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "mcp", "call", "files", "write", "--arguments-json", '{"path":"/outside"}',
+            "--target", "/allowed",
+        ])
