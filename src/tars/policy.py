@@ -233,8 +233,9 @@ def normalize_network_target(value: str, *, resolve_dns=False) -> tuple[str, str
     return normalized, host
 
 
-def add_rule(effect: str, action: str, *, target="", scope="persistent", expires_at=None,
-             metadata=None, target_kind=None):
+def add_rule_in_transaction(conn, effect: str, action: str, *, target="",
+                            scope="persistent", expires_at=None, metadata=None,
+                            target_kind=None):
     if effect not in EFFECTS or action not in POLICY_ACTIONS:
         raise ValueError("invalid policy effect or action")
     rule_id = "rule-" + uuid.uuid4().hex
@@ -247,15 +248,22 @@ def add_rule(effect: str, action: str, *, target="", scope="persistent", expires
     elif effect in {"network", "remote"} and target:
         parsed = urlsplit(target if "://" in target else "https://" + target)
         normalized_target = (parsed.hostname or target).rstrip(".").casefold()
+    conn.execute(
+        """INSERT INTO policy_rules(id,effect,action,target,scope,created_at,expires_at,metadata_json)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (rule_id, effect, action, normalized_target, scope, now_utc(), expires_at,
+         json_dumps(redact(rule_metadata))),
+    )
+    return rule_id
+
+
+def add_rule(effect: str, action: str, *, target="", scope="persistent", expires_at=None,
+             metadata=None, target_kind=None):
     ensure_state_store()
     with transaction(immediate=True) as conn:
-        conn.execute(
-            """INSERT INTO policy_rules(id,effect,action,target,scope,created_at,expires_at,metadata_json)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (rule_id, effect, action, normalized_target, scope, now_utc(), expires_at,
-             json_dumps(redact(rule_metadata))),
-        )
-    return rule_id
+        return add_rule_in_transaction(
+            conn, effect, action, target=target, scope=scope,
+            expires_at=expires_at, metadata=metadata, target_kind=target_kind)
 
 
 def list_rules():
@@ -263,12 +271,21 @@ def list_rules():
     conn = connect()
     try:
         current = now_utc()
-        return [dict(row) | {"metadata": json_loads(row["metadata_json"], {}),
-                             "expired": bool(row["expires_at"] and row["expires_at"] <= current),
-                             "active": not row["expires_at"] or row["expires_at"] > current}
-                for row in conn.execute(
-                    "SELECT * FROM policy_rules ORDER BY created_at DESC"
-                ).fetchall()]
+        result = []
+        for row in conn.execute(
+                "SELECT * FROM policy_rules ORDER BY created_at DESC").fetchall():
+            loaded_metadata = json_loads(row["metadata_json"], None)
+            metadata = loaded_metadata if isinstance(loaded_metadata, dict) else {}
+            expired = bool(row["expires_at"] and row["expires_at"] <= current)
+            authority = metadata.get("authority_intent")
+            valid = isinstance(loaded_metadata, dict) and (
+                not metadata.get("approval_id") or (
+                    isinstance(authority, dict) and bool(authority.get("sha256"))))
+            result.append(dict(row) | {
+                "metadata": metadata, "expired": expired, "valid": valid,
+                "active": not expired and valid,
+            })
+        return result
     finally:
         conn.close()
 
@@ -314,7 +331,7 @@ class ScopeGuard:
                 return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target,
                                       "destination is outside authorized network scope",
                                       normalized_arguments=redact_arguments(request.arguments))
-        rule = self._matching_rule(effect, target)
+        rule = self._matching_rule(effect, target, request=request)
         if missing_path_scope and not rule:
             return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target,
                                   "filesystem tools require an authorized path scope",
@@ -326,7 +343,7 @@ class ScopeGuard:
                               rule["id"] if rule else None, redact_arguments(request.arguments))
 
     @staticmethod
-    def _matching_rule(effect, target):
+    def _matching_rule(effect, target, *, request=None):
         ensure_state_store()
         conn = connect()
         try:
@@ -338,20 +355,39 @@ class ScopeGuard:
             ).fetchall()
             for row in rows:
                 configured = row["target"]
-                if not configured:
-                    return row
-                if row["metadata_json"] and json_loads(row["metadata_json"], {}).get("target_kind") == "path":
-                    if _within(target, (configured,)):
-                        return row
-                elif effect in {"network", "remote"}:
+                metadata = json_loads(row["metadata_json"], None)
+                if not isinstance(metadata, dict):
+                    continue
+                target_matches = not configured
+                if metadata.get("target_kind") == "path":
+                    target_matches = bool(configured) and _within(target, (configured,))
+                elif effect in {"network", "remote"} and configured:
                     try:
                         host = urlsplit(target).hostname or target
                     except ValueError:
                         host = target
-                    if host == configured or host.endswith("." + configured):
-                        return row
-                elif target == configured:
-                    return row
+                    target_matches = host == configured or host.endswith("." + configured)
+                elif configured:
+                    target_matches = target == configured
+                if not target_matches:
+                    continue
+                authority = metadata.get("authority_intent")
+                if metadata.get("approval_id") and not (
+                        isinstance(authority, dict) and authority.get("sha256")):
+                    continue
+                if authority is not None:
+                    if not isinstance(authority, dict) or not authority.get("sha256"):
+                        continue
+                    if request is None:
+                        continue
+                    candidate = PolicyDecision(
+                        row["action"], RISK_BY_EFFECT[effect], effect, target,
+                        "persistent authority candidate",
+                        normalized_arguments=redact_arguments(request.arguments),
+                    )
+                    if canonical_intent(request, candidate)["sha256"] != authority["sha256"]:
+                        continue
+                return row
             return None
         finally:
             conn.close()

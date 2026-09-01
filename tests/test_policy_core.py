@@ -227,6 +227,93 @@ def test_approval_scope_and_persistent_rule(isolated_policy):
     assert policy.ScopeGuard().evaluate(request).action == "allow"
 
 
+def test_persistent_approval_retains_complete_authority_dimensions(isolated_policy):
+    broker = approvals.ApprovalBroker()
+    guard = policy.ScopeGuard()
+    request = policy.ScopeRequest(
+        "process.signal", "execute", "process-one", {"signal": "TERM"})
+    pending = broker.request(request, guard.evaluate(request), scope="persistent")
+    broker.decide(pending.id, approve=True, reason="graceful stop only")
+    assert guard.evaluate(request).action == "allow"
+
+    variants = (
+        policy.ScopeRequest(
+            "process.write", "execute", "process-one", {"signal": "TERM"}),
+        policy.ScopeRequest(
+            "process.signal", "execute", "process-one", {"signal": "KILL"}),
+        policy.ScopeRequest(
+            "process.signal", "execute", "process-two", {"signal": "TERM"}),
+        policy.ScopeRequest(
+            "process.signal", "execute", "process-one", {"signal": "TERM"},
+            task_id="different-task"),
+    )
+    assert all(guard.evaluate(item).action == "ask" for item in variants)
+
+    network = policy.ScopeRequest(
+        "http.get", "network", "https://example.com/docs",
+        allowed_hosts=("example.com",))
+    broker.decide(
+        broker.request(network, guard.evaluate(network), scope="persistent").id,
+        approve=True)
+    assert guard.evaluate(network).action == "allow"
+    for target in (
+            "https://example.com/admin", "http://example.com/docs",
+            "https://example.com:8443/docs"):
+        changed = policy.ScopeRequest(
+            "http.get", "network", target, allowed_hosts=("example.com",))
+        assert guard.evaluate(changed).action == "ask"
+
+    path = isolated_policy / "payload"
+    write = policy.ScopeRequest(
+        "fs.write", "write", str(path), {"content": "payload-one"},
+        allowed_paths=(str(isolated_policy),))
+    write_approval = broker.request(
+        write, guard.evaluate(write), scope="persistent")
+    broker.decide(write_approval.id, approve=True)
+    changed_write = policy.ScopeRequest(
+        "fs.write", "write", str(path), {"content": "payload-two"},
+        allowed_paths=(str(isolated_policy),))
+    assert guard.evaluate(write).action == "allow"
+    assert guard.evaluate(changed_write).action == "ask"
+    write_rule = next(
+        item for item in policy.list_rules()
+        if item["metadata"].get("approval_id") == write_approval.id)
+    assert "payload-one" not in str(write_rule["metadata"])
+
+
+def test_legacy_unbound_approval_rule_is_inactive_and_cannot_authorize(isolated_policy):
+    request = policy.ScopeRequest(
+        "process.signal", "execute", "process-one", {"signal": "TERM"})
+    rule_id = policy.add_rule(
+        "execute", "allow", target="process-one",
+        metadata={"approval_id": "legacy-unbound"})
+    rule = next(item for item in policy.list_rules() if item["id"] == rule_id)
+    assert not rule["valid"] and not rule["active"]
+    assert policy.ScopeGuard().evaluate(request).action == "ask"
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE policy_rules SET metadata_json='[]' WHERE id=?", (rule_id,))
+    malformed = next(item for item in policy.list_rules() if item["id"] == rule_id)
+    assert not malformed["valid"] and not malformed["active"]
+    assert policy.ScopeGuard().evaluate(request).action == "ask"
+
+
+def test_persistent_decision_and_rule_creation_are_atomic(isolated_policy):
+    broker = approvals.ApprovalBroker()
+    request = policy.ScopeRequest(
+        "process.signal", "execute", "process-one", {"signal": "TERM"})
+    pending = broker.request(
+        request, policy.ScopeGuard().evaluate(request), scope="persistent")
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            """CREATE TRIGGER fail_persistent_rule BEFORE INSERT ON policy_rules
+               BEGIN SELECT RAISE(ABORT, 'injected persistent rule failure'); END""")
+    with pytest.raises(Exception, match="injected persistent rule failure"):
+        broker.decide(pending.id, approve=True)
+    assert broker.load(pending.id).state == "pending"
+    assert policy.list_rules() == []
+
+
 def test_task_and_session_approvals_do_not_cross_boundaries(monkeypatch, isolated_policy):
     monkeypatch.setattr(tasks, "resolve_role_id", lambda value: value)
     monkeypatch.setattr(sessions, "resolve_role_id", lambda value: value)

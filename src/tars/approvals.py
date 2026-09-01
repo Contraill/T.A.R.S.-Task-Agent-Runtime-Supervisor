@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import uuid
 
-from .policy import PolicyDecision, ScopeRequest, add_rule, canonical_intent, redact
+from .policy import (PolicyDecision, ScopeRequest, add_rule_in_transaction,
+                     canonical_intent, redact)
 from .state_events import insert_state_event
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 
@@ -91,19 +92,27 @@ class ApprovalBroker:
                 (state, reason, now_utc(), approval_id)).rowcount
             if changed != 1:
                 raise RuntimeError("approval changed concurrently")
+            if approve and approval.scope == "persistent":
+                intent = approval.request["intent"]
+                add_rule_in_transaction(
+                    conn, approval.request["effect"], "allow", target=approval.target,
+                    target_kind="path" if approval.tool.startswith("fs.") else None,
+                    expires_at=approval.expires_at,
+                    metadata={
+                        "approval_id": approval.id, "reason": reason,
+                        "authority_intent": {
+                            "version": intent.get("version"),
+                            "sha256": intent.get("sha256"),
+                        },
+                    },
+                )
             insert_state_event(
                 conn, "approval", f"{approval.tool}: {state}",
                 task_id=approval.task_id, session_id=approval.session_id,
                 payload={"approval_id": approval.id, "state": state,
                          "scope": approval.scope, "reason": reason},
             )
-        decided = self.load(approval_id)
-        if approve and decided.scope == "persistent":
-            add_rule(decided.request["effect"], "allow", target=decided.target,
-                     target_kind="path" if decided.tool.startswith("fs.") else None,
-                     expires_at=decided.expires_at,
-                     metadata={"approval_id": decided.id, "reason": reason})
-        return decided
+        return self.load(approval_id)
 
     def authorize(self, request: ScopeRequest, decision: PolicyDecision,
                   approval_id: str | None = None, *, consume=True) -> str | None:
@@ -172,7 +181,7 @@ class ApprovalBroker:
         current_intent = canonical_intent(request, decision)
         if not intent:
             return False
-        if approval.scope in {"call", "task", "session"}:
+        if approval.scope in {"call", "task", "session", "persistent"}:
             if intent.get("sha256") != current_intent["sha256"]:
                 return False
         else:
