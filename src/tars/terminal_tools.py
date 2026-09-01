@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import select
 import signal as signals
 import shlex
 import subprocess
@@ -26,19 +27,40 @@ import subprocess
 import sys
 
 expected_parent = int(sys.argv[1])
+ready_fd = int(sys.argv[2])
 libc = ctypes.CDLL(None, use_errno=True)
-if libc.prctl(1, signal.SIGTERM) != 0:
+owner_death_signal = signal.SIGRTMIN
+if libc.prctl(1, owner_death_signal) != 0:
     raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
 def parent_died(_signum=None, _frame=None):
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(owner_death_signal, signal.SIG_IGN)
     os.killpg(os.getpgrp(), signal.SIGKILL)
-signal.signal(signal.SIGTERM, parent_died)
+signal.signal(owner_death_signal, parent_died)
+def user_signal(_signum=None, _frame=None):
+    pass
+for user_signal_number in (
+        signal.SIGTERM, signal.SIGINT, signal.SIGHUP,
+        signal.SIGUSR1, signal.SIGUSR2):
+    signal.signal(user_signal_number, user_signal)
 if os.getppid() != expected_parent:
     parent_died()
-child = subprocess.Popen(sys.argv[2:])
+child = subprocess.Popen(sys.argv[3:])
+os.write(ready_fd, b"1")
+os.close(ready_fd)
 returncode = child.wait()
 raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
 """
+
+
+_USER_PROCESS_SIGNALS = {
+    "TERM": signals.SIGTERM,
+    "INT": signals.SIGINT,
+    "HUP": signals.SIGHUP,
+    "USR1": signals.SIGUSR1,
+    "USR2": signals.SIGUSR2,
+    "STOP": signals.SIGSTOP,
+    "CONT": signals.SIGCONT,
+}
 
 
 @dataclass
@@ -101,9 +123,11 @@ class ProcessManager:
         stdout_path.chmod(0o600)
         stderr_path.chmod(0o600)
         argv = ["/bin/bash", "-lc", request.argv[0]] if request.shell else list(request.argv)
+        ready_read, ready_write = os.pipe()
         managed_argv = [sys.executable, "-c", _PARENT_DEATH_WRAPPER,
-                        str(os.getpid()), *argv]
+                        str(os.getpid()), str(ready_write), *argv]
         environment = os.environ.copy()
+        process = None
         try:
             resolved = self.secret_store.resolve_many(
                 request.environment_refs, consumer="execution:background")
@@ -112,12 +136,28 @@ class ProcessManager:
             process = subprocess.Popen(
                 managed_argv, cwd=cwd, env=environment, stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                pass_fds=(ready_write,),
             )
+            os.close(ready_write)
+            ready_write = -1
+            readable, _, _ = select.select((ready_read,), (), (), 5.0)
+            if not readable or os.read(ready_read, 1) != b"1":
+                raise RuntimeError("managed process wrapper did not confirm child startup")
         except Exception as exc:
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signals.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
             stdout_handle.close()
             stderr_handle.close()
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
+        finally:
+            os.close(ready_read)
+            if ready_write >= 0:
+                os.close(ready_write)
         record = ManagedProcess(
             process_id, process, request.argv, cwd, "host", _stamp(), stdout_path,
             stderr_path, actions[-1].id,
@@ -282,38 +322,66 @@ class ProcessManager:
                           evidence_ids=(evidence.id,))
 
     def signal(self, process_id, signal_name="TERM", *, approval_id=None,
-               task_id=None, session_id=None, _tool="process.signal"):
+               task_id=None, session_id=None):
+        return self._send_signal(
+            process_id, signal_name, tool="process.signal", approval_id=approval_id,
+            task_id=task_id, session_id=session_id,
+        )
+
+    def _send_signal(self, process_id, signal_name, *, tool, approval_id=None,
+                     task_id=None, session_id=None):
         record = self._get(process_id)
-        destructive = signal_name.upper() == "KILL"
+        signal_name = str(signal_name).upper()
+        if tool == "process.kill":
+            if signal_name != "KILL":
+                raise ValueError("process.kill only supports KILL")
+            number = signals.SIGKILL
+            destructive = True
+        else:
+            try:
+                number = _USER_PROCESS_SIGNALS[signal_name]
+            except KeyError as exc:
+                raise ValueError(
+                    "process.signal supports TERM, INT, HUP, USR1, USR2, STOP, and CONT"
+                ) from exc
+            destructive = False
         request = ScopeRequest(
-            _tool, "destructive" if destructive else "execute", process_id,
-            {"signal": signal_name.upper()}, task_id=task_id, session_id=session_id,
+            tool, "destructive" if destructive else "execute", process_id,
+            {"signal": signal_name}, task_id=task_id, session_id=session_id,
             destructive=destructive,
         )
         actions = self.runtime.authorize((("control", request),), {"control": approval_id})
         if not record.cancellable:
             result = {"process_id": process_id, "requested": False, "cancellable": False}
             self.runtime.finish(actions, state="failed", result=result)
-            return ToolResult(_tool, "failed", result,
+            return ToolResult(tool, "failed", result,
                               error="process is not cancellable",
                               action_ids=tuple(action.id for action in actions))
-        try:
-            number = getattr(signals, "SIG" + signal_name.upper())
-        except AttributeError as exc:
-            raise ValueError(f"unknown signal: {signal_name}") from exc
+        requested = False
         if record.process.poll() is None:
-            os.killpg(record.process.pid, number)
-        result = {"process_id": process_id, "requested": True,
-                  "cancellable": True, "signal": signal_name.upper()}
+            try:
+                os.killpg(record.process.pid, number)
+                requested = True
+            except ProcessLookupError:
+                requested = False
+            except Exception as exc:
+                self.runtime.finish(actions, state="failed", result={
+                    "process_id": process_id, "requested": False,
+                    "signal": signal_name, "error": type(exc).__name__,
+                })
+                raise
+        result = {"process_id": process_id, "requested": requested,
+                  "cancellable": True, "signal": signal_name,
+                  "outcome": "dispatched" if requested else "already-exited"}
         self.runtime.finish(actions, state="succeeded", result=result)
         evidence = self.runtime.evidence("process", process_id, repr(result), task_id=task_id,
                                          event_uuid=actions[0].event_uuid)
-        return ToolResult(_tool, "succeeded", result,
+        return ToolResult(tool, "succeeded", result,
                           action_ids=tuple(action.id for action in actions),
                           evidence_ids=(evidence.id,))
 
     def kill(self, process_id, **kwargs):
-        return self.signal(process_id, "KILL", _tool="process.kill", **kwargs)
+        return self._send_signal(process_id, "KILL", tool="process.kill", **kwargs)
 
 
 class TerminalTools:

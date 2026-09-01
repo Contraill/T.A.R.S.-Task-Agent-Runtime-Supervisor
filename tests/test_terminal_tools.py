@@ -16,12 +16,32 @@ def _start_background_then_exit(database, state_root, log_root, cwd, output):
     state_store.TASK_INDEX_PATH = Path(state_root) / "index"
     policy.add_rule("sandbox_escape", "allow", target="host")
     manager = terminal_tools.ProcessManager(log_root=log_root)
+    business_pid_path = Path(state_root) / "business.pid"
+    descendant_pid_path = Path(state_root) / "descendant.pid"
+    descendant_code = (
+        "import os,signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"Path({str(descendant_pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    business_code = (
+        "import os,subprocess,sys,time; from pathlib import Path; "
+        f"subprocess.Popen([sys.executable,'-c',{descendant_code!r}]); "
+        f"Path({str(business_pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
     request = execution.ExecutionRequest(
-        (sys.executable, "-c", "import time; time.sleep(60)"),
+        (sys.executable, "-c", business_code),
         cwd=cwd, allowed_paths=(cwd,),
     )
     result = manager.start(request)
-    output.put(result.data["pid"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if business_pid_path.exists() and descendant_pid_path.exists():
+            break
+        time.sleep(0.01)
+    output.put((result.data["pid"], int(business_pid_path.read_text()),
+                int(descendant_pid_path.read_text())))
 
 
 @pytest.fixture
@@ -88,6 +108,81 @@ def test_background_process_lifecycle_and_durable_logs(terminal):
     assert waited.data["state"] == "exited" and waited.data["exit_code"] is not None
 
 
+def test_graceful_term_reaches_business_process_without_cleanup_escalation(terminal):
+    tools, root = terminal
+    marker = root / "term-handled"
+    code = (
+        "import signal,sys,time; from pathlib import Path; "
+        f"marker=Path({str(marker)!r}); "
+        "signal.signal(signal.SIGTERM, "
+        "lambda *_: (marker.write_text('TERM'), sys.exit(0))); "
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    started = tools.run(
+        (sys.executable, "-u", "-c", code), cwd=str(root),
+        allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    for _ in range(100):
+        if "ready" in tools.processes.logs(process_id).data["content"]:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("business process did not become ready")
+    approval = _approve("process.signal", "execute", process_id, {"signal": "TERM"})
+    truth = tools.processes.signal(process_id, "TERM", approval_id=approval)
+    waited = tools.processes.wait(process_id, timeout=5)
+    assert truth.data["signal"] == "TERM"
+    assert waited.data["state"] == "exited" and waited.data["exit_code"] == 0
+    assert marker.read_text() == "TERM"
+
+
+def test_term_cannot_turn_into_hidden_group_kill(terminal):
+    tools, root = terminal
+    started = tools.run(
+        (sys.executable, "-u", "-c",
+         "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+         "print('ready', flush=True); time.sleep(30)"),
+        cwd=str(root), allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    for _ in range(100):
+        if "ready" in tools.processes.logs(process_id).data["content"]:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("business process did not become ready")
+    approval = _approve("process.signal", "execute", process_id, {"signal": "TERM"})
+    tools.processes.signal(process_id, "TERM", approval_id=approval)
+    waited = tools.processes.wait(process_id, timeout=0.2)
+    assert waited.data["state"] == "running" and waited.data["timed_out"]
+
+    kill_approval = _approve(
+        "process.kill", "destructive", process_id, {"signal": "KILL"}, destructive=True)
+    tools.processes.kill(process_id, approval_id=kill_approval)
+    assert tools.processes.wait(process_id, timeout=5).data["state"] == "exited"
+
+
+@pytest.mark.parametrize("signal_name", ["KILL", "SEGV", "RTMIN"])
+def test_process_signal_rejects_authority_widening_signals(terminal, signal_name):
+    tools, root = terminal
+    started = tools.run(
+        (sys.executable, "-c", "import time; time.sleep(30)"), cwd=str(root),
+        allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    with pytest.raises(ValueError, match="process.signal supports"):
+        tools.processes.signal(process_id, signal_name)
+    with state_store.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM action_journal WHERE tool='process.signal'"
+        ).fetchone()[0] == 0
+    kill_approval = _approve(
+        "process.kill", "destructive", process_id, {"signal": "KILL"}, destructive=True)
+    tools.processes.kill(process_id, approval_id=kill_approval)
+    tools.processes.wait(process_id, timeout=5)
+
+
 def test_background_environment_secret_is_redacted_from_log(monkeypatch, terminal):
     tools, root = terminal
     monkeypatch.setenv("TARS_BG_SECRET", "do-not-log")
@@ -118,6 +213,21 @@ def test_process_kill_is_destructive_and_denied_without_approval(terminal):
     assert tools.processes.wait(process_id, timeout=5).data["state"] == "exited"
 
 
+def test_signal_after_exit_does_not_fabricate_dispatch(terminal):
+    tools, root = terminal
+    started = tools.run(
+        (sys.executable, "-c", "pass"), cwd=str(root),
+        allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    tools.processes.wait(process_id, timeout=5)
+    approval = _approve("process.signal", "execute", process_id, {"signal": "TERM"})
+    truth = tools.processes.signal(process_id, "TERM", approval_id=approval)
+    assert truth.succeeded
+    assert truth.data["requested"] is False
+    assert truth.data["outcome"] == "already-exited"
+
+
 def test_background_process_dies_with_owning_manager_process(tmp_path):
     context = multiprocessing.get_context("spawn")
     output = context.Queue()
@@ -127,15 +237,23 @@ def test_background_process_dies_with_owning_manager_process(tmp_path):
               str(tmp_path), output),
     )
     process.start()
-    child_pid = output.get(timeout=10)
+    managed_pids = output.get(timeout=10)
     process.join(timeout=10)
     assert process.exitcode == 0
-    for _ in range(100):
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
+    remaining = set(managed_pids)
+    for _ in range(200):
+        for pid in tuple(remaining):
+            try:
+                os.kill(pid, 0)
+                stat = Path(f"/proc/{pid}/stat").read_text()
+                if stat[stat.rfind(")") + 2:].split()[0] == "Z":
+                    remaining.discard(pid)
+            except (ProcessLookupError, FileNotFoundError):
+                remaining.discard(pid)
+        if not remaining:
             break
-        time.sleep(0.02)
-    else:
-        os.kill(child_pid, 9)
-        pytest.fail("managed background child survived its owning process")
+        time.sleep(0.01)
+    if remaining:
+        for pid in remaining:
+            os.kill(pid, 9)
+        pytest.fail(f"managed process group survived its owning process: {remaining}")
