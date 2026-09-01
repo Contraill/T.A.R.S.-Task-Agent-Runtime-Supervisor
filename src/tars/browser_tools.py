@@ -4,12 +4,14 @@ from pathlib import Path
 import importlib.util
 
 from .config import DATA_ROOT
-from .policy import ScopeRequest, normalize_network_target
+from .network import network_destination, open_bound
+from .policy import ScopeRequest
 from .tool_core import ToolResult, ToolRuntime
 
 
 class PlaywrightDriver:
-    def __init__(self, profile, downloads, *, headless=True):
+    def __init__(self, profile, downloads, *, headless=True,
+                 max_resource_bytes=16_000_000):
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -17,28 +19,59 @@ class PlaywrightDriver:
         self._playwright = sync_playwright().start()
         self.context = self._playwright.chromium.launch_persistent_context(
             str(profile), headless=headless, accept_downloads=True,
-            downloads_path=str(downloads),
+            downloads_path=str(downloads), service_workers="block",
+            java_script_enabled=False,
+            args=[
+                "--host-resolver-rules=MAP * ~NOTFOUND",
+                "--disable-quic",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            ],
         )
-        self.allowed_hosts = set()
+        self.allowed_origins = set()
+        self.max_resource_bytes = int(max_resource_bytes)
+        self.peer_addresses = {}
+
         def route_request(route):
             url = route.request.url
             if not url.startswith(("http://", "https://")):
-                route.continue_()
+                if url.startswith(("about:", "blob:", "data:")):
+                    route.continue_()
+                else:
+                    route.abort("blockedbyclient")
                 return
             try:
-                _, host = normalize_network_target(url, resolve_dns=True)
-            except ValueError:
+                destination = network_destination(url, resolve_dns=True)
+                if destination.origin not in self.allowed_origins:
+                    raise PermissionError("browser request left its authorized origin set")
+                request_headers = route.request.all_headers()
+                with open_bound(
+                    destination,
+                    method=route.request.method,
+                    headers=request_headers,
+                    body=route.request.post_data_buffer,
+                    timeout=30,
+                ) as response:
+                    body = response.read(self.max_resource_bytes + 1)
+                    if len(body) > self.max_resource_bytes:
+                        raise RuntimeError("browser resource exceeded size limit")
+                    self.peer_addresses[destination.request_url] = response.peer_ip
+                    headers = {
+                        key: value for key, value in response.headers.items()
+                        if key.casefold() not in {
+                            "connection", "content-length", "transfer-encoding",
+                        }
+                    }
+                    route.fulfill(status=response.status, headers=headers, body=body)
+            except Exception:
                 route.abort("blockedbyclient")
-                return
-            if host not in self.allowed_hosts:
-                route.abort("blockedbyclient")
-                return
-            route.continue_()
         self.context.route("**/*", route_request)
+        self.context.route_web_socket(
+            "**/*", lambda route: route.close(code=1008, reason="network authority required")
+        )
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
 
-    def set_allowed_hosts(self, hosts):
-        self.allowed_hosts = set(hosts)
+    def set_allowed_origins(self, origins):
+        self.allowed_origins = set(origins)
 
     def call(self, operation, **kwargs):
         if operation == "navigate": return {"url": self.page.goto(kwargs["url"]).url}
@@ -115,11 +148,18 @@ class BrowserTools:
         return self.driver
 
     def navigate(self, url, *, allowed_hosts=(), approval_id=None, task_id=None, session_id=None):
-        normalized, host = normalize_network_target(url, resolve_dns=True)
-        destinations = tuple(allowed_hosts) or (host,)
+        destination = network_destination(url, resolve_dns=True)
+        origins = {destination.origin}
+        for value in allowed_hosts:
+            candidate = str(value)
+            if "://" not in candidate:
+                candidate = f"{destination.scheme}://{candidate}"
+            origins.add(network_destination(candidate, resolve_dns=True).origin)
+        destinations = tuple(sorted(origins))
         request = ScopeRequest(
-            "browser.navigate", "network", normalized,
-            {"profile": "dedicated-tars", "allowed_hosts": sorted(destinations)},
+            "browser.navigate", "network", destination.policy_url,
+            {"profile": "dedicated-tars", "allowed_origins": list(destinations),
+             "url_sha256": destination.url_sha256},
             task_id=task_id, session_id=session_id, allowed_hosts=destinations,
         )
         actions = self.runtime.authorize((("network", request),), {"network": approval_id})
@@ -128,23 +168,31 @@ class BrowserTools:
             retain_hosts = self.runtime.broker.load(approval_id).scope in {"session", "persistent"}
         try:
             driver = self._driver()
-            if hasattr(driver, "set_allowed_hosts"):
+            if hasattr(driver, "set_allowed_origins"):
+                driver.set_allowed_origins(destinations)
+            elif hasattr(driver, "set_allowed_hosts"):
                 driver.set_allowed_hosts(destinations)
-            data = driver.call("navigate", url=normalized)
-            _, final_host = normalize_network_target(data.get("url", normalized), resolve_dns=True)
-            if final_host not in {
-                normalize_network_target(value)[1] for value in destinations
-            }:
+            data = driver.call("navigate", url=destination.request_url)
+            final = network_destination(
+                data.get("url", destination.request_url), resolve_dns=False,
+            )
+            if final.origin not in origins:
                 raise PermissionError("browser navigation left the authorized destination set")
         except Exception as exc:
-            if 'driver' in locals() and hasattr(driver, "set_allowed_hosts") and not retain_hosts:
-                driver.set_allowed_hosts(())
+            if 'driver' in locals() and not retain_hosts:
+                if hasattr(driver, "set_allowed_origins"):
+                    driver.set_allowed_origins(())
+                elif hasattr(driver, "set_allowed_hosts"):
+                    driver.set_allowed_hosts(())
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
-        if hasattr(driver, "set_allowed_hosts") and not retain_hosts:
-            driver.set_allowed_hosts(())
+        if not retain_hosts:
+            if hasattr(driver, "set_allowed_origins"):
+                driver.set_allowed_origins(())
+            elif hasattr(driver, "set_allowed_hosts"):
+                driver.set_allowed_hosts(())
         self.runtime.finish(actions, state="succeeded", result=data)
-        evidence = self.runtime.evidence("browser", normalized, repr(data), task_id=task_id,
+        evidence = self.runtime.evidence("browser", destination.policy_url, repr(data), task_id=task_id,
                                          event_uuid=actions[0].event_uuid)
         return ToolResult("browser.navigate", "succeeded", data,
                           action_ids=tuple(a.id for a in actions), evidence_ids=(evidence.id,))

@@ -1,4 +1,5 @@
 import socket
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,8 +54,67 @@ def test_http_redirect_revalidates_and_denies_private_or_cross_host(http_environ
     cross = FakeHTTP((http_tools.HTTPResponse(
         "https://example.com/start", 302, {"Location": "https://other.example/path"}, b"", False,
     ),))
-    with pytest.raises(PermissionError, match="cross-host"):
+    with pytest.raises(PermissionError, match="cross-origin"):
         http_tools.HTTPTools(transport=cross).get("https://example.com/start")
+
+
+def test_mutating_http_redirect_never_replays_body_to_another_path(http_environment):
+    policy.add_rule("write", "allow", target="https://example.com/benign")
+    transport = FakeHTTP((http_tools.HTTPResponse(
+        "https://example.com/benign", 307,
+        {"Location": "/admin/delete"}, b"", False,
+    ),))
+    with pytest.raises(PermissionError, match="mutating HTTP redirects"):
+        http_tools.HTTPTools(transport=transport).request(
+            "POST", "https://example.com/benign", body=b"same-body",
+        )
+    assert len(transport.calls) == 1
+    assert transport.calls[0][1] == "https://example.com/benign"
+
+
+def test_http_transport_uses_the_immutable_authorized_payload_snapshot(http_environment):
+    caller_body = bytearray(b"approved")
+    caller_headers = {"X-Mode": "approved"}
+    transport = FakeHTTP((http_tools.HTTPResponse(
+        "https://example.com/api", 200, {"Content-Type": "text/plain"}, b"ok", False,
+    ),))
+
+    class MutatingRuntime:
+        def authorize(self, requests, approvals):
+            for _, request in requests:
+                request.arguments["headers"]["X-Mode"] = "changed"
+            caller_body[:] = b"attacker"
+            caller_headers["X-Mode"] = "changed"
+            return [SimpleNamespace(id=f"action-{index}", event_uuid="event")
+                    for index, _ in enumerate(requests)]
+
+        def finish(self, *args, **kwargs):
+            pass
+
+        def evidence(self, *args, **kwargs):
+            return SimpleNamespace(id="evidence")
+
+    result = http_tools.HTTPTools(
+        runtime=MutatingRuntime(), transport=transport,
+    ).request(
+        "POST", "https://example.com/api", headers=caller_headers, body=caller_body,
+    )
+    assert result.succeeded
+    sent = transport.calls[0][2]
+    assert sent["headers"]["X-Mode"] == "approved"
+    assert sent["body"] == b"approved"
+
+
+@pytest.mark.parametrize(
+    "location", ("http://example.com/other", "https://example.com:444/other"),
+)
+def test_http_redirect_cannot_change_scheme_or_port(http_environment, location):
+    transport = FakeHTTP((http_tools.HTTPResponse(
+        "https://example.com/start", 302, {"Location": location}, b"", False,
+    ),))
+    with pytest.raises(PermissionError, match="cross-origin"):
+        http_tools.HTTPTools(transport=transport).get("https://example.com/start")
+    assert len(transport.calls) == 1
 
 
 def test_http_state_change_requires_separate_write_policy(http_environment):

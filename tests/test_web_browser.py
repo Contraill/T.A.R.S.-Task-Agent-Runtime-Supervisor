@@ -3,7 +3,8 @@ import socket
 
 import pytest
 
-from tars import approvals, browser_tools, policy, state_store, tool_core, web_research
+from tars import (approvals, browser_tools, network, policy, state_store, tool_core,
+                  web_research)
 
 
 class FakeBrowser:
@@ -60,10 +61,12 @@ def test_browser_uses_dedicated_profile_stable_actions_and_evidence(web_environm
     browser = browser_tools.BrowserTools(
         profile=profile, downloads=downloads, driver=driver,
     )
+    destination = network.network_destination("https://example.com")
     navigate_request = policy.ScopeRequest(
         "browser.navigate", "network", "https://example.com/",
-        {"profile": "dedicated-tars", "allowed_hosts": ["example.com"]},
-        allowed_hosts=("example.com",),
+        {"profile": "dedicated-tars", "allowed_origins": ["https://example.com:443"],
+         "url_sha256": destination.url_sha256},
+        allowed_hosts=("https://example.com:443",),
     )
     navigation = browser.navigate("https://example.com", approval_id=_approve(navigate_request))
     assert driver.allowed_hosts == ()
@@ -90,6 +93,32 @@ def test_browser_personal_profile_private_network_and_raw_evaluation_are_blocked
         browser.navigate("http://127.0.0.1/admin")
     with pytest.raises(PermissionError):
         browser.action("evaluate", script="document.cookie")
+
+
+@pytest.mark.parametrize(
+    "final_url", ("http://example.com/", "https://example.com:444/"),
+)
+def test_browser_navigation_cannot_change_authorized_origin(web_environment, final_url):
+    class RedirectingBrowser(FakeBrowser):
+        def call(self, operation, **kwargs):
+            self.calls.append((operation, kwargs))
+            return {"url": final_url}
+
+    destination = network.network_destination("https://example.com")
+    request = policy.ScopeRequest(
+        "browser.navigate", "network", destination.policy_url,
+        {"profile": "dedicated-tars",
+         "allowed_origins": [destination.origin],
+         "url_sha256": destination.url_sha256},
+        allowed_hosts=(destination.origin,),
+    )
+    browser = browser_tools.BrowserTools(
+        profile=web_environment / "profile", downloads=web_environment / "downloads",
+        driver=RedirectingBrowser(),
+    )
+    with pytest.raises(PermissionError, match="authorized destination"):
+        browser.navigate(destination.request_url, approval_id=_approve(request))
+    assert browser.driver.allowed_hosts == ()
 
 
 def test_browser_screenshot_is_forced_into_isolated_location(web_environment):

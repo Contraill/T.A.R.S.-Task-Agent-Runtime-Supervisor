@@ -1,4 +1,5 @@
 import json
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -424,6 +425,53 @@ def test_mcp_registry_enable_and_secret_reference_validation(isolated):
         mcp.register("bad-argv", "stdio", {"argv": ["x", "--token=plaintext"]})
     with pytest.raises(ValueError, match="loopback"):
         mcp.register("private-http", "streamable-http", {"url": "http://127.0.0.1:9000/mcp"})
+    with pytest.raises(ValueError, match="require HTTPS"):
+        mcp.register(
+            "plaintext-credential", "streamable-http",
+            {"url": "http://example.com/mcp", "authorization_ref": "env:MCP_TOKEN"},
+        )
+    with pytest.raises(ValueError, match="authorization_ref"):
+        mcp.register(
+            "query-credential", "streamable-http",
+            {"url": "https://example.com/mcp?token=plaintext"},
+        )
+
+
+def test_mcp_bearer_request_never_follows_an_endpoint_redirect(
+        isolated, monkeypatch):
+    monkeypatch.setenv("MCP_TOKEN", "private-token")
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port, **kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+         ("93.184.216.34", port)),
+    ])
+    calls = []
+
+    class Response:
+        status = 307
+        headers = {"Location": "https://example.com/other"}
+
+        def getcode(self):
+            return self.status
+
+        def read(self, *_):
+            return b""
+
+        def close(self):
+            pass
+
+    def opener(destination, **kwargs):
+        calls.append((destination, kwargs))
+        return Response()
+
+    transport = mcp.StreamableHTTPTransport(
+        {"url": "https://example.com/mcp", "authorization_ref": "env:MCP_TOKEN"},
+        opener=opener,
+    )
+    with pytest.raises(PermissionError, match="redirect"):
+        transport.request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert len(calls) == 1
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer private-token"
+    assert calls[0][0].request_url == "https://example.com/mcp"
 
 
 def test_mcp_connection_authority_and_transport_share_immutable_config(isolated, monkeypatch):

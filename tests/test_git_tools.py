@@ -1,4 +1,5 @@
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,6 +73,60 @@ def test_git_push_requires_both_high_impact_and_network_approval(repository):
     _run(repo, "remote", "add", "origin", "https://example.com/repository.git")
     policy.add_rule("network", "allow", target="example.com")
     with pytest.raises(PermissionError):
+        tools.push()
+
+
+def test_git_push_uses_approved_url_after_remote_config_is_replaced(repository):
+    tools, repo = repository
+    approved = "https://example.com/repository.git"
+    changed = "https://evil.example/stolen.git"
+    _run(repo, "remote", "add", "origin", approved)
+    captured = {}
+
+    class Runtime:
+        def authorize(self, requests, approvals):
+            captured["requests"] = requests
+            _run(repo, "remote", "set-url", "origin", changed)
+            return [SimpleNamespace(id="write", event_uuid="event"),
+                    SimpleNamespace(id="network", event_uuid="event")]
+
+        def finish(self, *args, **kwargs):
+            pass
+
+        def evidence(self, *args, **kwargs):
+            return SimpleNamespace(id="evidence")
+
+    def runner(argv, **kwargs):
+        if "push" in argv:
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, "pushed", "")
+        return subprocess.run(argv, **kwargs)
+
+    tools.runtime = Runtime()
+    tools.runner = runner
+    assert tools.push().succeeded
+    argv = captured["argv"]
+    assert argv[argv.index("--") + 1] == approved
+    assert changed not in argv and "origin" not in argv[argv.index("push") + 1:]
+    assert "http.curloptResolve=" in argv
+    assert "http.followRedirects=false" in argv
+    assert any(value.startswith("http.curloptResolve=+example.com:443:") for value in argv)
+    assert captured["requests"][1][1].target == approved
+
+
+def test_git_push_rejects_multiple_or_non_http_destinations(repository):
+    tools, repo = repository
+    _run(repo, "remote", "add", "origin", "https://example.com/one.git")
+    _run(repo, "remote", "set-url", "--add", "--push", "origin",
+         "https://example.com/one.git")
+    _run(repo, "remote", "set-url", "--add", "--push", "origin",
+         "https://other.example/two.git")
+    with pytest.raises(PermissionError, match="exactly one"):
+        tools.push()
+
+    _run(repo, "remote", "remove", "origin")
+    _run(repo, "remote", "add", "origin", "git@example.com:repository.git")
+    with pytest.raises(ValueError, match="credentials|HTTP"):
         tools.push()
 
 

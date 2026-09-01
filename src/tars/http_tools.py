@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-import urllib.error
 import urllib.request
 
-from .policy import ScopeRequest, canonical_path, normalize_network_target, redact
+from .network import NetworkDestination, network_destination, open_bound
+from .policy import ScopeRequest, canonical_path, redact
 from .tool_core import ToolResult, ToolRuntime
 
 
@@ -17,28 +17,22 @@ class HTTPResponse:
     headers: dict
     body: bytes
     truncated: bool
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+    peer_ip: str = ""
 
 
 class UrllibHTTPTransport:
-    def __init__(self):
-        self.opener = urllib.request.build_opener(_NoRedirect)
-
-    def __call__(self, method, url, *, headers, body, timeout, max_bytes):
-        request = urllib.request.Request(url, data=body, method=method, headers=headers)
-        try:
-            response = self.opener.open(request, timeout=timeout)
-        except urllib.error.HTTPError as exc:
-            response = exc
-        with response:
+    def __call__(self, method, url, *, headers, body, timeout, max_bytes,
+                 destination=None):
+        bound = destination or network_destination(url, resolve_dns=True)
+        if not isinstance(bound, NetworkDestination) or bound.request_url != url:
+            raise PermissionError("HTTP request differs from its authorized destination")
+        with open_bound(
+            bound, method=method, headers=headers, body=body, timeout=timeout,
+        ) as response:
             payload = b"" if method == "HEAD" else response.read(max_bytes + 1)
             return HTTPResponse(
                 response.geturl(), response.status, dict(response.headers.items()),
-                payload[:max_bytes], len(payload) > max_bytes,
+                payload[:max_bytes], len(payload) > max_bytes, response.peer_ip,
             )
 
 
@@ -54,7 +48,7 @@ class HTTPTools:
 
     @staticmethod
     def _validate(url):
-        return normalize_network_target(url, resolve_dns=True)
+        return network_destination(url, resolve_dns=True)
 
     def request(self, method, url, *, headers=None, body=None, approval_ids=None,
                 task_id=None, session_id=None, use_cache=True, output=None,
@@ -62,23 +56,33 @@ class HTTPTools:
         method = method.upper()
         if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
             raise ValueError(f"unsupported HTTP method: {method}")
-        current, approved_host = self._validate(url)
-        safe_headers = dict(headers or {})
-        cached = self.cache.get(current) if use_cache and method in {"GET", "HEAD"} else None
+        destination = self._validate(url)
+        current = destination.request_url
+        approved_origin = destination.origin
+        safe_headers = {
+            str(key): str(value) for key, value in dict(headers or {}).items()
+        }
+        if body is not None and not isinstance(body, (bytes, bytearray, memoryview)):
+            raise TypeError("HTTP request bodies must be bytes")
+        body = None if body is None else bytes(body)
+        cached = (self.cache.get(destination.policy_url)
+                  if use_cache and method in {"GET", "HEAD"} else None)
         if cached:
             if cached.headers.get("ETag"):
                 safe_headers.setdefault("If-None-Match", cached.headers["ETag"])
             if cached.headers.get("Last-Modified"):
                 safe_headers.setdefault("If-Modified-Since", cached.headers["Last-Modified"])
         requests = [("network", ScopeRequest(
-            "http.request", "network", current,
-            {"method": method, "headers": safe_headers, "body": body or b""},
-            task_id=task_id, session_id=session_id, allowed_hosts=(approved_host,),
+            "http.request", "network", destination.policy_url,
+            {"method": method, "headers": dict(safe_headers), "body": body or b"",
+             "origin": approved_origin, "url_sha256": destination.url_sha256},
+            task_id=task_id, session_id=session_id, allowed_hosts=(approved_origin,),
         ))]
         if method not in {"GET", "HEAD"}:
             requests.append(("write", ScopeRequest(
-                "http.request", "write", current,
-                {"method": method, "headers": safe_headers, "body": body or b""},
+                "http.request", "write", destination.policy_url,
+                {"method": method, "headers": dict(safe_headers), "body": body or b"",
+                 "origin": approved_origin, "url_sha256": destination.url_sha256},
                 task_id=task_id, session_id=session_id,
             )))
         output_path = None
@@ -87,7 +91,8 @@ class HTTPTools:
                 raise ValueError("HTTP output files are supported only for GET")
             output_path = canonical_path(output)
             requests.append(("output", ScopeRequest(
-                "http.download", "write", output_path, {"url": current},
+                "http.download", "write", output_path,
+                {"url": destination.policy_url, "url_sha256": destination.url_sha256},
                 task_id=task_id, session_id=session_id,
                 allowed_paths=tuple(allowed_paths),
             )))
@@ -98,7 +103,15 @@ class HTTPTools:
                 response = self.transport(
                     method, current, headers=safe_headers, body=body,
                     timeout=self.timeout, max_bytes=self.max_bytes,
+                    destination=destination,
                 )
+                response_destination = network_destination(
+                    response.url, resolve_dns=False,
+                )
+                if response_destination.request_url != destination.request_url:
+                    raise PermissionError(
+                        "HTTP transport returned a different destination than it received"
+                    )
                 if response.status == 304 and cached:
                     response = cached
                     break
@@ -107,11 +120,16 @@ class HTTPTools:
                 location = response.headers.get("Location")
                 if not location:
                     break
+                if method not in {"GET", "HEAD"}:
+                    raise PermissionError(
+                        "mutating HTTP redirects require separate authorization"
+                    )
                 next_url = urllib.request.urljoin(current, location)
-                current, redirect_host = self._validate(next_url)
-                if redirect_host != approved_host:
-                    raise PermissionError("cross-host redirects require a separate request")
-                redirects.append(current)
+                destination = self._validate(next_url)
+                if destination.origin != approved_origin:
+                    raise PermissionError("cross-origin redirects require a separate request")
+                current = destination.request_url
+                redirects.append(destination.policy_url)
             else:
                 raise RuntimeError("HTTP redirect limit exceeded")
             content_type = response.headers.get("Content-Type", "application/octet-stream")
@@ -126,7 +144,8 @@ class HTTPTools:
             data = {"url": response.url, "status": response.status,
                     "headers": response_headers, "content_type": content_type,
                     "content": content, "bytes": len(response.body),
-                    "truncated": response.truncated, "redirects": redirects}
+                    "truncated": response.truncated, "redirects": redirects,
+                    "peer_ip": response.peer_ip}
             state = "succeeded" if 200 <= response.status < 400 else "failed"
             if output_path and state == "succeeded":
                 if response.truncated:
@@ -138,7 +157,7 @@ class HTTPTools:
                              "sha256": hashlib.sha256(response.body).hexdigest(),
                              "verified_bytes": target.stat().st_size})
             if method in {"GET", "HEAD"} and state == "succeeded":
-                self.cache[current] = response
+                self.cache[destination.policy_url] = response
         except Exception as exc:
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise

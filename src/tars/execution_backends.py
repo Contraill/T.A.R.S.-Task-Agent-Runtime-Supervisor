@@ -14,6 +14,7 @@ import uuid
 
 from .action_journal import begin_action, finish_action, record_denied
 from .approvals import ApprovalBroker
+from .network import NetworkDestination, tcp_destination
 from .ownership import (Heartbeat, Owner, claim_workspace, current_owner, held_by,
                         release as release_lease)
 from .policy import ScopeGuard, ScopeRequest, canonical_path, normalize_network_target, redact
@@ -133,8 +134,10 @@ class ExecutionBackend(Protocol):
 
 
 class _ExecutionAuthorization:
-    def __init__(self, action_ids):
+    def __init__(self, action_ids, *, network_destination=None, ssh_target=None):
         self.action_ids = tuple(action_ids)
+        self.network_destination = network_destination
+        self.ssh_target = ssh_target
 
 
 def _require_authorization(value):
@@ -356,10 +359,11 @@ class SSHBackend:
         _require_authorization(authorization)
         if not self.ssh_binary:
             raise RuntimeError("SSH backend unavailable: OpenSSH client missing")
-        try:
-            target = self.targets[request.target]
-        except KeyError as exc:
-            raise PermissionError("SSH target is not explicitly registered") from exc
+        target = authorization.ssh_target
+        if (not isinstance(target, SSHExecutionTarget)
+                or target.name != request.target
+                or self.targets.get(request.target) != target):
+            raise PermissionError("SSH target differs from its guarded configuration")
         command_name = request.argv[0]
         if not target.allowed_commands or command_name not in target.allowed_commands:
             raise PermissionError(f"SSH command is outside target scope: {command_name}")
@@ -370,8 +374,18 @@ class SSHBackend:
             if not any(cwd == PurePosixPath(root) or PurePosixPath(root) in cwd.parents
                        for root in target.allowed_paths):
                 raise PermissionError("SSH cwd is outside target scope")
+        bound = authorization.network_destination
+        expected = tcp_destination(
+            target.host, target.port, scheme="ssh", resolve_dns=False,
+        )
+        if (not isinstance(bound, NetworkDestination)
+                or bound.host != expected.host or bound.port != target.port
+                or not bound.addresses):
+            raise PermissionError("SSH execution lacks its guarded network destination")
         destination = f"{target.user}@{target.host}"
         command = [self.ssh_binary, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                   "-o", f"Hostname={bound.addresses[0]}",
+                   "-o", f"HostKeyAlias={bound.host}", "-o", "CheckHostIP=yes",
                    "-o", f"ConnectTimeout={max(1, min(int(request.limits.timeout), 30))}",
                    "-p", str(target.port)]
         if target.credential_ref:
@@ -412,11 +426,16 @@ class GuardedExecutor:
                   (backend_name == "container" and backend.sandbox_escape(request)))
         effect = "remote" if backend_name == "ssh" else "execute"
         target = request.target or backend_name
+        ssh_destination = None
         if backend_name == "ssh":
             try:
-                target = "https://" + backend.targets[request.target].host
+                configured = backend.targets[request.target]
             except KeyError as exc:
                 raise PermissionError("SSH target is not explicitly registered") from exc
+            ssh_destination = tcp_destination(
+                configured.host, configured.port, scheme="ssh", resolve_dns=True,
+            )
+            target = ssh_destination.policy_url
         path_target = (request.workspace if backend_name == "container"
                        and request.workspace_mode != "ephemeral" else None)
         path_checks = []
@@ -451,6 +470,7 @@ class GuardedExecutor:
         scope_request = ScopeRequest(
             "terminal.run", effect, target,
             arguments={
+                "backend": backend_name,
                 "argv": list(request.argv), "cwd": request.cwd,
                 "environment_refs": request.environment_refs,
                 "workspace": request.workspace,
@@ -458,10 +478,23 @@ class GuardedExecutor:
                 "image": request.image, "network": request.network,
                 "network_hosts": list(request.network_hosts),
                 "persistent": request.persistent,
+                "network_origin": ssh_destination.origin if ssh_destination else "",
+                "network_url_sha256": ssh_destination.url_sha256 if ssh_destination else "",
+                "ssh_target": ({
+                    "name": configured.name, "host": configured.host,
+                    "port": configured.port, "user": configured.user,
+                    "credential_ref": configured.credential_ref,
+                    "allowed_commands": list(configured.allowed_commands),
+                    "allowed_paths": list(configured.allowed_paths),
+                } if ssh_destination else {}),
                 "authority_contract": ({
                     "filesystem": "unrestricted-host", "network": "unrestricted-host",
                     "resource_limits": "timeout-only",
                 } if backend_name == "host" else {
+                    "filesystem": "registered-remote-paths",
+                    "network": "pinned-ssh-peer",
+                    "resource_limits": "timeout-only",
+                } if backend_name == "ssh" else {
                     "filesystem": "container-mounts", "network": (
                         "unrestricted-public-egress" if request.network else "disabled"),
                     "resource_limits": "container-runtime",
@@ -470,11 +503,6 @@ class GuardedExecutor:
             task_id=task_id, session_id=session_id, sandbox_escape=escape,
         )
         decision = self.guard.evaluate(scope_request)
-        if backend_name == "ssh" and decision.action != "deny":
-            try:
-                normalize_network_target(target, resolve_dns=True)
-            except ValueError as exc:
-                decision = replace(decision, action="deny", reason=str(exc))
         approval_map = approval_id if isinstance(approval_id, dict) else {"primary": approval_id}
         workspace_owner = current_owner() or Owner.create("execution")
         actions = [begin_action(
@@ -558,7 +586,11 @@ class GuardedExecutor:
                 for workspace_key in workspace_claimed:
                     heartbeats.enter_context(Heartbeat(
                         "workspace", workspace_key, workspace_owner, lease_seconds=30))
-                authorization = _ExecutionAuthorization(action.id for action in actions)
+                authorization = _ExecutionAuthorization(
+                    (action.id for action in actions),
+                    network_destination=ssh_destination,
+                    ssh_target=configured if backend_name == "ssh" else None,
+                )
                 result = backend.execute(
                     request, authorization=authorization, allow_host_mounts=escape,
                 ) if backend_name == "container" else backend.execute(

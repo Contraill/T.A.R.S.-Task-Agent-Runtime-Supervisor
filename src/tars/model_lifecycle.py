@@ -9,10 +9,10 @@ import shutil
 import struct
 import tempfile
 import urllib.parse
-import urllib.request
 
 from .calibration import calibration_path, load_calibration
 from .config import MODEL_ARTIFACT_ROOT, MODEL_DOWNLOAD_ROOT
+from .network import network_destination, open_bound
 from .registry import ensure_registry, get_model, role_for_alias, save_registry
 
 COMPATIBILITY_MANIFEST = json.loads(
@@ -117,22 +117,38 @@ def import_model(path: str | Path, alias: str, *, expected_sha256: str | None = 
     return artifact
 
 
+def _open_url(url, *, method="GET", headers=None, timeout=30, max_redirects=5):
+    current = str(url)
+    for _ in range(max_redirects + 1):
+        destination = network_destination(current, resolve_dns=True)
+        response = open_bound(
+            destination, method=method, headers=headers, timeout=timeout,
+        )
+        if response.status not in {301, 302, 303, 307, 308}:
+            return response
+        location = response.headers.get("Location")
+        response.close()
+        if not location:
+            raise RuntimeError("model download redirect omitted its destination")
+        current = urllib.parse.urljoin(destination.request_url, location)
+    raise RuntimeError("model download redirect limit exceeded")
+
+
 def _download(url: str, partial: Path, *, expected_size: int | None = None) -> None:
     offset = partial.stat().st_size if partial.exists() else 0
     if expected_size is None:
         try:
-            head = urllib.request.Request(url, method="HEAD")
-            with urllib.request.urlopen(head, timeout=15) as response:
+            with _open_url(url, method="HEAD", timeout=15) as response:
                 length = response.headers.get("Content-Length")
             expected_size = int(length) if length is not None else None
         except (OSError, ValueError):
             expected_size = None
     required = max(0, (expected_size or 0) - offset)
     _preflight(partial, required)
-    request = urllib.request.Request(url)
+    headers = {}
     if offset:
-        request.add_header("Range", f"bytes={offset}-")
-    with urllib.request.urlopen(request, timeout=30) as response:
+        headers["Range"] = f"bytes={offset}-"
+    with _open_url(url, headers=headers, timeout=30) as response:
         status = getattr(response, "status", 200)
         mode = "ab" if offset and status == 206 else "wb"
         with partial.open(mode) as handle:
@@ -145,7 +161,10 @@ def pull_model(source: str, alias: str, *, expected_sha256: str | None = None,
                native_context: int = 0) -> Path:
     if source.startswith(("http://", "https://")):
         url = source
-        source_name = source
+        destination = network_destination(source, resolve_dns=False)
+        source_name = destination.policy_url
+        if destination.policy_url != destination.request_url:
+            source_name += f"#url-sha256={destination.url_sha256}"
     else:
         if not filename:
             raise ValueError("Hugging Face pulls require --filename")
@@ -172,7 +191,7 @@ def search_huggingface(query: str, *, limit: int = 10) -> list[dict]:
     url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(
         {"search": query, "filter": "gguf", "limit": int(limit), "sort": "downloads", "direction": -1}
     )
-    with urllib.request.urlopen(url, timeout=15) as response:
+    with _open_url(url, timeout=15) as response:
         rows = json.loads(response.read().decode("utf-8"))
     return [{"id": row.get("id", ""), "downloads": row.get("downloads", 0),
              "likes": row.get("likes", 0), "license": (row.get("cardData") or {}).get("license", "unknown")}

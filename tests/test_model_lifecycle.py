@@ -71,13 +71,13 @@ def test_download_resumes_partial_file(monkeypatch, tmp_path):
         def __enter__(self): return self
         def __exit__(self, *args): return False
 
-    def urlopen(request, timeout):
-        if request.get_method() == "HEAD":
+    def open_url(url, *, method="GET", headers=None, timeout):
+        if method == "HEAD":
             return Response(b"")
-        observed["range"] = request.get_header("Range")
+        observed["range"] = headers.get("Range")
         return Response(b"rest")
 
-    monkeypatch.setattr(lifecycle.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(lifecycle, "_open_url", open_url)
     lifecycle._download("https://example.invalid/model.gguf", partial)
     assert observed["range"] == "bytes=4-"
     assert partial.read_bytes() == b"GGUFrest"

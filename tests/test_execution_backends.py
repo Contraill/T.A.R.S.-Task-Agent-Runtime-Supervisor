@@ -311,12 +311,13 @@ def test_ssh_backend_uses_registered_target_and_secret_reference(monkeypatch, is
     )
     backend = execution.SSHBackend((target,), ssh_binary="/usr/bin/ssh", runner=runner)
     request = execution.ExecutionRequest(("uname", "-a"), target="lab")
+    target_url = "ssh://example.com:2222/"
     decision = policy.ScopeGuard().evaluate(policy.ScopeRequest(
-        "terminal.run", "remote", "https://example.com",
+        "terminal.run", "remote", target_url,
     ))
     broker = approvals.ApprovalBroker()
     pending = broker.request(
-        policy.ScopeRequest("terminal.run", "remote", "https://example.com"), decision,
+        policy.ScopeRequest("terminal.run", "remote", target_url), decision,
         scope="target",
     )
     broker.decide(pending.id, approve=True)
@@ -325,8 +326,61 @@ def test_ssh_backend_uses_registered_target_and_secret_reference(monkeypatch, is
     )
     command = runner.calls[0][0]
     assert result.succeeded and "operator@example.com" in command
+    assert any(value.startswith("Hostname=") for value in command)
+    assert "HostKeyAlias=example.com" in command
     assert command[-1] == "uname -a" and str(identity) in command
     assert backend.status().support == "experimental"
+
+
+def test_ssh_uses_the_guarded_dns_snapshot_without_reresolving(
+        monkeypatch, isolated_execution):
+    resolutions = []
+
+    def rebinding(host, port, **kwargs):
+        address = "93.184.216.34" if not resolutions else "127.0.0.1"
+        resolutions.append(address)
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                 (address, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding)
+    runner = FakeRunner(stdout="remote\n")
+    target = execution.SSHExecutionTarget(
+        "lab", "example.com", "operator", 22,
+        allowed_commands=("uname",),
+    )
+    backend = execution.SSHBackend((target,), ssh_binary="/usr/bin/ssh", runner=runner)
+    _allow("remote", "example.com")
+    result = execution.GuardedExecutor({"ssh": backend}).execute(
+        "ssh", execution.ExecutionRequest(("uname",), target="lab"),
+    )
+    assert result.succeeded and resolutions == ["93.184.216.34"]
+    command = runner.calls[0][0]
+    assert "Hostname=93.184.216.34" in command
+    assert "Hostname=127.0.0.1" not in command
+
+
+def test_ssh_backend_rejects_target_config_change_after_authorization(isolated_execution):
+    original = execution.SSHExecutionTarget(
+        "lab", "example.com", "operator", allowed_commands=("id",),
+    )
+    backend = execution.SSHBackend(
+        (original,), ssh_binary="/usr/bin/ssh", runner=FakeRunner(),
+    )
+    authorization = execution._ExecutionAuthorization(
+        ("action",),
+        network_destination=execution.tcp_destination(
+            original.host, original.port, scheme="ssh", resolve_dns=True,
+        ),
+        ssh_target=original,
+    )
+    backend.targets["lab"] = execution.SSHExecutionTarget(
+        "lab", "example.com", "root", allowed_commands=("id", "rm"),
+    )
+    with pytest.raises(PermissionError, match="guarded configuration"):
+        backend.execute(
+            execution.ExecutionRequest(("id",), target="lab"),
+            authorization=authorization,
+        )
 
 
 def test_ssh_unregistered_target_and_missing_container_runtime_are_explicit(isolated_execution):
@@ -346,7 +400,11 @@ def test_ssh_command_and_working_directory_scope_are_enforced(isolated_execution
         allowed_paths=("/srv/project",),
     )
     backend = execution.SSHBackend((target,), ssh_binary="/usr/bin/ssh", runner=FakeRunner())
-    authorization = execution._ExecutionAuthorization(("fixture",))
+    authorization = execution._ExecutionAuthorization(
+        ("fixture",), network_destination=execution.tcp_destination(
+            "example.com", 22, scheme="ssh", resolve_dns=True,
+        ), ssh_target=target,
+    )
     with pytest.raises(PermissionError, match="command"):
         backend.execute(execution.ExecutionRequest(("rm", "-rf", "/"), target="lab"),
                         authorization=authorization)

@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-from ipaddress import ip_address
 from pathlib import Path
 import re
-import socket
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 import uuid
 
+from .network import network_destination, tcp_destination
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 
 EFFECTS = {"read", "write", "execute", "network", "service", "remote", "secret",
@@ -190,47 +189,23 @@ def _path_request(request: ScopeRequest) -> bool:
     return bool(request.allowed_paths) or request.tool.startswith("fs.")
 
 
-def _unsafe_ip(value: str) -> bool:
-    address = ip_address(value)
-    return not address.is_global
-
-
 def normalize_network_target(value: str, *, resolve_dns=False) -> tuple[str, str]:
-    parsed = urlsplit(value if "://" in value else "https://" + value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("network target must be an HTTP(S) URL or host")
-    if parsed.username or parsed.password:
-        raise ValueError("credentials in network targets are forbidden")
-    host = parsed.hostname.rstrip(".").casefold()
-    if host == "localhost" or host.endswith(".localhost"):
-        raise ValueError("loopback network targets are denied")
-    try:
-        if _unsafe_ip(host):
-            raise ValueError("private, loopback, link-local and reserved targets are denied")
-    except ValueError as exc:
-        if "denied" in str(exc):
-            raise
-    try:
-        legacy = socket.inet_aton(host)
-    except OSError:
-        legacy = None
-    if legacy is not None and _unsafe_ip(socket.inet_ntoa(legacy)):
-        raise ValueError("non-canonical private or loopback targets are denied")
-    if resolve_dns:
-        try:
-            addresses = {item[4][0] for item in socket.getaddrinfo(host, parsed.port or 443)}
-        except socket.gaierror as exc:
-            raise ValueError(f"network target cannot be resolved: {host}") from exc
-        if any(_unsafe_ip(item) for item in addresses):
-            raise ValueError("network target resolves to a non-public address")
-    port = parsed.port
-    authority = f"{host}:{port}" if port else host
-    safe_query = urlencode([
-        (key, "[REDACTED]" if _sensitive_key(key) else value)
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-    ])
-    normalized = urlunsplit((parsed.scheme, authority, parsed.path or "/", safe_query, ""))
-    return normalized, host
+    destination = network_destination(value, resolve_dns=resolve_dns)
+    return destination.policy_url, destination.host
+
+
+def normalize_remote_target(value: str, *, resolve_dns=False) -> tuple[str, str]:
+    parsed = urlsplit(str(value))
+    if parsed.scheme == "ssh" and parsed.hostname:
+        if (parsed.username or parsed.password or parsed.query or parsed.fragment
+                or parsed.path not in {"", "/"}):
+            raise ValueError("SSH authority targets contain only host and port")
+        destination = tcp_destination(
+            parsed.hostname, parsed.port or 22, scheme="ssh",
+            resolve_dns=resolve_dns,
+        )
+        return destination.policy_url, destination.host
+    return normalize_network_target(value, resolve_dns=resolve_dns)
 
 
 def add_rule_in_transaction(conn, effect: str, action: str, *, target="",
@@ -319,7 +294,11 @@ class ScopeGuard:
             missing_path_scope = not request.allowed_paths
         if request.effect in {"network", "remote"}:
             try:
-                target, host = normalize_network_target(target)
+                normalizer = (
+                    normalize_remote_target if request.effect == "remote"
+                    else normalize_network_target
+                )
+                target, host = normalizer(target)
             except ValueError as exc:
                 return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target, str(exc),
                                       normalized_arguments=redact_arguments(request.arguments))

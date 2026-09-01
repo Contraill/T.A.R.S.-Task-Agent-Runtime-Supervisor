@@ -10,13 +10,11 @@ import threading
 import select
 import re
 import time
-from urllib.request import Request
-import urllib.error
-import urllib.request
 from urllib.parse import urlsplit
 import uuid
 
 from . import __version__
+from .network import network_destination, open_bound
 from .policy import ScopeRequest, canonical_path, normalize_network_target, redact
 from .process_supervision import spawn_supervised
 from .state_store import (connect, ensure_state_store, json_dumps, json_loads,
@@ -78,9 +76,18 @@ def register(name, transport, config, *, enabled=True, tool_filter=None,
     else:
         if not str(config.get("url", "")).startswith(("http://", "https://")):
             raise ValueError("streamable HTTP MCP config requires an HTTP(S) URL")
-        config["url"] = normalize_network_target(config["url"], resolve_dns=True)[0]
+        destination = network_destination(config["url"], resolve_dns=False)
+        if destination.policy_url != destination.request_url:
+            raise ValueError(
+                "MCP endpoint credentials must use authorization_ref, not URL query values"
+            )
+        config["url"] = destination.request_url
         if config.get("authorization_ref"):
             parse_reference(config["authorization_ref"])
+            if destination.scheme != "https":
+                raise ValueError(
+                    "credential-bearing MCP transports require HTTPS"
+                )
     effects = _normalize_effect_policy(name, effect_policy or {})
     stamp = now_utc()
     ensure_state_store()
@@ -690,10 +697,6 @@ class StdioTransport:
 
 
 class StreamableHTTPTransport:
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            return None
-
     def __init__(self, config, *, opener=None, secret_store=None,
                  consumer="mcp:http"):
         self.url = config["url"]
@@ -701,7 +704,7 @@ class StreamableHTTPTransport:
         self.authorization_ref = config.get("authorization_ref")
         self.secret_store = secret_store or SecretStore()
         self.consumer = consumer
-        self.opener = opener or urllib.request.build_opener(self._NoRedirect).open
+        self.opener = opener
         self.session_id = None
         self.secret_values = ()
 
@@ -714,32 +717,32 @@ class StreamableHTTPTransport:
                 headers["Authorization"] = "Bearer " + secret
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
-        current, approved_host = normalize_network_target(self.url, resolve_dns=True)
-        for _ in range(6):
-            request = Request(current, data=json.dumps(payload).encode(), headers=headers,
-                              method="POST")
-            try:
-                response = self.opener(request, timeout=self.timeout)
-            except urllib.error.HTTPError as exc:
-                response = exc
+        destination = network_destination(self.url, resolve_dns=True)
+        body_bytes = json.dumps(payload).encode()
+        if self.opener is None:
+            response = open_bound(
+                destination, method="POST", headers=headers, body=body_bytes,
+                timeout=self.timeout,
+            )
+        else:
+            response = self.opener(
+                destination, method="POST", headers=headers, body=body_bytes,
+                timeout=self.timeout,
+            )
+        try:
             status = getattr(response, "status", None)
             status = response.getcode() if status is None else status
-            if status not in {301, 302, 303, 307, 308}:
-                break
-            location = response.headers.get("Location")
-            if not location:
-                break
-            next_url = urllib.request.urljoin(current, location)
-            current, redirect_host = normalize_network_target(next_url, resolve_dns=True)
-            if redirect_host != approved_host:
-                raise PermissionError("cross-host MCP redirects require separate authorization")
-        else:
-            raise RuntimeError("MCP HTTP redirect limit exceeded")
-        self.session_id = response.headers.get("Mcp-Session-Id", self.session_id)
-        body = response.read(8_000_001)
-        if len(body) > 8_000_000:
-            raise RuntimeError("MCP HTTP response exceeded size limit")
-        content_type = response.headers.get("Content-Type", "")
+            if status in {301, 302, 303, 307, 308}:
+                raise PermissionError(
+                    "MCP HTTP redirects require separate endpoint authorization"
+                )
+            self.session_id = response.headers.get("Mcp-Session-Id", self.session_id)
+            body = response.read(8_000_001)
+            if len(body) > 8_000_000:
+                raise RuntimeError("MCP HTTP response exceeded size limit")
+            content_type = response.headers.get("Content-Type", "")
+        finally:
+            response.close()
         if "text/event-stream" in content_type:
             events = [line[6:] for line in body.decode().splitlines() if line.startswith("data: ")]
             if not events:
@@ -792,12 +795,22 @@ class MCPClient:
         self._server_identity = _server_identity(self.server)
         if transport is None:
             effect = "execute" if self.server.transport == "stdio" else "network"
-            target = (self.server.config["argv"][0] if effect == "execute"
-                      else self.server.config["url"])
-            request = ScopeRequest(f"mcp.{self.server.name}.connect", effect, target,
-                                   {"transport": self.server.transport,
+            connection_arguments = {"transport": self.server.transport,
                                     "config": self.server.config,
-                                    "server_identity_sha256": self._server_identity})
+                                    "server_identity_sha256": self._server_identity}
+            if effect == "execute":
+                target = self.server.config["argv"][0]
+            else:
+                destination = network_destination(
+                    self.server.config["url"], resolve_dns=True,
+                )
+                target = destination.policy_url
+                connection_arguments |= {
+                    "origin": destination.origin,
+                    "url_sha256": destination.url_sha256,
+                }
+            request = ScopeRequest(f"mcp.{self.server.name}.connect", effect, target,
+                                   connection_arguments)
             actions = self.runtime.authorize(
                 (("connect", request),), {"connect": connection_approval_id})
             transport_cls = StdioTransport if self.server.transport == "stdio" else StreamableHTTPTransport

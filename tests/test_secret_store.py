@@ -8,6 +8,7 @@ from tars.core_client import CoreClient
 from tars.execution_backends import (ExecutionRequest, HostBackend, SSHBackend,
                                      SSHExecutionTarget, _ExecutionAuthorization)
 from tars.mcp import MCPServerRecord, MCPClient
+from tars.network import tcp_destination
 from tars.secret_store import SecretStore, parse_reference
 from tars.web_research import TavilyResearch
 
@@ -68,13 +69,17 @@ def test_real_host_and_ssh_execution_resolve_at_backend_boundary(tmp_path):
     assert result.stdout == "resolved"
 
     ssh_calls = []
-    ssh = SSHBackend((SSHExecutionTarget(
+    ssh_target = SSHExecutionTarget(
         "lab", "example.com", "operator", credential_ref="fixture:identity",
-        allowed_commands=("id",)),), ssh_binary="/usr/bin/ssh",
+        allowed_commands=("id",))
+    ssh = SSHBackend((ssh_target,), ssh_binary="/usr/bin/ssh",
         runner=lambda argv, **kwargs: ssh_calls.append(argv) or subprocess.CompletedProcess(
             argv, 0, "", ""), secret_store=secrets)
     ssh.execute(ExecutionRequest(("id",), target="lab"),
-                authorization=_ExecutionAuthorization(("action",)))
+                authorization=_ExecutionAuthorization(
+                    ("action",), network_destination=tcp_destination(
+                        "example.com", 22, scheme="ssh", resolve_dns=True,
+                    ), ssh_target=ssh_target))
     assert ssh_calls[0][ssh_calls[0].index("-i") + 1] == "/keys/id"
 
 

@@ -5,7 +5,8 @@ from pathlib import Path
 import re
 import subprocess
 
-from .policy import ScopeRequest, canonical_path, normalize_network_target
+from .network import network_destination
+from .policy import ScopeRequest, canonical_path
 from .tool_core import ToolResult, ToolRuntime
 
 
@@ -133,30 +134,43 @@ class GitTools:
     def push(self, remote="origin", branch="HEAD", *, approval_ids=None, **kwargs):
         remote = _remote_name(remote)
         branch = _git_ref(branch, label="branch name")
-        remote_url = self._git(["remote", "get-url", remote])
+        remote_url = self._git(["remote", "get-url", "--push", "--all", remote])
         if remote_url.returncode != 0:
             return ToolResult("git.push", "failed", {"exit_code": remote_url.returncode},
                               error=remote_url.stderr)
-        url = remote_url.stdout.strip()
-        if url.startswith("git@"):
-            host = url.split("@", 1)[1].split(":", 1)[0]
-            url = "https://" + host
-        url = normalize_network_target(url, resolve_dns=True)[0]
+        urls = tuple(value for value in remote_url.stdout.splitlines() if value.strip())
+        if len(urls) != 1:
+            raise PermissionError("Git push requires exactly one explicit remote destination")
+        destination = network_destination(urls[0], resolve_dns=True)
+        authority = {
+            "remote": remote, "branch": branch, "origin": destination.origin,
+            "url_sha256": destination.url_sha256,
+        }
         requests = (
             ("write", ScopeRequest("git.push", "destructive", self.repository,
-                                   {"remote": remote, "branch": branch},
+                                   authority,
                                    allowed_paths=(self.repository,), destructive=True,
                                    task_id=kwargs.get("task_id"), session_id=kwargs.get("session_id"))),
-            ("network", ScopeRequest("git.push", "network", url,
-                                     {"remote": remote, "branch": branch},
+            ("network", ScopeRequest("git.push", "network", destination.policy_url,
+                                     authority,
                                      task_id=kwargs.get("task_id"), session_id=kwargs.get("session_id"))),
         )
         actions = self.runtime.authorize(requests, approval_ids)
         before = self._state()
-        proc = self._git(["push", remote, branch])
+        resolver_options = ["-c", "http.curloptResolve="]
+        for address in destination.addresses:
+            pinned = f"[{address}]" if ":" in address else address
+            value = f"+{destination.host}:{destination.port}:{pinned}"
+            resolver_options.extend(("-c", f"http.curloptResolve={value}"))
+        proc = self._git([
+            "-c", "http.proxy=", "-c", "http.followRedirects=false",
+            *resolver_options,
+            "push", "--", destination.request_url, branch,
+        ])
         after = self._state()
         data = {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr,
-                "remote": remote, "branch": branch, "before": before, "after": after}
+                "remote": remote, "branch": branch, "origin": destination.origin,
+                "before": before, "after": after}
         state = "succeeded" if proc.returncode == 0 else "failed"
         self.runtime.finish(actions, state=state, result=data)
         evidence = self.runtime.evidence(
