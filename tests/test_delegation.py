@@ -13,6 +13,14 @@ from tars.tool_core import ToolResult
 from tars.cli import build_parser
 
 
+def _atomic(invoke):
+    return delegation.AtomicDelegationExecutor(invoke)
+
+
+def _iterative(invoke):
+    return delegation.IterativeDelegationExecutor(invoke)
+
+
 def _configure_child_state(database, scratch, memory_root, history_root):
     state_store.STATE_DB_PATH = Path(database)
     state_store.TASK_ROOT = Path(scratch) / "legacy"
@@ -32,7 +40,7 @@ def _run_delegation_process(database, scratch, memory_root, history_root,
             os._exit(17)
         release.wait(10)
         return {"summary": "process complete"}
-    future = delegation.start(delegation_id, execute)
+    future = delegation.start(delegation_id, _atomic(execute))
     future.result(timeout=15)
 
 
@@ -106,7 +114,7 @@ def delegated(tmp_path, monkeypatch):
             authority={"paths": (root,), "effects": ("read", "write")},
             parent_authority={"paths": (tmp_path,), "effects": ("read", "write", "execute")},
             parent_tools=("fs.read", "fs.write", "terminal.run"),
-            budget={"max_seconds": 5, "max_iterations": 10, "max_tokens": 1000,
+            budget={"max_seconds": 5, "max_iterations": 1, "max_tokens": 1000,
                     "inference": False},
             workspace={"root": root, "mode": "shared", "access": "read-write"},
             completion={"required_evidence_types": (), "summary_required": True},
@@ -175,7 +183,7 @@ def test_child_run_join_and_parent_evidence_acceptance(delegated):
         record = evidence.record("terminal_result", "fixture", "passed", task_id=child_id)
         return {"summary": "verified", "evidence_ids": [record.id]}
 
-    delegation.start(contract.delegation_id, execute)
+    delegation.start(contract.delegation_id, _atomic(execute))
     assert delegation.join(contract.delegation_id, timeout=2) == {
         "state": "completed", "joined": True}
     accepted = delegation.accept(contract.delegation_id, reason="evidence verified")
@@ -186,19 +194,99 @@ def test_child_run_join_and_parent_evidence_acceptance(delegated):
 
 def test_delegation_can_compose_agent_loop_under_same_task_owner(delegated):
     _, _, create = delegated
-    contract = create()
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 1000, "inference": False})
 
-    def execute(context):
-        outcome = agent_loop.AgentLoop(
+    def build(context, limits):
+        return agent_loop.AgentLoop(
             context["task_id"],
             lambda current, controls: {"type": "finish", "summary": "child done"},
             agent_loop.ToolDispatcher(),
             completion=agent_loop.CompletionContract(require_evidence=False),
-        ).run()
-        return {"summary": outcome.reason}
+            limits=limits,
+        )
 
-    future = delegation.start(contract.delegation_id, execute)
+    future = delegation.start(
+        contract.delegation_id, delegation.AgentLoopDelegationExecutor(build))
     assert future.result(timeout=10).state == "completed"
+
+
+def test_undeclared_opaque_executor_cannot_run_or_change_durable_state(delegated):
+    _, _, create = delegated
+    contract = create()
+    effects = []
+
+    def hidden_loop(context):
+        for item in range(20):
+            effects.append(item)
+        return {"summary": "hidden iterations"}
+
+    with pytest.raises(TypeError, match="protocol was not declared"):
+        delegation.start(contract.delegation_id, hidden_loop)
+    assert effects == []
+    assert delegation.load_contract(contract.delegation_id).state == "created"
+
+
+def test_atomic_protocol_cannot_stand_in_for_multi_iteration_contract(delegated):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": False})
+    effects = []
+    with pytest.raises(ValueError, match="atomic delegation requires"):
+        delegation.start(
+            contract.delegation_id,
+            _atomic(lambda context: effects.append("ran") or {"summary": "done"}),
+        )
+    assert effects == []
+    assert delegation.load_contract(contract.delegation_id).state == "created"
+
+
+def test_canonical_agent_loop_cannot_widen_delegated_iteration_limit(delegated):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": False})
+    model_calls = []
+
+    def build(context, limits):
+        return agent_loop.AgentLoop(
+            context["task_id"],
+            lambda current, controls: model_calls.append(True) or {
+                "type": "continue", "summary": "again"},
+            agent_loop.ToolDispatcher(),
+            completion=agent_loop.CompletionContract(require_evidence=False),
+            limits=agent_loop.LoopLimits(max_iterations=limits.max_iterations + 1),
+        )
+
+    future = delegation.start(
+        contract.delegation_id, delegation.AgentLoopDelegationExecutor(build))
+    with pytest.raises(PermissionError, match="widened its execution budget"):
+        future.result(timeout=5)
+    assert model_calls == []
+
+
+def test_canonical_agent_loop_never_performs_iteration_after_ceiling(delegated):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": False})
+    model_calls = []
+
+    def model(current, controls):
+        model_calls.append(len(model_calls) + 1)
+        return {"type": "continue", "summary": "again"}
+
+    def build(context, limits):
+        return agent_loop.AgentLoop(
+            context["task_id"], model, agent_loop.ToolDispatcher(),
+            completion=agent_loop.CompletionContract(require_evidence=False),
+            limits=limits,
+        )
+
+    future = delegation.start(
+        contract.delegation_id, delegation.AgentLoopDelegationExecutor(build))
+    with pytest.raises(RuntimeError, match="iteration budget"):
+        future.result(timeout=5)
+    assert model_calls == [1, 2]
+    assert delegation.load_contract(contract.delegation_id).state == "failed"
 
 
 def test_delegation_has_one_live_executor_across_processes(delegated):
@@ -216,7 +304,10 @@ def test_delegation_has_one_live_executor_across_processes(delegated):
     process.start()
     assert ready.wait(5)
     with pytest.raises(RuntimeError, match="live executor"):
-        delegation.start(contract.delegation_id, lambda context: {"summary": "duplicate"})
+        delegation.start(
+            contract.delegation_id,
+            _atomic(lambda context: {"summary": "duplicate"}),
+        )
     with pytest.raises(RuntimeError, match="exclusively owned"):
         fs_tools.FilesystemTools((root,)).read(root / "value.txt")
     release.set()
@@ -236,7 +327,7 @@ def test_delegation_child_lease_blocks_runner_and_cross_process_agent(delegated)
         assert release.wait(10)
         return {"summary": "delegation complete"}
 
-    future = delegation.start(contract.delegation_id, execute)
+    future = delegation.start(contract.delegation_id, _atomic(execute))
     assert entered.wait(5)
     with pytest.raises(RuntimeError, match="live execution owner"):
         runner.create_run(child_id)
@@ -278,7 +369,7 @@ def test_live_cross_process_agent_blocks_delegation_without_clobbering_task(dele
     calls = []
     future = delegation.start(
         contract.delegation_id,
-        lambda child_context: calls.append(True) or {"summary": "duplicate"},
+        _atomic(lambda child_context: calls.append(True) or {"summary": "duplicate"}),
     )
     with pytest.raises(RuntimeError, match="live execution owner"):
         future.result(timeout=10)
@@ -310,8 +401,10 @@ def test_dead_running_delegation_is_not_replayed(delegated):
     assert process.exitcode == 17
     called = []
     with pytest.raises(RuntimeError, match="not replayed"):
-        delegation.start(contract.delegation_id,
-                         lambda context: called.append(True) or {"summary": "duplicate"})
+        delegation.start(
+            contract.delegation_id,
+            _atomic(lambda context: called.append(True) or {"summary": "duplicate"}),
+        )
     assert called == []
     current = delegation.load_contract(contract.delegation_id)
     assert current.state == "failed"
@@ -337,7 +430,8 @@ def test_child_memory_is_staged_until_parent_acceptance(delegated):
     unrelated = memory.stage_candidate("unrelated", kind="reference", scope="project")
     with pytest.raises(PermissionError):
         delegation.review_child_memory(contract.delegation_id, candidate, promote=True)
-    delegation.start(contract.delegation_id, lambda context: {"summary": "done"})
+    delegation.start(
+        contract.delegation_id, _atomic(lambda context: {"summary": "done"}))
     delegation.join(contract.delegation_id, timeout=2)
     delegation.accept(contract.delegation_id)
     with pytest.raises(KeyError):
@@ -358,7 +452,7 @@ def test_cancel_is_cooperative_and_truthful(delegated):
             pass
         return {"summary": "stopped at safe boundary"}
 
-    delegation.start(contract.delegation_id, execute)
+    delegation.start(contract.delegation_id, _atomic(execute))
     assert entered.wait(1)
     result = delegation.cancel(contract.delegation_id)
     assert result["requested"] is True
@@ -382,8 +476,10 @@ def test_queued_future_cancellation_is_terminal(monkeypatch, delegated):
     blocker = executor.submit(gate.wait, 5)
     monkeypatch.setattr(delegation, "_EXECUTOR", executor)
     contract = create()
-    future = delegation.start(contract.delegation_id,
-                              lambda context: {"summary": "must not run"})
+    future = delegation.start(
+        contract.delegation_id,
+        _atomic(lambda context: {"summary": "must not run"}),
+    )
     result = delegation.cancel(contract.delegation_id)
     assert result == {"requested": True, "state": "cancelled", "cancelled": True}
     assert future.cancelled()
@@ -414,9 +510,9 @@ def test_cancel_reclaims_dead_scheduled_owner(delegated):
 
 def test_children_with_same_exclusive_workspace_serialize(delegated):
     _, _, create = delegated
-    first = create(budget={"max_seconds": 5, "max_iterations": 2,
+    first = create(budget={"max_seconds": 5, "max_iterations": 1,
                            "max_tokens": 100, "inference": False})
-    second = create(budget={"max_seconds": 5, "max_iterations": 2,
+    second = create(budget={"max_seconds": 5, "max_iterations": 1,
                             "max_tokens": 100, "inference": False})
     active = 0
     maximum = 0
@@ -432,8 +528,8 @@ def test_children_with_same_exclusive_workspace_serialize(delegated):
             active -= 1
         return {"summary": "done"}
 
-    delegation.start(first.delegation_id, execute)
-    delegation.start(second.delegation_id, execute)
+    delegation.start(first.delegation_id, _atomic(execute))
+    delegation.start(second.delegation_id, _atomic(execute))
     assert delegation.join(first.delegation_id, timeout=2)["joined"]
     assert delegation.join(second.delegation_id, timeout=2)["joined"]
     assert maximum == 1
@@ -449,7 +545,7 @@ def test_exclusive_workspace_blocks_sibling_tool_surfaces(delegated):
         entered.set()
         assert release.wait(5)
         return {"summary": "done"}
-    delegation.start(contract.delegation_id, execute)
+    delegation.start(contract.delegation_id, _atomic(execute))
     assert entered.wait(5)
     with pytest.raises(RuntimeError, match="exclusively owned"):
         fs_tools.FilesystemTools((root,)).read(root / "value.txt")
@@ -460,14 +556,14 @@ def test_exclusive_workspace_blocks_sibling_tool_surfaces(delegated):
 
 def test_child_timeout_requests_cooperative_stop(delegated):
     _, _, create = delegated
-    contract = create(budget={"max_seconds": 1, "max_iterations": 2,
+    contract = create(budget={"max_seconds": 1, "max_iterations": 1,
                               "max_tokens": 100, "inference": False})
 
     def execute(context):
         assert context["cancel_event"].wait(2)
         return {"summary": "safe boundary reached"}
 
-    delegation.start(contract.delegation_id, execute)
+    delegation.start(contract.delegation_id, _atomic(execute))
     assert delegation.join(contract.delegation_id, timeout=2) == {
         "state": "timed_out", "joined": True}
 
@@ -488,7 +584,7 @@ def test_iteration_budget_is_enforced_by_child_executor_protocol(delegated):
             yield delegation.DelegationStep({"summary": "three"}, done=True)
         finally:
             closed.append(True)
-    future = delegation.start(contract.delegation_id, execute)
+    future = delegation.start(contract.delegation_id, _iterative(execute))
     with pytest.raises(RuntimeError, match="iteration budget"):
         future.result(timeout=2)
     assert resumed == ["one", "two"]
@@ -507,7 +603,7 @@ def test_iterative_executor_must_finish_within_authoritative_budget(delegated):
         yield delegation.DelegationStep({"summary": "working"})
         yield delegation.DelegationStep({"summary": "done"}, done=True)
 
-    delegation.start(contract.delegation_id, execute)
+    delegation.start(contract.delegation_id, _iterative(execute))
     assert delegation.join(contract.delegation_id, timeout=2) == {
         "state": "completed", "joined": True}
 
@@ -516,11 +612,12 @@ def test_iterative_executor_must_finish_within_authoritative_budget(delegated):
 def test_opaque_executor_cannot_self_report_iteration_compliance(
         delegated, claimed):
     _, _, create = delegated
-    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+    contract = create(budget={"max_seconds": 5, "max_iterations": 1,
                               "max_tokens": 100, "inference": False})
     future = delegation.start(
         contract.delegation_id,
-        lambda context: {"summary": "claimed compliance", "iterations": claimed},
+        _atomic(lambda context: {
+            "summary": "claimed compliance", "iterations": claimed}),
     )
     with pytest.raises(TypeError, match="must not self-report"):
         future.result(timeout=2)
@@ -535,7 +632,7 @@ def test_iterative_executor_cannot_use_untyped_results_as_hidden_protocol(delega
     def execute(context):
         yield {"summary": "untyped terminal", "done": True}
 
-    future = delegation.start(contract.delegation_id, execute)
+    future = delegation.start(contract.delegation_id, _iterative(execute))
     with pytest.raises(TypeError, match="must yield DelegationStep"):
         future.result(timeout=2)
 
@@ -561,7 +658,7 @@ def test_iterator_is_not_resumed_after_cooperative_cancellation(delegated):
 
             return Steps()
 
-    delegation.start(contract.delegation_id, Executor())
+    delegation.start(contract.delegation_id, _iterative(Executor()))
     assert delegation.join(contract.delegation_id, timeout=2) == {
         "state": "cancelled", "joined": True}
     assert calls == ["resume"]
@@ -570,7 +667,8 @@ def test_iterator_is_not_resumed_after_cooperative_cancellation(delegated):
 def test_accept_reject_review_is_compare_and_swap(delegated):
     _, _, create = delegated
     contract = create()
-    delegation.start(contract.delegation_id, lambda context: {"summary": "done"})
+    delegation.start(
+        contract.delegation_id, _atomic(lambda context: {"summary": "done"}))
     assert delegation.join(contract.delegation_id, timeout=2)["joined"]
     barrier = threading.Barrier(2)
     outcomes = []

@@ -54,6 +54,36 @@ class DelegationStep:
     done: bool = False
 
 
+@dataclass(frozen=True)
+class AtomicDelegationExecutor:
+    """Explicitly declare one indivisible, non-iterative child operation."""
+    invoke: object
+
+    def __post_init__(self):
+        if not callable(self.invoke):
+            raise TypeError("atomic delegation executor must be callable")
+
+
+@dataclass(frozen=True)
+class IterativeDelegationExecutor:
+    """Declare an executor whose progress is exposed as bounded steps."""
+    invoke: object
+
+    def __post_init__(self):
+        if not callable(self.invoke):
+            raise TypeError("iterative delegation executor must be callable")
+
+
+@dataclass(frozen=True)
+class AgentLoopDelegationExecutor:
+    """Build the canonical AgentLoop with boundary-owned limits."""
+    build: object
+
+    def __post_init__(self):
+        if not callable(self.build):
+            raise TypeError("AgentLoop delegation builder must be callable")
+
+
 def _contract(row):
     return DelegationContract(
         row["delegation_id"], row["parent_delegation_id"],
@@ -298,20 +328,51 @@ def _result_object(value):
 
 
 def _execute_bounded(executor, context, maximum, cancel_event):
-    """Run one atomic call or at most ``maximum`` explicit iterator steps.
+    """Run one declared atomic call or an authoritatively bounded child loop.
 
-    A dictionary return is one opaque boundary invocation. Iterative executors
-    must yield ``DelegationStep`` and explicitly mark their terminal result;
-    the boundary never resumes an iterator merely to discover an overrun.
+    Iterative executors must yield ``DelegationStep`` and explicitly mark their
+    terminal result; the boundary never resumes an iterator merely to discover
+    an overrun. Canonical AgentLoop builders receive and must retain limits
+    derived from the delegation contract.
     """
     if cancel_event.is_set():
         return {}
-    execution = executor(context)
-    if isinstance(execution, dict):
+
+    if isinstance(executor, AtomicDelegationExecutor):
+        execution = executor.invoke(context)
         return _result_object(execution)
+    if isinstance(executor, AgentLoopDelegationExecutor):
+        from .agent_loop import AgentLoop, LoopLimits
+        limits = LoopLimits(
+            max_iterations=maximum,
+            max_seconds=float(context["budget"]["max_seconds"]),
+        )
+        loop = executor.build(context, limits)
+        if type(loop) is not AgentLoop:
+            raise TypeError("AgentLoop delegation builder must return AgentLoop")
+        if (loop.limits.max_iterations > maximum
+                or loop.limits.max_seconds > limits.max_seconds):
+            raise PermissionError("delegated AgentLoop widened its execution budget")
+        outcome = loop.run()
+        if outcome.iterations > maximum:
+            raise RuntimeError("child exceeded delegated iteration budget")
+        if (outcome.state == "paused"
+                and outcome.reason == "iteration budget exhausted"):
+            raise RuntimeError("child exceeded delegated iteration budget")
+        if outcome.state != "completed":
+            raise RuntimeError(
+                f"delegated AgentLoop stopped in {outcome.state}: {outcome.reason}")
+        return {
+            "summary": outcome.reason,
+            "agent_state": outcome.state,
+            "execution_iterations": outcome.iterations,
+        }
+    if not isinstance(executor, IterativeDelegationExecutor):
+        raise TypeError("delegation executor protocol was not declared")
+
+    execution = executor.invoke(context)
     if not isinstance(execution, Iterator):
-        raise TypeError(
-            "child executor must return an atomic result or delegation-step iterator")
+        raise TypeError("iterative child executor must return a delegation-step iterator")
 
     final = None
     primary_error = None
@@ -348,8 +409,17 @@ def _execute_bounded(executor, context, maximum, cancel_event):
 
 
 def start(delegation_id, executor):
-    """Run a bounded atomic child or an explicit ``DelegationStep`` iterator."""
+    """Run a child through an explicit atomic, iterative, or AgentLoop protocol."""
+    if not isinstance(executor, (
+        AtomicDelegationExecutor,
+        IterativeDelegationExecutor,
+        AgentLoopDelegationExecutor,
+    )):
+        raise TypeError("delegation executor protocol was not declared")
     contract = load_contract(delegation_id)
+    if (isinstance(executor, AtomicDelegationExecutor)
+            and int(contract.budget["max_iterations"]) != 1):
+        raise ValueError("atomic delegation requires max_iterations=1")
     delegation = load_delegation(delegation_id)
     owner = Owner.create("delegation")
     cancel_event = threading.Event()
