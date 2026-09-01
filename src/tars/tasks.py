@@ -7,11 +7,19 @@ import uuid
 from .checkpoints import create_checkpoint, latest_checkpoint
 from .conversation import active_conversation
 from .events import append_event, read_events, EVENT_TYPES
+from .ownership import (active_in_transaction, current_owner,
+                        held_by_in_transaction)
 from .roles import resolve_role_id
 from .state_store import connect, ensure_state_store, get_meta, json_dumps, json_loads, now_utc, set_meta, transaction
 
 TASK_STATES = {"pending", "running", "paused", "completed", "failed", "cancelled"}
 TASK_KINDS = {"primary", "delegation", "sideband", "scheduled"}
+TERMINAL_TASK_STATES = {"completed", "failed", "cancelled"}
+EXECUTION_OWNED_COLUMNS = {
+    "state", "phase", "progress", "owner_role", "conversation_id", "epoch",
+    "constraints_json", "decisions_json", "completed_json", "open_steps_json",
+    "failures_json", "evidence_refs_json",
+}
 
 
 @dataclass
@@ -168,15 +176,44 @@ def list_tasks(limit=50, *, scheduled_only=False, conversation_id=None):
         conn.close()
 
 
+def require_task_write_in_transaction(conn, task_id, *, changes=None, owner=None,
+                                      allow_fail_closed=False):
+    """Fence execution-owned task truth and terminal-state monotonicity."""
+    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not row:
+        raise KeyError(f"unknown task: {task_id}")
+    selected = owner or current_owner()
+    if (active_in_transaction(conn, "task-execution", task_id)
+            and not allow_fail_closed and not (
+                selected and held_by_in_transaction(
+                    conn, "task-execution", task_id, selected))):
+        raise RuntimeError(
+            f"task {task_id} execution-owned state has a live executor")
+    changes = dict(changes or {})
+    if row["state"] in TERMINAL_TASK_STATES:
+        changed = [
+            key for key, value in changes.items()
+            if key in EXECUTION_OWNED_COLUMNS and key in row.keys() and row[key] != value
+        ]
+        if changed:
+            raise RuntimeError(
+                f"terminal task {task_id} cannot mutate execution truth: "
+                + ", ".join(sorted(changed)))
+    return row
+
+
 
 def attach_conversation(task_id, conversation_id):
-    """Attach an existing task to a conversation without altering task ownership."""
-    load_task(task_id)
+    """Attach only previously unbound task provenance."""
     from .conversation import load_conversation
     load_conversation(conversation_id)
     with transaction(immediate=True) as conn:
+        current = require_task_write_in_transaction(
+            conn, task_id, changes={"conversation_id": conversation_id})
+        if current["conversation_id"] not in {None, conversation_id}:
+            raise RuntimeError("task conversation provenance is already bound")
         conn.execute(
-            "UPDATE tasks SET conversation_id=?, updated_at=? WHERE id=?",
+            "UPDATE tasks SET conversation_id=?,updated_at=? WHERE id=?",
             (conversation_id, now_utc(), task_id),
         )
     return load_task(task_id)
@@ -203,8 +240,9 @@ def update_task(
     last_run_at=None,
     last_result_status=None,
     schedule_enabled=None,
+    _execution_owner=None,
 ):
-    task = load_task(task_id)
+    load_task(task_id)
     values = {}
     if state is not None:
         if state not in TASK_STATES:
@@ -241,6 +279,8 @@ def update_task(
         values["updated_at"] = now_utc()
         assignments = ", ".join(f"{key}=?" for key in values)
         with transaction(immediate=True) as conn:
+            require_task_write_in_transaction(
+                conn, task_id, changes=values, owner=_execution_owner)
             conn.execute(
                 f"UPDATE tasks SET {assignments} WHERE id=?",
                 (*values.values(), task_id),
@@ -256,6 +296,32 @@ def update_task(
         task.id, "status", f"Task state updated: {task.state}", role=task.owner_role,
         data={"state": task.state, "phase": task.phase, "progress": task.progress,
               "epoch": task.epoch},
+    )
+    return task
+
+
+def recover_task(task_id, *, phase="recovered"):
+    """Explicitly recover a failed task when no execution owner remains."""
+    stamp = now_utc()
+    with transaction(immediate=True) as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise KeyError(f"unknown task: {task_id}")
+        if active_in_transaction(conn, "task-execution", task_id):
+            raise RuntimeError(f"task {task_id} still has a live execution owner")
+        if row["state"] != "failed":
+            raise RuntimeError(f"task {task_id} is not failed")
+        if row["phase"] == "cancellation-recovery-required":
+            raise RuntimeError("ambiguous cancellation requires dedicated recovery")
+        conn.execute(
+            "UPDATE tasks SET state='pending',phase=?,updated_at=? "
+            "WHERE id=? AND state='failed'",
+            (str(phase), stamp, task_id),
+        )
+    task = load_task(task_id)
+    append_event(
+        task.id, "status", "Task explicitly recovered", role=task.owner_role,
+        data={"state": task.state, "phase": task.phase},
     )
     return task
 
@@ -330,4 +396,5 @@ __all__ = [
     "create_task", "load_task", "list_tasks", "update_task", "append_event",
     "read_events", "set_active_task", "active_task", "clear_active_task",
     "canonical_task_state", "checkpoint_task", "attach_conversation",
+    "require_task_write_in_transaction", "recover_task",
 ]

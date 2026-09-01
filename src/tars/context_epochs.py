@@ -6,7 +6,7 @@ import uuid
 
 from .events import append_event
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
-from .tasks import canonical_task_state_from_row
+from .tasks import canonical_task_state_from_row, require_task_write_in_transaction
 
 
 @dataclass(frozen=True)
@@ -41,9 +41,8 @@ def rollover(task_id: str, *, reason="context pressure") -> ContextEpoch:
     checkpoint_id = "cp-" + uuid.uuid4().hex
     epoch_id = "epoch-" + uuid.uuid4().hex
     with transaction(immediate=True) as conn:
-        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if not task:
-            raise KeyError(f"unknown task: {task_id}")
+        task = require_task_write_in_transaction(
+            conn, task_id, changes={"epoch": None})
         if not task["conversation_id"]:
             raise RuntimeError("context rollover requires a task conversation")
         state = canonical_task_state_from_row(task, conn)

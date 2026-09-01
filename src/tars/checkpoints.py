@@ -36,9 +36,9 @@ def create_checkpoint_in_transaction(conn, task_id, state=None, *, reason="",
                                      evidence_refs=None, advance_epoch=False,
                                      checkpoint_id=None, created_at=None):
     """Insert a checkpoint using the caller's authoritative write transaction."""
-    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-    if not task:
-        raise KeyError(f"unknown task: {task_id}")
+    from .tasks import require_task_write_in_transaction
+    changes = {"epoch": None} if advance_epoch else {}
+    task = require_task_write_in_transaction(conn, task_id, changes=changes)
     if state is None:
         from .tasks import canonical_task_state_from_row
         state = canonical_task_state_from_row(task, conn)

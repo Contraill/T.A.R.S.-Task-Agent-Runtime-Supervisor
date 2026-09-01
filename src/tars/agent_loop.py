@@ -28,7 +28,8 @@ from .ownership import (Heartbeat, Owner, active as lease_active, current_owner,
                         held_by, task_execution_fenced, task_execution_scope)
 from .runtime import chat_completion
 from .state_events import append_state_event
-from .tasks import canonical_task_state, load_task, update_task
+from .tasks import (TERMINAL_TASK_STATES, canonical_task_state, load_task,
+                    update_task)
 from .tool_core import ToolResult
 
 
@@ -566,13 +567,19 @@ class AgentLoop:
 
     def _run_once(self):
         task = load_task(self.task_id)
-        if task.state in {"completed", "cancelled"}:
+        if task.phase == CANCELLATION_RECOVERY_PHASE:
+            raise RuntimeError(
+                f"task {task.id} requires explicit recovery after ambiguous cancellation")
+        if task.state in TERMINAL_TASK_STATES:
             raise RuntimeError(f"task {task.id} is {task.state}")
         inherited_execution = held_by("task-execution", task.id, self.owner)
         with task_execution_scope(
                 task.id, engine="agent-loop", owner=self.owner, lease_seconds=30):
             task = load_task(self.task_id)
-            if task.state in {"completed", "cancelled"}:
+            if task.phase == CANCELLATION_RECOVERY_PHASE:
+                raise RuntimeError(
+                    f"task {task.id} requires explicit recovery after ambiguous cancellation")
+            if task.state in TERMINAL_TASK_STATES:
                 raise RuntimeError(f"task {task.id} is {task.state}")
             # Reconcile dead control owners even when task execution itself is
             # ambiguous and must fail closed rather than replay.
@@ -730,6 +737,20 @@ class AgentLoop:
                         "error": result.error, "evidence_ids": result.evidence_ids,
                     }, ensure_ascii=False, default=str)[:64_000], kind="tool-result",
                         related_task_id=task.id, metadata={"unresolved": False})
+                try:
+                    _, stop, blocked = self._apply_controls()
+                except Exception as exc:
+                    return self._stop(
+                        "failed", f"control application failed: {exc}",
+                        iteration, results, checkpoint_id)
+                if blocked is not None:
+                    return self._stop(
+                        "paused", "cancellation reconciliation pending",
+                        iteration, results, checkpoint_id)
+                if stop:
+                    return LoopOutcome(
+                        stop, f"{stop} by user control", iteration,
+                        tuple(results), checkpoint_id)
                 refs = tuple(dict.fromkeys((*load_task(task.id).evidence_refs,
                                             *result.evidence_ids)))
                 update_task(task.id, evidence_refs=refs, phase="verifying-progress")

@@ -7,12 +7,14 @@ from .checkpoints import create_checkpoint
 from .context import ContextManager
 from .conversation import active_conversation, add_message, create_conversation
 from .events import append_event
-from .ownership import (Owner, claim_in_transaction, current_owner,
+from .ownership import (Owner, active_metadata, claim_in_transaction, current_owner,
                         task_execution_scope)
 from .roles import get_role
 from .runtime import chat_completion_stream
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
-from .tasks import canonical_task_state, load_task, update_task
+from .tasks import (canonical_task_state, load_task,
+                    require_task_write_in_transaction, TERMINAL_TASK_STATES,
+                    update_task)
 
 RUN_STATES = {"queued", "running", "paused", "completed", "failed", "cancelled"}
 CONTROL_ACTIONS = {"pause", "resume", "cancel", ""}
@@ -52,7 +54,7 @@ def _from_row(row) -> TaskRun:
 def create_run(task_id: str, conversation_id: str | None = None) -> TaskRun:
     ensure_state_store()
     task = load_task(task_id)
-    if task.state in {"completed", "cancelled"}:
+    if task.state in TERMINAL_TASK_STATES:
         raise RuntimeError(f"task {task.id} is {task.state}")
     if conversation_id is None:
         conversation_id = task.conversation_id
@@ -68,15 +70,13 @@ def create_run(task_id: str, conversation_id: str | None = None) -> TaskRun:
         current = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not current:
             raise KeyError(f"unknown task: {task_id}")
-        if current["state"] in {"completed", "cancelled"}:
+        if current["state"] in TERMINAL_TASK_STATES:
             raise RuntimeError(f"task {task_id} is {current['state']}")
         if not conn.execute(
                 "SELECT 1 FROM conversations WHERE id=?", (conversation_id,)).fetchone():
             raise KeyError(f"unknown conversation: {conversation_id}")
-        if current["conversation_id"] is None:
-            conn.execute("UPDATE tasks SET conversation_id=?,updated_at=? WHERE id=?",
-                         (conversation_id, now, task_id))
-        elif current["conversation_id"] != conversation_id:
+        if (current["conversation_id"] is not None
+                and current["conversation_id"] != conversation_id):
             raise RuntimeError("run conversation does not match task provenance")
         existing = conn.execute(
             "SELECT id,state FROM task_runs WHERE task_id=? "
@@ -95,6 +95,12 @@ def create_run(task_id: str, conversation_id: str | None = None) -> TaskRun:
         )
         if not can_claim:
             raise RuntimeError(f"task {task.id} already has a live execution owner")
+        require_task_write_in_transaction(
+            conn, task_id, changes={"conversation_id": conversation_id},
+            owner=recovery_owner)
+        if current["conversation_id"] is None:
+            conn.execute("UPDATE tasks SET conversation_id=?,updated_at=? WHERE id=?",
+                         (conversation_id, now, task_id))
         if existing:
             if existing["state"] != "running":
                 if not borrowed:
@@ -190,7 +196,18 @@ def request_control(task_id: str, action: str) -> TaskRun | None:
     action = str(action).strip().lower()
     if action not in {"pause", "resume", "cancel"}:
         raise ValueError("control action must be pause, resume or cancel")
+    execution = active_metadata("task-execution", task_id)
+    engine = execution.get("engine") if execution is not None else None
     run = active_run(task_id)
+    if execution is not None and not engine:
+        raise RuntimeError(f"task {task_id} live execution engine is not identifiable")
+    if engine and engine != "reasoning-epoch":
+        from .agent_loop import submit_task_control
+        submit_task_control(task_id, action)
+        return None
+    if engine == "reasoning-epoch" and (run is None or run.state != "running"):
+        raise RuntimeError(
+            f"task {task_id} has a reasoning executor without a matching running run")
     if run is None:
         # No live runner: preserve intuitive task-state controls.
         if action == "pause":

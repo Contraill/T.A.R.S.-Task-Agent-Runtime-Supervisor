@@ -11,6 +11,7 @@ from .runtime_backends import backend_binding_ready
 from .registry import get_model
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import (canonical_task_state, create_task_in_transaction, load_task,
+                    require_task_write_in_transaction, TERMINAL_TASK_STATES,
                     update_task)
 
 DELEGATION_STATES = {"requested", "running", "completed", "failed", "cancelled"}
@@ -321,11 +322,27 @@ def complete_delegation(
         ).rowcount
         if changed != 1:
             raise RuntimeError(f"delegation {delegation_id} changed concurrently")
-        conn.execute(
-            """UPDATE tasks SET state=?,phase='delegation-complete',
-               progress=CASE WHEN ?='completed' THEN 1.0 ELSE progress END,updated_at=?
-               WHERE id=?""",
-            (child_state, child_state, now, current["child_task_id"]),)
+        child = conn.execute(
+            "SELECT state FROM tasks WHERE id=?", (current["child_task_id"],),
+        ).fetchone()
+        if not child:
+            raise KeyError(f"unknown task: {current['child_task_id']}")
+        if child["state"] in {"completed", "failed", "cancelled"}:
+            if child["state"] != child_state:
+                raise RuntimeError(
+                    "delegation result conflicts with terminal child task truth")
+        else:
+            require_task_write_in_transaction(
+                conn, current["child_task_id"],
+                changes={
+                    "state": child_state, "phase": "delegation-complete",
+                    **({"progress": 1.0} if child_state == "completed" else {}),
+                })
+            conn.execute(
+                """UPDATE tasks SET state=?,phase='delegation-complete',
+                   progress=CASE WHEN ?='completed' THEN 1.0 ELSE progress END,updated_at=?
+                   WHERE id=?""",
+                (child_state, child_state, now, current["child_task_id"]),)
         delegation = _delegation_from_row(conn.execute(
             "SELECT * FROM delegations WHERE id=?", (delegation_id,)).fetchone())
     append_event(
@@ -381,7 +398,7 @@ def handoff_task(task_id: str, to_role: str, *, reason: str = "manual handoff") 
     target = _require_available_role(resolve_role_id(to_role))
     if task.owner_role == target.id:
         raise ValueError(f"task {task.id} is already owned by {target.id}")
-    if task.state in {"completed", "cancelled"}:
+    if task.state in TERMINAL_TASK_STATES:
         raise RuntimeError(f"cannot hand off {task.state} task {task.id}")
 
     handoff_id = _new_id("handoff")
@@ -392,7 +409,7 @@ def handoff_task(task_id: str, to_role: str, *, reason: str = "manual handoff") 
             raise KeyError(f"unknown task: {task.id}")
         if current["owner_role"] != task.owner_role:
             raise RuntimeError("task owner changed while preparing handoff")
-        if current["state"] in {"completed", "cancelled"}:
+        if current["state"] in TERMINAL_TASK_STATES:
             raise RuntimeError(f"cannot hand off {current['state']} task {task.id}")
         active = conn.execute(
             "SELECT id,state FROM task_runs WHERE task_id=? "
@@ -401,6 +418,10 @@ def handoff_task(task_id: str, to_role: str, *, reason: str = "manual handoff") 
             raise RuntimeError(
                 f"task {task.id} has active run {active['id']} ({active['state']}); "
                 "finish or cancel it before handoff")
+        require_task_write_in_transaction(
+            conn, task.id,
+            changes={"owner_role": target.id, "phase": "handoff-complete",
+                     "epoch": current["epoch"] + 1})
         checkpoint_row = create_checkpoint_in_transaction(
             conn, task.id,
             reason=f"pre-handoff {task.owner_role} -> {target.id}: {reason}")

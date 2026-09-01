@@ -213,11 +213,29 @@ def held_by_in_transaction(conn, resource_type, resource_key, owner: Owner, *,
 def active(resource_type, resource_key) -> bool:
     ensure_state_store()
     with connect() as conn:
-        row = conn.execute(
-            "SELECT owner_pid,owner_start,expires_at FROM resource_leases "
-            "WHERE resource_type=? AND resource_key=?", (resource_type, resource_key),
-        ).fetchone()
+        return active_in_transaction(conn, resource_type, resource_key)
+
+
+def active_in_transaction(conn, resource_type, resource_key) -> bool:
+    row = conn.execute(
+        "SELECT owner_pid,owner_start FROM resource_leases "
+        "WHERE resource_type=? AND resource_key=?", (resource_type, resource_key),
+    ).fetchone()
     return bool(row and not owner_gone(row["owner_pid"], row["owner_start"]))
+
+
+def active_metadata(resource_type, resource_key) -> dict | None:
+    ensure_state_store()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT owner_pid,owner_start,metadata_json FROM resource_leases "
+            "WHERE resource_type=? AND resource_key=?",
+            (resource_type, resource_key),
+        ).fetchone()
+    if not row or owner_gone(row["owner_pid"], row["owner_start"]):
+        return None
+    from .state_store import json_loads
+    return json_loads(row["metadata_json"], {})
 
 
 def task_execution_fenced(task_id) -> bool:

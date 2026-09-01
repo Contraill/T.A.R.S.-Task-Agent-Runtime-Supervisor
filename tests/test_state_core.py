@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tars import activity, conversation, identity, prompt_compiler, projects, role_state, sessions
+from tars import (activity, agent_loop, conversation, identity, prompt_compiler,
+                  projects, role_state, sessions)
 from tars import ownership, runner, state_events, state_store, tasks
 
 
@@ -150,6 +151,70 @@ def test_unverifiable_process_identity_remains_fenced(isolated_state, monkeypatc
     monkeypatch.setattr(ownership, "_read_process_start", unreadable)
     assert ownership.active("gpu-slot", "unverifiable")
     assert not ownership.claim("gpu-slot", "unverifiable", second)
+
+
+def test_terminal_task_truth_is_monotonic_and_recovery_is_explicit(
+        monkeypatch, isolated_state):
+    monkeypatch.setattr(tasks, "resolve_role_id", lambda value: value)
+    first = conversation.create_conversation(title="terminal provenance", make_active=False)
+    second = conversation.create_conversation(title="replacement", make_active=False)
+    task = tasks.create_task(
+        "terminal task", "general", conversation_id=first.id, make_active=False)
+    tasks.update_task(task.id, state="completed", phase="completed", progress=1.0)
+    with pytest.raises(RuntimeError, match="terminal task"):
+        tasks.update_task(task.id, state="paused", phase="paused")
+    with pytest.raises(RuntimeError, match="terminal task"):
+        tasks.update_task(task.id, phase="resurrected")
+    with pytest.raises(RuntimeError, match="already bound|terminal task"):
+        tasks.attach_conversation(task.id, second.id)
+    with pytest.raises(RuntimeError, match="not failed"):
+        tasks.recover_task(task.id)
+    with pytest.raises(RuntimeError, match="completed"):
+        runner.create_run(task.id, first.id)
+    unchanged = tasks.load_task(task.id)
+    assert unchanged.state == "completed" and unchanged.phase == "completed"
+    assert unchanged.conversation_id == first.id
+
+    failed = tasks.create_task("failed admission", "general", make_active=False)
+    tasks.update_task(failed.id, state="failed", phase="failed")
+    with pytest.raises(RuntimeError, match="failed"):
+        runner.create_run(failed.id)
+    with pytest.raises(RuntimeError, match="failed"):
+        agent_loop.AgentLoop(
+            failed.id, lambda *_: pytest.fail("terminal model must not run"),
+            agent_loop.ToolDispatcher(),
+        ).run()
+    assert runner.active_run(failed.id) is None
+    assert tasks.recover_task(failed.id, phase="operator-recovered").state == "pending"
+    assert runner.create_run(failed.id).state == "queued"
+
+
+def test_expired_execution_generation_cannot_commit_task_state(
+        monkeypatch, isolated_state):
+    monkeypatch.setattr(tasks, "resolve_role_id", lambda value: value)
+    task = tasks.create_task("generation fenced", "general", make_active=False)
+    first = ownership.Owner.create("task-owner")
+    second = ownership.Owner.create("stale-writer")
+    assert ownership.claim("task-execution", task.id, first)
+    with ownership.owner_scope(first):
+        tasks.update_task(task.id, state="running", phase="owned")
+    with pytest.raises(RuntimeError, match="not identifiable"):
+        runner.request_control(task.id, "pause")
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE resource_leases SET expires_at='1970-01-01T00:00:00+00:00' "
+            "WHERE resource_type='task-execution' AND resource_key=?",
+            (task.id,),
+        )
+    with ownership.owner_scope(first), pytest.raises(RuntimeError, match="live executor"):
+        tasks.update_task(task.id, phase="stale-owner-write")
+    with ownership.owner_scope(second), pytest.raises(RuntimeError, match="live executor"):
+        tasks.update_task(task.id, phase="sibling-write")
+    assert tasks.load_task(task.id).phase == "owned"
+    assert ownership.heartbeat("task-execution", task.id, first)
+    with ownership.owner_scope(first):
+        tasks.update_task(task.id, phase="renewed-owner")
+    assert tasks.load_task(task.id).phase == "renewed-owner"
 
 
 def test_append_event_transaction_rolls_back_on_invalid_reference(isolated_state):

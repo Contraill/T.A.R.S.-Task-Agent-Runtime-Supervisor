@@ -1322,7 +1322,7 @@ def command_task_mutation(action, task_id):
             clear_active_task(task_id)
         else:
             raise ValueError(action)
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 2
     console.print("OK")

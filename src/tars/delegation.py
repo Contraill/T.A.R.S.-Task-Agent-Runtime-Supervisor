@@ -17,7 +17,7 @@ from .ownership import (Heartbeat, Owner, claim, claim_in_transaction,
 from .policy import canonical_path
 from .state_store import (connect, ensure_state_store, json_dumps, json_loads,
                           now_utc, transaction)
-from .tasks import load_task, update_task
+from .tasks import load_task, require_task_write_in_transaction, update_task
 
 
 TERMINAL_STATES = {"completed", "failed", "cancelled", "timed_out", "accepted", "rejected"}
@@ -303,11 +303,27 @@ def _finish_execution(delegation_id, owner, contract_state, *, status, summary, 
         if changed != 1:
             raise RuntimeError(f"delegation {delegation_id} result changed concurrently")
         if update_child:
-            conn.execute(
-                "UPDATE tasks SET state=?,phase=?,updated_at=? WHERE id=?",
-                (child_state, f"delegation-{contract_state}", stamp,
-                 delegation.child_task_id),
-            )
+            child = conn.execute(
+                "SELECT state FROM tasks WHERE id=?",
+                (delegation.child_task_id,),
+            ).fetchone()
+            if not child:
+                raise KeyError(f"unknown task: {delegation.child_task_id}")
+            if child["state"] in {"completed", "failed", "cancelled"}:
+                if child["state"] != child_state:
+                    raise RuntimeError(
+                        "delegation result conflicts with terminal child task truth")
+            else:
+                require_task_write_in_transaction(
+                    conn, delegation.child_task_id,
+                    changes={"state": child_state,
+                             "phase": f"delegation-{contract_state}"},
+                    owner=owner)
+                conn.execute(
+                    "UPDATE tasks SET state=?,phase=?,updated_at=? WHERE id=?",
+                    (child_state, f"delegation-{contract_state}", stamp,
+                     delegation.child_task_id),
+                )
         conn.execute(
             "DELETE FROM resource_leases WHERE resource_type='delegation' "
             "AND resource_key=? AND owner_token=?", (delegation_id, owner.token),
@@ -512,7 +528,9 @@ def start(delegation_id, executor):
                     summary="cancelled before execution", result={"cancelled": True})
             _set_state(delegation_id, "running", expected=("scheduled",), owner=owner,
                        started_at=now_utc())
-            update_task(delegation.child_task_id, state="running", phase="delegated-running")
+            update_task(
+                delegation.child_task_id, state="running", phase="delegated-running",
+                _execution_owner=owner)
             context = {
                 "delegation_id": delegation_id, "task_id": delegation.child_task_id,
                 "goal": delegation.goal, "tools": list(contract.tool_allowlist),

@@ -6,7 +6,7 @@ import uuid
 from .state_events import insert_state_event
 from .ownership import Owner, claim_in_transaction, owner_alive
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
-from .tasks import load_task
+from .tasks import load_task, require_task_write_in_transaction
 
 
 PRIORITY = {"cancel": 0, "interrupt": 1, "pause": 1, "approval": 2,
@@ -26,6 +26,11 @@ def _fail_task_for_ambiguous_cancellation(conn, task_id, control_id, reason):
     if failure not in failures:
         failures.append(failure)
     stamp = now_utc()
+    require_task_write_in_transaction(
+        conn, task_id,
+        changes={"state": "failed", "phase": CANCELLATION_RECOVERY_PHASE,
+                 "failures_json": json_dumps(failures)},
+        allow_fail_closed=True)
     conn.execute(
         "UPDATE tasks SET state='failed',phase=?,failures_json=?,updated_at=? WHERE id=?",
         (CANCELLATION_RECOVERY_PHASE, json_dumps(failures), stamp, task_id),

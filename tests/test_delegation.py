@@ -331,6 +331,11 @@ def test_delegation_child_lease_blocks_runner_and_cross_process_agent(delegated)
     assert entered.wait(5)
     with pytest.raises(RuntimeError, match="live execution owner"):
         runner.create_run(child_id)
+    with pytest.raises(RuntimeError, match="live executor"):
+        orchestration.complete_delegation(
+            contract.delegation_id, status="success", summary="forged completion")
+    with pytest.raises(RuntimeError, match="live executor"):
+        orchestration.handoff_task(child_id, "reviewer", reason="concurrent writer")
 
     context = multiprocessing.get_context("spawn")
     agent_entered, agent_release = context.Event(), context.Event()

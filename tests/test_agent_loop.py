@@ -5,8 +5,8 @@ import time
 
 import pytest
 
-from tars import (agent_loop, control_queue, conversation, evidence, ownership,
-                  runner, state_store, tasks)
+from tars import (agent_loop, checkpoints, cli, control_queue, conversation, evidence,
+                  ownership, runner, state_store, tasks)
 from tars.cli import build_parser
 from tars.tool_core import ToolResult
 
@@ -86,6 +86,18 @@ def _attempt_task_execution_in_process(database, scratch, task_id, connection):
     try:
         with ownership.task_execution_scope(task_id, engine="contender"):
             connection.send(("entered", ""))
+    except Exception as exc:
+        connection.send(("blocked", str(exc)))
+    finally:
+        connection.close()
+
+
+def _attempt_task_mutation_in_process(database, scratch, task_id, connection):
+    _configure_process_state(database, scratch)
+    try:
+        tasks.update_task(
+            task_id, state="completed", phase="completed", progress=1.0)
+        connection.send(("mutated", ""))
     except Exception as exc:
         connection.send(("blocked", str(exc)))
     finally:
@@ -488,6 +500,71 @@ def test_hung_cancellation_fences_every_executor_and_close_is_truthful(loop_stat
     release_cancel.set()
     assert loop.close(timeout=5) is True
     assert cancel_calls == [True]
+
+
+def test_live_agent_loop_owns_task_state_provenance_and_cli_transitions(loop_state):
+    task, original_conversation = loop_state
+    inactive_run = runner.create_run(task.id, original_conversation.id)
+    runner._set_run(inactive_run.id, state="paused")
+    other_conversation = conversation.create_conversation(
+        title="must not replace provenance", make_active=False)
+    tool_started = threading.Event()
+    release_tool = threading.Event()
+    model_calls = []
+
+    def model(*_):
+        model_calls.append(True)
+        return {"type": "tool", "tool": "read", "arguments": {}}
+
+    def execute(task_id=None):
+        tool_started.set()
+        assert release_tool.wait(5)
+        return result_for(task_id, tool="read")
+
+    loop = agent_loop.AgentLoop(
+        task.id, model,
+        agent_loop.ToolDispatcher().register("read", execute, retry_safe=True),
+    )
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.setdefault("value", loop.run()))
+    worker.start()
+    assert tool_started.wait(5)
+
+    try:
+        with pytest.raises(RuntimeError, match="live executor"):
+            tasks.update_task(task.id, state="completed", phase="completed", progress=1.0)
+        with pytest.raises(RuntimeError, match="live executor"):
+            tasks.attach_conversation(task.id, other_conversation.id)
+        with pytest.raises(RuntimeError, match="live executor"):
+            checkpoints.create_checkpoint(task.id, reason="unauthorized live snapshot")
+        assert cli.command_task_mutation("complete", task.id) == 2
+        assert runner.request_control(task.id, "pause") is None
+        assert runner.load_run(inactive_run.id).control_request == ""
+        assert control_queue.list_controls(task.id, state="pending")[0].kind == "pause"
+        context = multiprocessing.get_context("spawn")
+        receiver, sender = context.Pipe(duplex=False)
+        contender = context.Process(
+            target=_attempt_task_mutation_in_process,
+            args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+                  task.id, sender),
+        )
+        contender.start()
+        mutation_state, mutation_error = receiver.recv()
+        contender.join(timeout=10)
+        assert contender.exitcode == 0 and mutation_state == "blocked"
+        assert "live executor" in mutation_error
+        still_running = tasks.load_task(task.id)
+        assert still_running.state == "running"
+        assert still_running.conversation_id == original_conversation.id
+    finally:
+        release_tool.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert outcome["value"].state == "paused"
+    paused = tasks.load_task(task.id)
+    assert paused.state == "paused" and paused.phase == "paused"
+    assert paused.conversation_id == original_conversation.id
+    assert len(model_calls) == 1
 
 
 def test_close_cannot_overtake_cancellation_worker_admission(loop_state, monkeypatch):
