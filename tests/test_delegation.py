@@ -476,16 +476,95 @@ def test_iteration_budget_is_enforced_by_child_executor_protocol(delegated):
     _, _, create = delegated
     contract = create(budget={"max_seconds": 5, "max_iterations": 2,
                               "max_tokens": 100, "inference": False})
+    resumed = []
+    closed = []
     def execute(context):
-        yield {"summary": "one"}
-        yield {"summary": "two"}
-        yield {"summary": "three"}
+        try:
+            resumed.append("one")
+            yield delegation.DelegationStep({"summary": "one"})
+            resumed.append("two")
+            yield delegation.DelegationStep({"summary": "two"})
+            resumed.append("three-side-effect")
+            yield delegation.DelegationStep({"summary": "three"}, done=True)
+        finally:
+            closed.append(True)
     future = delegation.start(contract.delegation_id, execute)
     with pytest.raises(RuntimeError, match="iteration budget"):
         future.result(timeout=2)
+    assert resumed == ["one", "two"]
+    assert closed == [True]
     assert delegation.load_contract(contract.delegation_id).state == "failed"
     assert delegation.join(contract.delegation_id) == {
         "state": "failed", "joined": True}
+
+
+def test_iterative_executor_must_finish_within_authoritative_budget(delegated):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": False})
+
+    def execute(context):
+        yield delegation.DelegationStep({"summary": "working"})
+        yield delegation.DelegationStep({"summary": "done"}, done=True)
+
+    delegation.start(contract.delegation_id, execute)
+    assert delegation.join(contract.delegation_id, timeout=2) == {
+        "state": "completed", "joined": True}
+
+
+@pytest.mark.parametrize("claimed", [0, 1, 999])
+def test_opaque_executor_cannot_self_report_iteration_compliance(
+        delegated, claimed):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": False})
+    future = delegation.start(
+        contract.delegation_id,
+        lambda context: {"summary": "claimed compliance", "iterations": claimed},
+    )
+    with pytest.raises(TypeError, match="must not self-report"):
+        future.result(timeout=2)
+    assert delegation.load_contract(contract.delegation_id).state == "failed"
+
+
+def test_iterative_executor_cannot_use_untyped_results_as_hidden_protocol(delegated):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": False})
+
+    def execute(context):
+        yield {"summary": "untyped terminal", "done": True}
+
+    future = delegation.start(contract.delegation_id, execute)
+    with pytest.raises(TypeError, match="must yield DelegationStep"):
+        future.result(timeout=2)
+
+
+def test_iterator_is_not_resumed_after_cooperative_cancellation(delegated):
+    _, _, create = delegated
+    contract = create(budget={"max_seconds": 5, "max_iterations": 2,
+                              "max_tokens": 100, "inference": False})
+    calls = []
+
+    class Executor:
+        def __call__(self, context):
+            class Steps:
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    calls.append("resume")
+                    if len(calls) == 1:
+                        context["cancel_event"].set()
+                        return delegation.DelegationStep({"summary": "stopping"})
+                    raise AssertionError("iterator resumed after cancellation")
+
+            return Steps()
+
+    delegation.start(contract.delegation_id, Executor())
+    assert delegation.join(contract.delegation_id, timeout=2) == {
+        "state": "cancelled", "joined": True}
+    assert calls == ["resume"]
 
 
 def test_accept_reject_review_is_compare_and_swap(delegated):

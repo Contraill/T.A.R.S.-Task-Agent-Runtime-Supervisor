@@ -47,6 +47,13 @@ class DelegationContract:
     finished_at: str | None
 
 
+@dataclass(frozen=True)
+class DelegationStep:
+    """One boundary-observable iterative executor step."""
+    result: dict
+    done: bool = False
+
+
 def _contract(row):
     return DelegationContract(
         row["delegation_id"], row["parent_delegation_id"],
@@ -282,29 +289,66 @@ def _finish_execution(delegation_id, owner, contract_state, *, status, summary, 
     return load_contract(delegation_id)
 
 
-def _execute_bounded(executor, context, maximum):
-    result = executor(context)
-    if isinstance(result, dict):
-        iterations = int(result.get("iterations", 1))
-        if iterations < 0 or iterations > maximum:
-            raise RuntimeError("child exceeded delegated iteration budget")
-        return result
-    if isinstance(result, Iterator):
-        final = None
-        for count, item in enumerate(result, 1):
-            if count > maximum:
-                raise RuntimeError("child exceeded delegated iteration budget")
-            if not isinstance(item, dict):
-                raise TypeError("child iteration must yield a result object")
-            final = item
-        if final is None:
-            raise ValueError("child executor produced no result")
-        return final
-    raise TypeError("child executor must return a result object")
+def _result_object(value):
+    if not isinstance(value, dict):
+        raise TypeError("child executor result must be an object")
+    if "iterations" in value:
+        raise TypeError("child executor must not self-report iteration counts")
+    return dict(value)
+
+
+def _execute_bounded(executor, context, maximum, cancel_event):
+    """Run one atomic call or at most ``maximum`` explicit iterator steps.
+
+    A dictionary return is one opaque boundary invocation. Iterative executors
+    must yield ``DelegationStep`` and explicitly mark their terminal result;
+    the boundary never resumes an iterator merely to discover an overrun.
+    """
+    if cancel_event.is_set():
+        return {}
+    execution = executor(context)
+    if isinstance(execution, dict):
+        return _result_object(execution)
+    if not isinstance(execution, Iterator):
+        raise TypeError(
+            "child executor must return an atomic result or delegation-step iterator")
+
+    final = None
+    primary_error = None
+    try:
+        for _count in range(1, maximum + 1):
+            if cancel_event.is_set():
+                return final or {}
+            try:
+                step = next(execution)
+            except StopIteration as exc:
+                raise ValueError(
+                    "child iterative executor ended without a terminal step") from exc
+            if not isinstance(step, DelegationStep):
+                raise TypeError("child iteration must yield DelegationStep")
+            final = _result_object(step.result)
+            if step.done:
+                return final
+        if cancel_event.is_set():
+            return final or {}
+        raise RuntimeError("child exceeded delegated iteration budget")
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        close = getattr(execution, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as close_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    f"child iterator close also failed: {close_error}")
 
 
 def start(delegation_id, executor):
-    """Run a child with bounded context and cancellation; executor returns a result dict."""
+    """Run a bounded atomic child or an explicit ``DelegationStep`` iterator."""
     contract = load_contract(delegation_id)
     delegation = load_delegation(delegation_id)
     owner = Owner.create("delegation")
@@ -409,7 +453,8 @@ def start(delegation_id, executor):
                     heartbeats.enter_context(Heartbeat(
                         resource_type, resource_key, owner, lease_seconds=30))
                 result = _execute_bounded(
-                    executor, context, int(contract.budget["max_iterations"]))
+                    executor, context, int(contract.budget["max_iterations"]),
+                    cancel_event)
             if timed_out.is_set():
                 _finish_execution(
                     delegation_id, owner, "timed_out", status="failed",
