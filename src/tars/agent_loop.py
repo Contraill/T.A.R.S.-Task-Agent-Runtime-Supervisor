@@ -114,6 +114,13 @@ class ToolBinding:
         return callable(self.cancel)
 
 
+def _model_arguments(arguments):
+    return {
+        key: value for key, value in dict(arguments).items()
+        if key not in {"task_id", "session_id", "principal_id"}
+    }
+
+
 class ToolDispatcher:
     def __init__(self):
         self._bindings = {}
@@ -200,8 +207,8 @@ class ToolDispatcher:
 
     def execute(self, name, arguments, *, task_id=None):
         binding = self.binding(name)
-        call_arguments = dict(arguments)
-        if task_id and "task_id" in inspect.signature(binding.execute).parameters:
+        call_arguments = _model_arguments(arguments)
+        if task_id is not None and "task_id" in inspect.signature(binding.execute).parameters:
             call_arguments["task_id"] = task_id
         result = binding.execute(**call_arguments)
         if not isinstance(result, ToolResult):
@@ -605,7 +612,7 @@ class AgentLoop:
                     continue
                 if binding.before_execute is not None:
                     try:
-                        hook_arguments = dict(decision.arguments)
+                        hook_arguments = _model_arguments(decision.arguments)
                         signature = inspect.signature(binding.before_execute).parameters
                         if "task_id" in signature:
                             hook_arguments["task_id"] = task.id

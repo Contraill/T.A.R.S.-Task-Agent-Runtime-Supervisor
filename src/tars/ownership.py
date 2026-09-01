@@ -18,7 +18,7 @@ _MODEL_EXECUTION_OWNER = ContextVar("tars_model_execution_owner", default=None)
 MODEL_EXECUTION_RESOURCE = ("gpu-slot", "local-inference:0")
 
 
-def _process_start(pid: int) -> str:
+def process_start(pid: int) -> str:
     try:
         value = Path(f"/proc/{pid}/stat").read_text()
         fields = value[value.rfind(")") + 2:].split()
@@ -36,7 +36,7 @@ class Owner:
     @classmethod
     def create(cls, prefix="owner"):
         pid = os.getpid()
-        return cls(f"{prefix}-{uuid.uuid4().hex}", pid, _process_start(pid))
+        return cls(f"{prefix}-{uuid.uuid4().hex}", pid, process_start(pid))
 
 
 def current_owner() -> Owner | None:
@@ -56,8 +56,8 @@ def owner_scope(owner: Owner):
         _CURRENT_OWNER.reset(token)
 
 
-def owner_alive(pid: int, process_start: str) -> bool:
-    return bool(process_start and _process_start(int(pid)) == process_start)
+def owner_alive(pid: int, expected_start: str) -> bool:
+    return bool(expected_start and process_start(int(pid)) == expected_start)
 
 
 def _expiry(seconds: float, *, now=None) -> str:
@@ -160,11 +160,14 @@ def held_by(resource_type, resource_key, owner: Owner) -> bool:
     ensure_state_store()
     with connect() as conn:
         row = conn.execute(
-            "SELECT owner_token,expires_at FROM resource_leases "
+            "SELECT owner_token,owner_pid,owner_start,expires_at FROM resource_leases "
             "WHERE resource_type=? AND resource_key=?", (resource_type, resource_key),
         ).fetchone()
     return bool(row and row["owner_token"] == owner.token
-                and row["expires_at"] > now_utc())
+                and row["owner_pid"] == owner.pid
+                and row["owner_start"] == owner.process_start
+                and row["expires_at"] > now_utc()
+                and owner_alive(row["owner_pid"], row["owner_start"]))
 
 
 def active(resource_type, resource_key) -> bool:

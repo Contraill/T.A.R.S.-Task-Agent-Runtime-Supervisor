@@ -770,6 +770,53 @@ def test_non_tool_return_is_not_promoted_to_fabricated_tool_result(loop_state):
     assert outcome.reason == "tool failure guard"
 
 
+def test_model_arguments_cannot_declare_trusted_execution_identity():
+    observed = []
+
+    def execute(*, task_id=None, session_id=None, principal_id=None):
+        observed.append((task_id, session_id, principal_id))
+        return ToolResult("fixture", "succeeded")
+
+    dispatcher = agent_loop.ToolDispatcher().register("fixture", execute)
+    dispatcher.execute(
+        "fixture",
+        {"task_id": "attacker-task", "session_id": "attacker-session",
+         "principal_id": "attacker-principal"},
+        task_id="trusted-task",
+    )
+    dispatcher.execute(
+        "fixture",
+        {"task_id": "attacker-task", "session_id": "attacker-session",
+         "principal_id": "attacker-principal"},
+    )
+    assert observed == [("trusted-task", None, None), (None, None, None)]
+
+
+def test_model_identity_arguments_do_not_reach_preexecution_hook(loop_state):
+    task, _ = loop_state
+    observed = []
+
+    def before_execute(*, task_id=None, session_id=None, principal_id=None):
+        observed.append((task_id, session_id, principal_id))
+        return ToolResult("workspace.checkpoint", "succeeded", {"checkpoint_id": "cp"})
+
+    dispatcher = agent_loop.ToolDispatcher().register(
+        "fixture", lambda task_id=None: result_for(task_id),
+        before_execute=before_execute)
+    agent_loop.AgentLoop(
+        task.id,
+        lambda *_: {
+            "type": "tool", "tool": "fixture",
+            "arguments": {"task_id": "attacker-task",
+                          "session_id": "attacker-session",
+                          "principal_id": "attacker-principal"},
+        },
+        dispatcher,
+        limits=agent_loop.LoopLimits(max_iterations=1),
+    ).run()
+    assert observed == [(task.id, None, None)]
+
+
 def test_failed_control_terminalizes_loop_instead_of_leaving_task_running(loop_state):
     task, _ = loop_state
     control_queue.enqueue(task.id, "approval", "malformed", payload={})

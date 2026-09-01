@@ -3,11 +3,14 @@ import time
 import multiprocessing
 import os
 from pathlib import Path
+import subprocess
 import threading
+from dataclasses import replace
 
 import pytest
 
-from tars import approvals, execution_backends as execution, policy, state_store, terminal_tools
+from tars import (approvals, execution_backends as execution, policy, state_store,
+                  sessions, tasks, terminal_tools)
 
 
 def _start_background_then_exit(database, state_root, log_root, cwd, output):
@@ -41,8 +44,9 @@ def _start_background_then_exit(database, state_root, log_root, cwd, output):
         if business_pid_path.exists() and descendant_pid_path.exists():
             break
         time.sleep(0.01)
-    output.put((result.data["supervisor_pid"], result.data["pid"],
-                int(business_pid_path.read_text()), int(descendant_pid_path.read_text())))
+    output.put((result.data["process_id"], (
+        result.data["supervisor_pid"], result.data["pid"],
+        int(business_pid_path.read_text()), int(descendant_pid_path.read_text()))))
 
 
 def _start_background_signal_then_wait(database, state_root, log_root, cwd,
@@ -128,12 +132,16 @@ def terminal(monkeypatch, tmp_path):
     ), tmp_path
 
 
-def _approve(tool, effect, target, arguments=None, *, destructive=False):
-    request = policy.ScopeRequest(tool, effect, target, arguments or {}, destructive=destructive)
+def _approve(tool, effect, target, arguments=None, *, destructive=False,
+             task_id=None, session_id=None):
+    request = policy.ScopeRequest(
+        tool, effect, target, arguments or {}, destructive=destructive,
+        task_id=task_id, session_id=session_id)
     decision = policy.ScopeGuard().evaluate(request)
     broker = approvals.ApprovalBroker()
     pending = broker.request(request, decision)
-    broker.decide(pending.id, approve=True)
+    broker.decide(
+        pending.id, approve=True, task_id=task_id, session_id=session_id)
     return pending.id
 
 
@@ -283,6 +291,213 @@ def test_process_kill_is_destructive_and_denied_without_approval(terminal):
     assert tools.processes.wait(process_id, timeout=5).data["state"] == "exited"
 
 
+def test_process_operations_require_exact_trusted_task_origin(terminal):
+    tools, root = terminal
+    owner = tasks.create_task("own managed process", "general")
+    stranger = tasks.create_task("must not control another task process", "general")
+    owner_session = sessions.create_session()
+    stranger_session = sessions.create_session()
+    started = tools.run(
+        (sys.executable, "-c", "import time; time.sleep(30)"), cwd=str(root),
+        allowed_paths=(str(root),), background=True, task_id=owner.id,
+        session_id=owner_session.id,
+    )
+    process_id = started.data["process_id"]
+
+    assert tools.processes.list(task_id=stranger.id).data["processes"] == []
+    for operation in (
+        lambda: tools.processes.poll(process_id, task_id=stranger.id),
+        lambda: tools.processes.wait(process_id, timeout=0, task_id=stranger.id),
+        lambda: tools.processes.logs(process_id, task_id=stranger.id),
+        lambda: tools.processes.write(process_id, "x", task_id=stranger.id),
+        lambda: tools.processes.signal(process_id, "TERM", task_id=stranger.id),
+        lambda: tools.processes.kill(process_id, task_id=stranger.id),
+        lambda: tools.processes.poll(
+            process_id, task_id=owner.id, session_id=stranger_session.id),
+        lambda: tools.processes.poll(process_id),
+    ):
+        with pytest.raises(PermissionError, match="another task or session"):
+            operation()
+    assert tools.processes.poll(
+        process_id, task_id=owner.id,
+        session_id=owner_session.id).data["state"] == "running"
+
+    approval = _approve(
+        "process.kill", "destructive", process_id, {"signal": "KILL"},
+        destructive=True, task_id=owner.id, session_id=owner_session.id)
+    tools.processes.kill(
+        process_id, approval_id=approval, task_id=owner.id,
+        session_id=owner_session.id)
+    assert tools.processes.wait(
+        process_id, timeout=5, task_id=owner.id,
+        session_id=owner_session.id).data["state"] == "exited"
+
+
+def test_fake_process_records_cannot_control_unrelated_process(terminal):
+    tools, root = terminal
+    started = tools.run(
+        (sys.executable, "-c", "import time; time.sleep(30)"), cwd=str(root),
+        allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    real_record = tools.processes._processes[process_id]
+    unrelated = subprocess.Popen(
+        (sys.executable, "-c", "import time; time.sleep(30)"), start_new_session=True)
+    fake_id = "process-forged"
+    try:
+        tools.processes._processes["process-raw-popen"] = unrelated
+        with pytest.raises(PermissionError, match="trusted creation provenance"):
+            tools.processes.poll("process-raw-popen")
+
+        tools.processes._processes[fake_id] = replace(
+            real_record, id=fake_id, process=unrelated,
+            business_pid=unrelated.pid,
+            business_start=terminal_tools.process_start(unrelated.pid),
+            process_group_id=os.getpgid(unrelated.pid),
+            supervisor_start=terminal_tools.process_start(unrelated.pid),
+        )
+        with pytest.raises(PermissionError, match="durable provenance"):
+            tools.processes.signal(fake_id, "TERM")
+
+        tools.processes._processes[process_id] = replace(
+            real_record, process=unrelated, business_pid=unrelated.pid,
+            business_start=terminal_tools.process_start(unrelated.pid),
+            process_group_id=os.getpgid(unrelated.pid),
+            supervisor_start=terminal_tools.process_start(unrelated.pid),
+        )
+        with pytest.raises(PermissionError, match="durable provenance"):
+            tools.processes.kill(process_id)
+        assert unrelated.poll() is None
+    finally:
+        tools.processes._processes[process_id] = real_record
+        tools.processes._processes.pop(fake_id, None)
+        tools.processes._processes.pop("process-raw-popen", None)
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+        approval = _approve(
+            "process.kill", "destructive", process_id, {"signal": "KILL"},
+            destructive=True)
+        tools.processes.kill(process_id, approval_id=approval)
+        tools.processes.wait(process_id, timeout=5)
+
+
+def test_second_manager_cannot_reconstruct_live_process_authority(terminal):
+    tools, root = terminal
+    started = tools.run(
+        (sys.executable, "-c", "import time; time.sleep(30)"), cwd=str(root),
+        allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    second = terminal_tools.ProcessManager(log_root=root / "other-logs")
+    with pytest.raises(KeyError, match="unknown process"):
+        second.signal(process_id, "TERM")
+    assert tools.processes.poll(process_id).data["state"] == "running"
+    approval = _approve(
+        "process.kill", "destructive", process_id, {"signal": "KILL"}, destructive=True)
+    tools.processes.kill(process_id, approval_id=approval)
+    tools.processes.wait(process_id, timeout=5)
+
+
+def test_stale_supervisor_identity_fails_closed_before_signal(monkeypatch, terminal):
+    tools, root = terminal
+    started = tools.run(
+        (sys.executable, "-c", "import time; time.sleep(30)"), cwd=str(root),
+        allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    supervisor_pid = started.data["supervisor_pid"]
+    real_process_start = terminal_tools.process_start
+
+    def stale(pid):
+        return "reused-process-identity" if pid == supervisor_pid else real_process_start(pid)
+
+    monkeypatch.setattr(terminal_tools, "process_start", stale)
+    with pytest.raises(PermissionError, match="supervisor identity changed"):
+        tools.processes.signal(process_id, "TERM")
+    monkeypatch.setattr(terminal_tools, "process_start", real_process_start)
+    approval = _approve(
+        "process.kill", "destructive", process_id, {"signal": "KILL"}, destructive=True)
+    tools.processes.kill(process_id, approval_id=approval)
+    tools.processes.wait(process_id, timeout=5)
+
+
+def test_lost_process_authority_lease_never_rebinds_control(terminal):
+    tools, root = terminal
+    started = tools.run(
+        (sys.executable, "-c", "import time; time.sleep(30)"), cwd=str(root),
+        allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    record = tools.processes._processes[process_id]
+    heartbeat = tools.processes._handles[process_id][4]
+    heartbeat.stop_event.set()
+    heartbeat.thread.join(timeout=5)
+    with state_store.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE resource_leases SET expires_at='1970-01-01T00:00:00+00:00' "
+            "WHERE resource_type='managed-process' AND resource_key=?",
+            (process_id,),
+        )
+
+    with pytest.raises(PermissionError, match="durable provenance"):
+        tools.processes.signal(process_id, "TERM")
+    assert _process_state(record.business_pid)
+
+    os.kill(record.process.pid, terminal_tools.signals.SIGRTMIN)
+    record.process.wait(timeout=5)
+    tools.processes._refresh(record)
+    assert tools.processes.poll(process_id).data["state"] == "exited"
+
+
+def test_lost_signal_acknowledgement_is_ambiguous_and_fenced(terminal):
+    tools, root = terminal
+    marker = root / "usr1-count"
+    code = (
+        "import signal,time; from pathlib import Path; "
+        f"marker=Path({str(marker)!r}); "
+        "signal.signal(signal.SIGUSR1, lambda *_: marker.write_text("
+        "marker.read_text() + 'x' if marker.exists() else 'x')); "
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    started = tools.run(
+        (sys.executable, "-u", "-c", code), cwd=str(root),
+        allowed_paths=(str(root),), background=True,
+    )
+    process_id = started.data["process_id"]
+    for _ in range(100):
+        if "ready" in tools.processes.logs(process_id).data["content"]:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("business process did not become ready")
+    record = tools.processes._processes[process_id]
+    os.close(record.response_read)
+
+    first_approval = _approve(
+        "process.signal", "execute", process_id, {"signal": "USR1"})
+    outcome = tools.processes.signal(
+        process_id, "USR1", approval_id=first_approval)
+    assert outcome.state == "unknown"
+    assert outcome.data["requested"] is None
+    assert outcome.data["outcome"] == "dispatch-ambiguous"
+    for _ in range(100):
+        if marker.exists():
+            break
+        time.sleep(0.01)
+    assert marker.read_text() == "x"
+
+    second_approval = _approve(
+        "process.signal", "execute", process_id, {"signal": "USR1"})
+    refused = tools.processes.signal(
+        process_id, "USR1", approval_id=second_approval)
+    assert refused.state == "failed" and refused.data["cancellable"] is False
+    assert marker.read_text() == "x"
+
+    os.kill(record.process.pid, terminal_tools.signals.SIGRTMIN)
+    record.process.wait(timeout=5)
+    tools.processes._refresh(record)
+
+
 def test_signal_after_exit_does_not_fabricate_dispatch(terminal):
     tools, root = terminal
     started = tools.run(
@@ -298,7 +513,7 @@ def test_signal_after_exit_does_not_fabricate_dispatch(terminal):
     assert truth.data["outcome"] == "already-exited"
 
 
-def test_background_process_dies_with_owning_manager_process(tmp_path):
+def test_background_process_dies_with_owning_manager_process(monkeypatch, tmp_path):
     context = multiprocessing.get_context("spawn")
     output = context.Queue()
     process = context.Process(
@@ -307,10 +522,23 @@ def test_background_process_dies_with_owning_manager_process(tmp_path):
               str(tmp_path), output),
     )
     process.start()
-    managed_pids = output.get(timeout=10)
+    process_id, managed_pids = output.get(timeout=10)
     process.join(timeout=10)
     assert process.exitcode == 0
     _assert_processes_gone(managed_pids)
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", tmp_path / "state.sqlite3")
+    monkeypatch.setattr(state_store, "TASK_ROOT", tmp_path / "legacy")
+    monkeypatch.setattr(state_store, "TASK_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setattr(state_store, "TASK_INDEX_PATH", tmp_path / "index")
+    restarted = terminal_tools.ProcessManager(log_root=tmp_path / "restarted-logs")
+    with state_store.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM resource_leases "
+            "WHERE resource_type='managed-process' AND resource_key=?",
+            (process_id,),
+        ).fetchone()[0] == 0
+    with pytest.raises(KeyError, match="unknown process"):
+        restarted.poll(process_id)
 
 
 @pytest.mark.parametrize(
