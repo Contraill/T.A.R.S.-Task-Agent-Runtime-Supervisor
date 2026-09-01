@@ -9,6 +9,7 @@ from .roles import get_role, resolve_role_id
 from .runtime_backends import (BackendStatus, LifecycleResult,
                                ModelCapabilities, RuntimeCapabilities,
                                backend_binding_ready, backend_for_model)
+from .ownership import model_execution_owner, model_execution_scope
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 from .tasks import append_event, load_task
 
@@ -64,6 +65,24 @@ class LocalRuntimeRouter:
     def resolve(self, role_name, *, task_id=None, required_capabilities=(),
                 context_tokens=0, require_reasoning=False, require_tools=False,
                 input_modalities=("text",), persist=True) -> RuntimeRoute:
+        with model_execution_scope(
+            operation="runtime-route",
+            metadata={"role": str(role_name)},
+        ):
+            return self._resolve_owned(
+                role_name, task_id=task_id,
+                required_capabilities=required_capabilities,
+                context_tokens=context_tokens,
+                require_reasoning=require_reasoning,
+                require_tools=require_tools,
+                input_modalities=input_modalities,
+                persist=persist,
+            )
+
+    def _resolve_owned(self, role_name, *, task_id=None, required_capabilities=(),
+                       context_tokens=0, require_reasoning=False,
+                       require_tools=False, input_modalities=("text",),
+                       persist=True) -> RuntimeRoute:
         if persist or task_id:
             ensure_state_store()
         role_id = resolve_role_id(role_name)
@@ -236,6 +255,9 @@ class LocalRuntimeRouter:
                 visibility="normal" if route.ready else "quiet")
 
     def prepare(self, route: RuntimeRoute) -> LifecycleResult:
+        if model_execution_owner() is None:
+            raise RuntimeRouteUnavailable(
+                "runtime preparation requires model execution ownership")
         route.require_ready()
         if route._backend is None:
             raise RuntimeRouteUnavailable("runtime backend instance is unavailable")
@@ -245,6 +267,9 @@ class LocalRuntimeRouter:
         return result
 
     def release(self, route: RuntimeRoute) -> LifecycleResult:
+        if model_execution_owner() is None:
+            raise RuntimeRouteUnavailable(
+                "runtime release requires model execution ownership")
         route.require_ready()
         if route._backend is None:
             raise RuntimeRouteUnavailable("runtime backend instance is unavailable")

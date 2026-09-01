@@ -9,6 +9,7 @@ from tars import runtime
 from tars import runtime_backends as backends
 from tars import runtime_routing as routing
 from tars import state_store
+from tars import ownership
 from tars.generation import GenerationBudget
 
 
@@ -202,7 +203,13 @@ def test_runtime_dispatches_role_through_model_backend(monkeypatch):
     monkeypatch.setattr(runtime, "get_role", lambda name: role)
     monkeypatch.setattr(runtime, "get_model", lambda alias: model)
     monkeypatch.setattr(runtime, "LocalRuntimeRouter", Router)
-    monkeypatch.setattr(runtime, "count_chat_tokens", lambda *args, **kwargs: 10)
+    def count_tokens(*args, **kwargs):
+        owner = ownership.model_execution_owner()
+        assert owner is not None
+        assert ownership.held_by("gpu-slot", "local-inference:0", owner)
+        calls.append(("count",))
+        return 10
+    monkeypatch.setattr(runtime, "count_chat_tokens", count_tokens)
     monkeypatch.setattr(runtime, "generation_budget", lambda *args, **kwargs: GenerationBudget(
         "general", 200, 50, 10, 140, None))
     result = runtime.chat_completion({}, "general", [{"role": "user", "content": "hi"}])
@@ -217,6 +224,10 @@ def test_runtime_dispatches_role_through_model_backend(monkeypatch):
     assert [call[0] for call in calls].count("require") == 2
     assert [call[0] for call in calls].count("prepare") == 2
     assert [call[0] for call in calls].count("release") == 2
+    phases = [call[0] for call in calls]
+    first_prepare = phases.index("prepare")
+    assert first_prepare < phases.index("count", first_prepare) < phases.index(
+        "release", first_prepare)
 
 
 def test_inference_lifecycle_has_one_authoritative_gpu_owner(monkeypatch):
@@ -265,6 +276,27 @@ def test_inference_slot_is_exclusive_across_processes(monkeypatch):
     assert process.exitcode == 0
 
 
+def test_dead_model_owner_is_reclaimed_without_waiting_for_false_heartbeat(monkeypatch):
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(
+        target=_hold_inference_slot,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              ready, release),
+    )
+    process.start()
+    assert ready.wait(5)
+    process.terminate()
+    process.join(timeout=10)
+    assert process.exitcode is not None
+
+    with ownership.model_execution_scope(
+        operation="dead-owner-recovery", timeout=0.2,
+    ) as owner:
+        assert ownership.held_by("gpu-slot", "local-inference:0", owner)
+    assert not ownership.active("gpu-slot", "local-inference:0")
+
+
 def test_stream_close_releases_authoritative_runtime_lifecycle(monkeypatch):
     role = SimpleNamespace(id="oracle", model="heavy", runtime_id="oracle",
                            display_name="Oracle", execution="delegate")
@@ -273,6 +305,10 @@ def test_stream_close_releases_authoritative_runtime_lifecycle(monkeypatch):
 
     class Backend:
         def count_tokens(self, *args, **kwargs):
+            owner = ownership.model_execution_owner()
+            assert owner is not None
+            assert ownership.held_by("gpu-slot", "local-inference:0", owner)
+            calls.append("count")
             return 10
 
         def stream(self, request):
@@ -305,9 +341,9 @@ def test_stream_close_releases_authoritative_runtime_lifecycle(monkeypatch):
     stream = runtime.chat_completion_stream(
         {}, "oracle", [{"role": "user", "content": "review"}])
     assert next(stream)["content"] == "first"
-    assert calls == ["load"]
+    assert calls == ["load", "count"]
     stream.close()
-    assert calls == ["load", "unload"]
+    assert calls == ["load", "count", "unload"]
 
 
 def test_real_oracle_completion_path_loads_infers_and_releases(monkeypatch, tmp_path):
@@ -344,10 +380,11 @@ def test_real_oracle_completion_path_loads_infers_and_releases(monkeypatch, tmp_
     assert response["choices"][0]["message"]["content"] == "answer"
     urls = [call[1] for call in transport.calls]
     load_index = next(i for i, url in enumerate(urls) if url.endswith("/load"))
+    tokenize_index = next(i for i, url in enumerate(urls) if url.endswith("/v1/tokenize"))
     inference_index = next(i for i, url in enumerate(urls)
                            if url.endswith("/v1/chat/completions"))
     unload_index = next(i for i, url in enumerate(urls) if url.endswith("/unload"))
-    assert load_index < inference_index < unload_index
+    assert load_index < tokenize_index < inference_index < unload_index
     assert transport.calls[load_index][2] == {"ttl_seconds": 30}
 
 
@@ -360,20 +397,74 @@ def test_stream_normalization_never_synthesizes_reasoning():
 
 
 def test_role_token_count_uses_bound_backend_for_context_engine(monkeypatch):
-    role = SimpleNamespace(model="heavy", runtime_id="oracle", display_name="Oracle")
-    model = SimpleNamespace(backend="colibri")
+    lifecycle = []
 
     class Backend:
         def count_tokens(self, model_id, messages, *, thinking_mode=None):
             assert model_id == "oracle" and thinking_mode == "on"
+            owner = ownership.model_execution_owner()
+            assert owner is not None
+            assert ownership.held_by("gpu-slot", "local-inference:0", owner)
+            lifecycle.append("count")
             return 77
 
-    monkeypatch.setattr(runtime, "get_role", lambda value: role)
-    monkeypatch.setattr(runtime, "get_model", lambda value: model)
-    monkeypatch.setattr(runtime, "backend_for_model", lambda value, cfg: Backend())
+    class Router:
+        def __init__(self, cfg):
+            self.backend = Backend()
+
+        def resolve(self, role, **kwargs):
+            return SimpleNamespace(
+                runtime_id="oracle", backend_instance=self.backend,
+                require_ready=lambda: None,
+            )
+
+        def prepare(self, route):
+            lifecycle.append("load")
+
+        def release(self, route):
+            lifecycle.append("unload")
+
+    monkeypatch.setattr(runtime, "LocalRuntimeRouter", Router)
     assert runtime.count_role_chat_tokens(
         {}, "oracle", ({"role": "user", "content": "review"},),
         thinking_mode="on") == 77
+    assert lifecycle == ["load", "count", "unload"]
+    assert ownership.model_execution_owner() is None
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_end_to_end_chat_does_not_prepare_before_cross_process_model_ownership(
+        monkeypatch, streaming):
+    monkeypatch.setattr(runtime, "INFERENCE_SLOT_WAIT_SECONDS", 0.1)
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(
+        target=_hold_inference_slot,
+        args=(str(state_store.STATE_DB_PATH), str(state_store.STATE_DB_PATH.parent),
+              ready, release),
+    )
+    process.start()
+    assert ready.wait(5)
+
+    class Router:
+        def __init__(self, cfg):
+            raise AssertionError("routing/preparation ran without model ownership")
+
+    monkeypatch.setattr(runtime, "LocalRuntimeRouter", Router)
+    try:
+        if streaming:
+            result = runtime.chat_completion_stream(
+                {}, "general", ({"role": "user", "content": "hi"},))
+            with pytest.raises(RuntimeError, match="slot is busy"):
+                next(result)
+        else:
+            with pytest.raises(RuntimeError, match="slot is busy"):
+                runtime.chat_completion(
+                    {}, "general", ({"role": "user", "content": "hi"},))
+    finally:
+        release.set()
+        process.join(timeout=10)
+    assert process.exitcode == 0
 
 
 def test_backend_readiness_requires_matching_local_calibration(monkeypatch):

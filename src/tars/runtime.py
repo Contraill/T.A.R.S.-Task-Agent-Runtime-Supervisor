@@ -8,13 +8,13 @@ import urllib.request
 import time
 
 from .config import runtime_base_url
-from .runtime_backends import InferenceRequest, backend_for_model
+from .runtime_backends import InferenceRequest
 from .runtime_routing import LocalRuntimeRouter
 from .registry import get_model
 from .roles import get_role
 from .generation import generation_budget, generation_ceiling
 from .thinking import capability_for_model, decide as decide_thinking
-from .ownership import Heartbeat, Owner, acquire, release as release_lease
+from .ownership import model_execution_owner, model_execution_scope
 
 
 INFERENCE_SLOT_WAIT_SECONDS = 30.0
@@ -38,18 +38,26 @@ def post_json(url, payload, timeout=600):
 
 
 def runtime_models(cfg):
-    base = runtime_base_url(cfg)
-    return get_json(base + "/v1/models")["data"]
+    with model_execution_scope(
+        operation="runtime-models", timeout=INFERENCE_SLOT_WAIT_SECONDS,
+    ):
+        base = runtime_base_url(cfg)
+        return get_json(base + "/v1/models")["data"]
 
 
 def upstream_post_json(cfg, runtime_id, path, payload, *, timeout=600):
     """Route a llama-server-specific request through llama-swap to one model."""
-    base = runtime_base_url(cfg)
-    model_path = quote(str(runtime_id), safe="")
-    endpoint = path if str(path).startswith("/") else "/" + str(path)
-    return post_json(
-        f"{base}/upstream/{model_path}{endpoint}", payload, timeout=timeout
-    )
+    with model_execution_scope(
+        operation="runtime-upstream",
+        timeout=INFERENCE_SLOT_WAIT_SECONDS,
+        metadata={"runtime_id": str(runtime_id), "path": str(path)},
+    ):
+        base = runtime_base_url(cfg)
+        model_path = quote(str(runtime_id), safe="")
+        endpoint = path if str(path).startswith("/") else "/" + str(path)
+        return post_json(
+            f"{base}/upstream/{model_path}{endpoint}", payload, timeout=timeout
+        )
 
 
 def apply_chat_template(cfg, runtime_id, messages, *, thinking_mode=None):
@@ -91,37 +99,52 @@ def tokenize_text(cfg, runtime_id, content):
 
 
 def count_chat_tokens(cfg, runtime_id, messages, *, thinking_mode=None):
-    prompt = apply_chat_template(
-        cfg, runtime_id, messages, thinking_mode=thinking_mode
-    )
-    return len(tokenize_text(cfg, runtime_id, prompt))
+    with model_execution_scope(
+        operation="exact-token-count",
+        timeout=INFERENCE_SLOT_WAIT_SECONDS,
+        metadata={"runtime_id": str(runtime_id)},
+    ):
+        prompt = apply_chat_template(
+            cfg, runtime_id, messages, thinking_mode=thinking_mode
+        )
+        return len(tokenize_text(cfg, runtime_id, prompt))
 
 
 def count_role_chat_tokens(cfg, role, messages, *, thinking_mode=None):
     """Count with the bound backend tokenizer without leaking backend details to Context."""
-    role_record = get_role(role)
-    if not role_record.model:
-        raise RuntimeError(f"role {role_record.display_name!r} has no model binding")
-    model = get_model(role_record.model)
-    backend = backend_for_model(model, cfg)
-    if hasattr(backend, "count_tokens"):
-        return backend.count_tokens(
-            role_record.runtime_id, messages, thinking_mode=thinking_mode)
-    return count_chat_tokens(
-        cfg, role_record.runtime_id, messages, thinking_mode=thinking_mode)
+    with model_execution_scope(
+        operation="role-token-count", timeout=INFERENCE_SLOT_WAIT_SECONDS,
+        metadata={"role": str(role)},
+    ):
+        router, route, backend = _inference_route(cfg, role)
+        with _inference_lifecycle(router, route):
+            if hasattr(backend, "count_tokens"):
+                return backend.count_tokens(
+                    route.runtime_id, messages, thinking_mode=thinking_mode)
+            return count_chat_tokens(
+                cfg, route.runtime_id, messages, thinking_mode=thinking_mode)
+
+
+def _inference_route(cfg, role):
+    if model_execution_owner() is None:
+        raise RuntimeError("runtime routing requires model execution ownership")
+    router = LocalRuntimeRouter(cfg)
+    route = router.resolve(role, persist=False)
+    route.require_ready()
+    backend = route.backend_instance
+    if backend is None:
+        raise RuntimeError("resolved runtime backend instance is unavailable")
+    return router, route, backend
 
 
 def _inference_request(cfg, role, messages, *, max_tokens=None, input_tokens=None,
                        temperature=0.2, thinking="auto", operation="chat",
-                       task_active=False, requires_tools=False, complex_task=False):
-    router = LocalRuntimeRouter(cfg)
-    route = router.resolve(role, persist=False)
-    route.require_ready()
+                       task_active=False, requires_tools=False, complex_task=False,
+                       router, route, backend):
+    if model_execution_owner() is None:
+        raise RuntimeError("inference preparation requires model execution ownership")
     role_record = get_role(route.selected_role)
     model = get_model(route.model_alias)
-    backend = route.backend_instance
-    if backend is None:
-        raise RuntimeError("resolved runtime backend instance is unavailable")
     thinking_decision = decide_thinking(
         cfg, role_record.id, capability_for_model(model), requested=thinking,
         operation=operation, task_active=task_active, requires_tools=requires_tools,
@@ -158,37 +181,32 @@ def _inference_request(cfg, role, messages, *, max_tokens=None, input_tokens=Non
                 "profile_context_limit": budget.context_window,
                 "backend_context_limit": backend_context,
                 "effective_context_limit": effective_window}
-    return router, route, backend, request, metadata
+    return request, metadata
 
 
 @contextmanager
 def _inference_lifecycle(router, route):
     """Apply the resolved backend lifecycle around every real inference attempt."""
-    owner = Owner.create("inference")
-    if not acquire(
-        "gpu-slot", "local-inference:0", owner, lease_seconds=30,
+    with model_execution_scope(
+        operation="inference-lifecycle",
         timeout=INFERENCE_SLOT_WAIT_SECONDS,
         metadata={"backend": getattr(route, "backend", ""),
                   "runtime_id": getattr(route, "runtime_id", "")},
     ):
-        raise RuntimeError("local inference slot is busy")
-    primary_error = None
-    try:
-        with Heartbeat("gpu-slot", "local-inference:0", owner, lease_seconds=30):
+        primary_error = None
+        try:
             router.prepare(route)
             yield
-    except BaseException as exc:
-        primary_error = exc
-        raise
-    finally:
-        try:
-            router.release(route)
-        except Exception as release_error:
-            if primary_error is None:
-                raise
-            primary_error.add_note(f"runtime release also failed: {release_error}")
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            release_lease("gpu-slot", "local-inference:0", owner)
+            try:
+                router.release(route)
+            except Exception as release_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(f"runtime release also failed: {release_error}")
 
 
 def _reported_usage(usage):
@@ -206,14 +224,21 @@ def chat_completion(cfg, role, messages, *, max_tokens=None, input_tokens=None,
                     temperature=0.2, thinking="auto", operation="chat",
                     task_active=False, requires_tools=False, complex_task=False):
     overall_started = time.monotonic()
-    router, route, backend, request, metadata = _inference_request(
-        cfg, role, messages, max_tokens=max_tokens, input_tokens=input_tokens,
-        temperature=temperature, thinking=thinking, operation=operation,
-        task_active=task_active, requires_tools=requires_tools,
-        complex_task=complex_task)
-    started = time.monotonic()
-    with _inference_lifecycle(router, route):
-        response = backend.complete(request)
+    with model_execution_scope(
+        operation="chat-completion", timeout=INFERENCE_SLOT_WAIT_SECONDS,
+        metadata={"role": str(role)},
+    ):
+        router, route, backend = _inference_route(cfg, role)
+        with _inference_lifecycle(router, route):
+            request, metadata = _inference_request(
+                cfg, role, messages, max_tokens=max_tokens,
+                input_tokens=input_tokens, temperature=temperature,
+                thinking=thinking, operation=operation,
+                task_active=task_active, requires_tools=requires_tools,
+                complex_task=complex_task, router=router, route=route,
+                backend=backend)
+            started = time.monotonic()
+            response = backend.complete(request)
     choice = (response.get("choices") or [{}])[0]
     usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
     response["_tars_generation"] = metadata | _reported_usage(usage) | {
@@ -238,33 +263,40 @@ def chat_completion_stream(cfg, role, messages, *, max_tokens=None, input_tokens
     equivalent reasoning field).  T.A.R.S. never synthesizes Raw reasoning.
     """
     overall_started = time.monotonic()
-    router, route, backend, request, metadata = _inference_request(
-        cfg, role, messages, max_tokens=max_tokens, input_tokens=input_tokens,
-        temperature=temperature, thinking=thinking, operation=operation,
-        task_active=task_active, requires_tools=requires_tools,
-        complex_task=complex_task)
-    started = time.monotonic()
-    first_token = None
-    last_finish = None
-    with _inference_lifecycle(router, route):
-        for event in backend.stream(request):
-            if first_token is None and (event.content or event.reasoning):
-                first_token = time.monotonic() - started
-            usage = event.usage or {}
-            if event.finish_reason is not None:
-                last_finish = event.finish_reason
-            generation = metadata | _reported_usage(usage) | {
-                "finish_reason": last_finish,
-                "elapsed_seconds": time.monotonic() - started,
-                "preparation_seconds": started - overall_started,
-                "first_token_seconds": first_token,
-            }
-            yield {
-                "content": event.content,
-                "reasoning": event.reasoning,
-                "tool_calls": list(event.tool_calls),
-                "finish_reason": event.finish_reason,
-                "usage": event.usage,
-                "generation": generation,
-                "raw": event.raw,
-            }
+    with model_execution_scope(
+        operation="chat-completion-stream", timeout=INFERENCE_SLOT_WAIT_SECONDS,
+        metadata={"role": str(role)},
+    ):
+        router, route, backend = _inference_route(cfg, role)
+        with _inference_lifecycle(router, route):
+            request, metadata = _inference_request(
+                cfg, role, messages, max_tokens=max_tokens,
+                input_tokens=input_tokens, temperature=temperature,
+                thinking=thinking, operation=operation,
+                task_active=task_active, requires_tools=requires_tools,
+                complex_task=complex_task, router=router, route=route,
+                backend=backend)
+            started = time.monotonic()
+            first_token = None
+            last_finish = None
+            for event in backend.stream(request):
+                if first_token is None and (event.content or event.reasoning):
+                    first_token = time.monotonic() - started
+                usage = event.usage or {}
+                if event.finish_reason is not None:
+                    last_finish = event.finish_reason
+                generation = metadata | _reported_usage(usage) | {
+                    "finish_reason": last_finish,
+                    "elapsed_seconds": time.monotonic() - started,
+                    "preparation_seconds": started - overall_started,
+                    "first_token_seconds": first_token,
+                }
+                yield {
+                    "content": event.content,
+                    "reasoning": event.reasoning,
+                    "tool_calls": list(event.tool_calls),
+                    "finish_reason": event.finish_reason,
+                    "usage": event.usage,
+                    "generation": generation,
+                    "raw": event.raw,
+                }

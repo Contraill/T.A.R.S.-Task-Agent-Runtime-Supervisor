@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tars import runtime_routing as routing, state_store, tasks
+from tars import ownership, runtime_routing as routing, state_store, tasks
 from tars.runtime_backends import (BackendStatus, LifecycleResult, ModelCapabilities,
                                    RuntimeCapabilities)
 
@@ -76,10 +76,22 @@ def test_ready_route_preserves_exact_role_and_lifecycle(route_state):
     assert route.ready and route.requested_role == route.selected_role == "general"
     assert route.backend == "llama.cpp" and route.model_alias == "local"
     assert route.requested["local_only"] and not route.requested["silent_substitution"]
-    assert router.prepare(route).managed_on_demand
-    assert router.release(route).state == "ttl-managed"
+    with ownership.model_execution_scope(operation="route-lifecycle-test"):
+        assert router.prepare(route).managed_on_demand
+        assert router.release(route).state == "ttl-managed"
     assert backend.lifecycle == [("load", "daily"), ("unload", "daily")]
     assert routing.load_route(route.id).state == "ready"
+
+
+def test_runtime_lifecycle_cannot_bypass_model_execution_owner(route_state):
+    backend = Backend()
+    router = routing.LocalRuntimeRouter({}, backend_factory=lambda model, cfg: backend)
+    route = router.resolve("general")
+    with pytest.raises(routing.RuntimeRouteUnavailable, match="requires model execution"):
+        router.prepare(route)
+    with pytest.raises(routing.RuntimeRouteUnavailable, match="requires model execution"):
+        router.release(route)
+    assert backend.lifecycle == []
 
 
 def test_unhealthy_or_insufficient_binding_is_explicitly_unavailable(route_state):

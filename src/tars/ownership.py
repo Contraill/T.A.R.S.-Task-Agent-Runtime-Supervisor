@@ -13,6 +13,9 @@ from .state_store import connect, ensure_state_store, json_dumps, now_utc, trans
 
 
 _CURRENT_OWNER = ContextVar("tars_current_owner", default=None)
+_MODEL_EXECUTION_OWNER = ContextVar("tars_model_execution_owner", default=None)
+
+MODEL_EXECUTION_RESOURCE = ("gpu-slot", "local-inference:0")
 
 
 def _process_start(pid: int) -> str:
@@ -38,6 +41,10 @@ class Owner:
 
 def current_owner() -> Owner | None:
     return _CURRENT_OWNER.get()
+
+
+def model_execution_owner() -> Owner | None:
+    return _MODEL_EXECUTION_OWNER.get()
 
 
 @contextmanager
@@ -169,6 +176,36 @@ def active(resource_type, resource_key) -> bool:
         ).fetchone()
     return bool(row and row["expires_at"] > now_utc()
                 and owner_alive(row["owner_pid"], row["owner_start"]))
+
+
+@contextmanager
+def model_execution_scope(*, operation, lease_seconds=30.0, timeout=30.0,
+                          metadata=None):
+    """Own every managed-runtime touch, reusing only this exact lexical owner."""
+    existing = model_execution_owner()
+    resource_type, resource_key = MODEL_EXECUTION_RESOURCE
+    if existing is not None:
+        if not held_by(resource_type, resource_key, existing):
+            raise RuntimeError("model execution ownership was lost")
+        yield existing
+        return
+
+    owner = Owner.create("model-execution")
+    details = {"operation": str(operation)} | dict(metadata or {})
+    if not acquire(
+        resource_type, resource_key, owner,
+        lease_seconds=lease_seconds, timeout=timeout, metadata=details,
+    ):
+        raise RuntimeError("local inference slot is busy")
+    token = _MODEL_EXECUTION_OWNER.set(owner)
+    try:
+        with Heartbeat(
+            resource_type, resource_key, owner, lease_seconds=lease_seconds,
+        ):
+            yield owner
+    finally:
+        _MODEL_EXECUTION_OWNER.reset(token)
+        release(resource_type, resource_key, owner)
 
 
 @contextmanager
