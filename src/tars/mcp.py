@@ -9,6 +9,7 @@ import subprocess
 import threading
 import select
 import re
+import time
 from urllib.request import Request
 import urllib.error
 import urllib.request
@@ -17,6 +18,7 @@ import uuid
 
 from . import __version__
 from .policy import ScopeRequest, canonical_path, normalize_network_target, redact
+from .process_supervision import spawn_supervised
 from .state_store import (connect, ensure_state_store, json_dumps, json_loads,
                           now_utc, transaction)
 from .tool_core import ToolResult, ToolRuntime
@@ -582,14 +584,58 @@ class StdioTransport:
         resolved = store.resolve_many(config.get("env", {}), consumer=consumer)
         env.update(resolved)
         self.secret_values = tuple(resolved.values())
-        self.process = popen(config["argv"], cwd=config.get("cwd") or None, env=env,
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, text=True, bufsize=1)
+        self.supervised = spawn_supervised(
+            config["argv"], cwd=config.get("cwd") or None, env=env, popen=popen,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        self.process = self.supervised.process
         self.lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._quiesced = threading.Event()
+        self._stderr_lock = threading.Lock()
+        self._stderr_tail_value = ""
         self.timeout = float(config.get("timeout", 30))
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, name=f"tars-mcp-stderr-{self.process.pid}",
+            daemon=True,
+        )
+        try:
+            self._stderr_thread.start()
+        except Exception:
+            try:
+                self.supervised.stop(timeout=5)
+            finally:
+                self.supervised.close_control()
+                for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+                self.secret_values = ()
+            raise
+
+    def _drain_stderr(self):
+        try:
+            for chunk in iter(lambda: self.process.stderr.read(4096), ""):
+                safe = _redact_secret_values(chunk, self.secret_values)
+                with self._stderr_lock:
+                    self._stderr_tail_value = (self._stderr_tail_value + safe)[-65_536:]
+        finally:
+            try:
+                self.process.stderr.close()
+            except (OSError, ValueError):
+                pass
+
+    def _stderr_tail(self):
+        with self._stderr_lock:
+            return self._stderr_tail_value[-4096:]
 
     def request(self, payload):
         with self.lock:
+            if self._closed.is_set():
+                raise RuntimeError("MCP stdio transport is closed")
             self.process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
             self.process.stdin.flush()
             ready, _, _ = select.select([self.process.stdout], [], [], self.timeout)
@@ -597,17 +643,50 @@ class StdioTransport:
                 raise TimeoutError("MCP stdio request timed out")
             line = self.process.stdout.readline()
         if not line:
-            error = self.process.stderr.read(4096)
+            error = self._stderr_tail()
             raise RuntimeError("MCP stdio server closed" + (f": {error}" if error else ""))
         return json.loads(line)
 
-    def close(self):
-        if self.process.poll() is None:
-            self.process.terminate()
+    @staticmethod
+    def _close_stream_descriptor(stream):
+        if stream is None:
+            return
+        try:
+            os.close(stream.fileno())
+        except (OSError, ValueError):
+            pass
+
+    def close(self, timeout=5.0):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._close_lock:
+            if self._quiesced.is_set():
+                return True
+            self._closed.set()
+            self._close_stream_descriptor(self.process.stdin)
+            stop_error = None
             try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+                self.supervised.stop(timeout=max(0.1, deadline - time.monotonic()))
+            except Exception as exc:
+                stop_error = exc
+            finally:
+                self._close_stream_descriptor(self.process.stdout)
+                acquired = self.lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+                if acquired:
+                    self.lock.release()
+                self.supervised.close_control()
+            self._stderr_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+            self.secret_values = ()
+            if (stop_error is not None or not acquired or self._stderr_thread.is_alive()
+                    or self.process.poll() is None):
+                raise RuntimeError(
+                    "MCP stdio transport did not quiesce before shutdown") from stop_error
+            self._quiesced.set()
+            return True
 
 
 class StreamableHTTPTransport:

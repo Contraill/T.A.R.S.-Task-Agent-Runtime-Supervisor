@@ -8,7 +8,6 @@ import select
 import signal as signals
 import shlex
 import subprocess
-import sys
 import threading
 import uuid
 
@@ -17,88 +16,10 @@ from .execution_backends import ExecutionRequest, GuardedExecutor, HostBackend, 
 from .action_journal import load_action
 from .ownership import Heartbeat, Owner, claim, owner_gone, process_start, release
 from .policy import ScopeRequest, canonical_path
+from .process_supervision import spawn_supervised
 from .state_store import connect, ensure_state_store, json_loads, now_utc, transaction
 from .tool_core import ToolResult, ToolRuntime
 from .secret_store import SecretStore
-
-
-_PARENT_DEATH_WRAPPER = r"""
-import ctypes
-import os
-import signal
-import subprocess
-import sys
-import threading
-
-expected_parent = int(sys.argv[1])
-ready_fd = int(sys.argv[2])
-control_fd = int(sys.argv[3])
-response_fd = int(sys.argv[4])
-libc = ctypes.CDLL(None, use_errno=True)
-owner_death_signal = signal.SIGRTMIN
-signal.pthread_sigmask(signal.SIG_BLOCK, {owner_death_signal})
-if libc.prctl(1, owner_death_signal) != 0:
-    raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
-if libc.prctl(36, 1) != 0:
-    raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
-child_pgid = 0
-def parent_died(_signum=None, _frame=None):
-    signal.signal(owner_death_signal, signal.SIG_IGN)
-    if child_pgid:
-        try:
-            os.killpg(child_pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    os._exit(128 + owner_death_signal)
-signal.signal(owner_death_signal, parent_died)
-def user_signal(_signum=None, _frame=None):
-    pass
-for user_signal_number in (
-        signal.SIGTERM, signal.SIGINT, signal.SIGHUP,
-        signal.SIGUSR1, signal.SIGUSR2):
-    signal.signal(user_signal_number, user_signal)
-if os.getppid() != expected_parent:
-    parent_died()
-child = subprocess.Popen(sys.argv[5:], start_new_session=True)
-child_pgid = child.pid
-def child_start():
-    value = open(f"/proc/{child.pid}/stat", encoding="utf-8").read()
-    return value[value.rfind(")") + 2:].split()[19]
-def control_process():
-    allowed = {
-        "TERM": signal.SIGTERM, "INT": signal.SIGINT, "HUP": signal.SIGHUP,
-        "USR1": signal.SIGUSR1, "USR2": signal.SIGUSR2,
-        "STOP": signal.SIGSTOP, "CONT": signal.SIGCONT, "KILL": signal.SIGKILL,
-    }
-    with os.fdopen(control_fd, "rb", closefd=True) as requests:
-        with os.fdopen(response_fd, "wb", closefd=True) as responses:
-            for line in requests:
-                name = line.rstrip(b"\r\n").decode("ascii", errors="replace")
-                number = allowed.get(name)
-                if number is None:
-                    responses.write(b"invalid\n")
-                    responses.flush()
-                    continue
-                try:
-                    os.killpg(child_pgid, number)
-                except ProcessLookupError:
-                    outcome = b"already-exited\n"
-                else:
-                    outcome = b"dispatched\n"
-                responses.write(outcome)
-                responses.flush()
-threading.Thread(target=control_process, daemon=True).start()
-signal.pthread_sigmask(signal.SIG_UNBLOCK, {owner_death_signal})
-os.write(ready_fd, (str(child_pgid) + ":" + child_start() + "\n").encode("ascii"))
-os.close(ready_fd)
-returncode = child.wait()
-while True:
-    try:
-        os.wait()
-    except ChildProcessError:
-        break
-raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
-"""
 
 
 _USER_PROCESS_SIGNALS = {
@@ -203,17 +124,9 @@ class ProcessManager:
         stdout_path.chmod(0o600)
         stderr_path.chmod(0o600)
         argv = ["/bin/bash", "-lc", request.argv[0]] if request.shell else list(request.argv)
-        ready_read, ready_write = os.pipe()
-        control_read, control_write = os.pipe()
-        response_read, response_write = os.pipe()
-        managed_argv = [sys.executable, "-c", _PARENT_DEATH_WRAPPER,
-                        str(os.getpid()), str(ready_write), str(control_read),
-                        str(response_write), *argv]
         environment = os.environ.copy()
         process = None
-        business_pid = None
-        business_start = ""
-        supervisor_start = ""
+        supervised = None
         provenance_owner = Owner.create("managed-process")
         provenance_heartbeat = None
         secrets = ()
@@ -222,29 +135,16 @@ class ProcessManager:
                 request.environment_refs, consumer="execution:background")
             environment.update(resolved)
             secrets = tuple(environment[name].encode() for name in request.environment_refs)
-            process = subprocess.Popen(
-                managed_argv, cwd=cwd, env=environment, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-                pass_fds=(ready_write, control_read, response_write),
+            supervised = spawn_supervised(
+                argv, cwd=cwd, env=environment, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            os.close(ready_write)
-            ready_write = -1
-            os.close(control_read)
-            control_read = -1
-            os.close(response_write)
-            response_write = -1
-            readable, _, _ = select.select((ready_read,), (), (), 5.0)
-            ready_payload = os.read(ready_read, 128) if readable else b""
-            try:
-                pid_text, business_start = ready_payload.strip().decode("ascii").split(":", 1)
-                business_pid = int(pid_text)
-            except (TypeError, ValueError, UnicodeError):
-                business_pid = None
-                business_start = ""
-            supervisor_start = process_start(process.pid)
-            if (not business_pid or business_pid <= 1 or not business_start
-                    or not supervisor_start):
-                raise RuntimeError("managed process wrapper did not confirm child startup")
+            process = supervised.process
+            business_pid = supervised.child_pid
+            business_start = supervised.child_start
+            supervisor_start = supervised.supervisor_start
+            control_write = supervised.control_write
+            response_read = supervised.response_read
             metadata = {
                 "action_id": actions[-1].id, "task_id": task_id,
                 "session_id": session_id, "supervisor_pid": process.pid,
@@ -270,33 +170,17 @@ class ProcessManager:
                 release("managed-process", process_id, provenance_owner)
             except Exception:
                 pass
-            if process is not None and process.poll() is None:
+            if supervised is not None:
                 try:
-                    os.kill(process.pid, signals.SIGRTMIN)
-                except ProcessLookupError:
+                    supervised.stop(timeout=5)
+                except Exception:
                     pass
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.kill(process.pid, signals.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait(timeout=5)
-            for descriptor in (control_write, response_read):
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+                finally:
+                    supervised.close_control()
             stdout_handle.close()
             stderr_handle.close()
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
-        finally:
-            os.close(ready_read)
-            for descriptor in (ready_write, control_read, response_write):
-                if descriptor >= 0:
-                    os.close(descriptor)
         record = ManagedProcess(
             process_id, process, business_pid, business_start, business_pid,
             supervisor_start, request.argv, cwd, "host", _stamp(), stdout_path,

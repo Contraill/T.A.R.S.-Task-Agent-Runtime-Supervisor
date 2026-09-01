@@ -30,7 +30,7 @@ def _start_background_then_exit(database, state_root, log_root, cwd, output):
     )
     business_code = (
         "import os,subprocess,sys,time; from pathlib import Path; "
-        f"subprocess.Popen([sys.executable,'-c',{descendant_code!r}]); "
+        f"subprocess.Popen([sys.executable,'-c',{descendant_code!r}],start_new_session=True); "
         f"Path({str(business_pid_path)!r}).write_text(str(os.getpid())); "
         "time.sleep(60)"
     )
@@ -69,7 +69,7 @@ def _start_background_signal_then_wait(database, state_root, log_root, cwd,
     business_code = (
         "import os,signal,subprocess,sys,time; from pathlib import Path; "
         f"[signal.signal(value,signal.SIG_IGN) for value in {ignored}]; "
-        f"subprocess.Popen([sys.executable,'-c',{descendant_code!r}]); "
+        f"subprocess.Popen([sys.executable,'-c',{descendant_code!r}],start_new_session=True); "
         f"Path({str(business_pid_path)!r}).write_text(str(os.getpid())); "
         "time.sleep(60)"
     )
