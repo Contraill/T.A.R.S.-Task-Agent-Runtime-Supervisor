@@ -25,7 +25,7 @@ _INTERVAL = re.compile(r"^(?:every\s+|interval:)(\d+)([smhd]?)$", re.I)
 
 
 def _wake_path() -> Path:
-    return _state_store.STATE_DB_PATH.with_name("scheduler-wake.sock")
+    return _state_store.current_state_db_path().with_name("scheduler-wake.sock")
 
 
 def notify_scheduler() -> bool:

@@ -9,7 +9,8 @@ from pathlib import Path
 import threading
 import uuid
 
-from .state_store import connect, ensure_state_store, json_dumps, now_utc, transaction
+from .state_store import (connect, current_state_db_path, ensure_state_store, json_dumps,
+                          now_utc, state_db_path_scope, transaction)
 
 
 _CURRENT_OWNER = ContextVar("tars_current_owner", default=None)
@@ -347,6 +348,7 @@ class Heartbeat:
         self.stop_event = threading.Event()
         self.error = None
         self.lost = False
+        self.state_db_path = current_state_db_path()
         self.thread = threading.Thread(target=self._run, name="tars-lease-heartbeat", daemon=True)
 
     def __enter__(self):
@@ -363,15 +365,16 @@ class Heartbeat:
                 raise RuntimeError("durable lease ownership was lost")
 
     def _run(self):
-        interval = max(0.5, self.lease_seconds / 3)
-        while not self.stop_event.wait(interval):
-            try:
-                renewed = heartbeat(
-                    self.resource_type, self.resource_key, self.owner,
-                    lease_seconds=self.lease_seconds)
-            except Exception as exc:
-                self.error = exc
-                return
-            if not renewed:
-                self.lost = True
-                return
+        with state_db_path_scope(self.state_db_path):
+            interval = max(0.5, self.lease_seconds / 3)
+            while not self.stop_event.wait(interval):
+                try:
+                    renewed = heartbeat(
+                        self.resource_type, self.resource_key, self.owner,
+                        lease_seconds=self.lease_seconds)
+                except Exception as exc:
+                    self.error = exc
+                    return
+                if not renewed:
+                    self.lost = True
+                    return

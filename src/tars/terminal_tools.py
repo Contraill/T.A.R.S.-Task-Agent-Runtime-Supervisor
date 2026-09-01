@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import wraps
 import os
 from pathlib import Path
 import select
@@ -9,6 +10,7 @@ import signal as signals
 import shlex
 import subprocess
 import threading
+import time
 import uuid
 
 from .config import STATE_ROOT
@@ -16,8 +18,9 @@ from .execution_backends import ExecutionRequest, GuardedExecutor, HostBackend, 
 from .action_journal import load_action
 from .ownership import Heartbeat, Owner, claim, owner_gone, process_start, release
 from .policy import ScopeRequest, canonical_path
-from .process_supervision import spawn_supervised
-from .state_store import connect, ensure_state_store, json_loads, now_utc, transaction
+from .process_supervision import SupervisedProcess, spawn_supervised
+from .state_store import (connect, current_state_db_path, ensure_state_store, json_loads,
+                          now_utc, state_db_path_scope, transaction)
 from .tool_core import ToolResult, ToolRuntime
 from .secret_store import SecretStore
 
@@ -51,6 +54,7 @@ class ManagedProcess:
     task_id: str | None
     session_id: str | None
     provenance_owner: Owner = field(repr=False)
+    supervision: SupervisedProcess = field(repr=False)
     control_write: int = field(repr=False)
     response_read: int = field(repr=False)
     control_lock: threading.Lock = field(default_factory=threading.Lock, repr=False,
@@ -65,8 +69,17 @@ def _stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _manager_state(method):
+    @wraps(method)
+    def bound(self, *args, **kwargs):
+        with state_db_path_scope(self.state_db_path):
+            return method(self, *args, **kwargs)
+    return bound
+
+
 class ProcessManager:
     def __init__(self, *, log_root=None, runtime=None, secret_store=None):
+        self.state_db_path = current_state_db_path()
         self.log_root = Path(log_root or (STATE_ROOT / "process-logs"))
         self.log_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.log_root.chmod(0o700)
@@ -76,7 +89,11 @@ class ProcessManager:
         self._handles = {}
         self._watch_errors = {}
         self._lock = threading.Lock()
-        self._recover_dead_authority()
+        self._lifecycle = threading.Condition()
+        self._starting = 0
+        self._closed = False
+        with state_db_path_scope(self.state_db_path):
+            self._recover_dead_authority()
 
     @staticmethod
     def _recover_dead_authority():
@@ -95,7 +112,23 @@ class ProcessManager:
                     (row["resource_key"], row["owner_token"]),
                 )
 
+    @_manager_state
     def start(self, request, *, approval_id=None, task_id=None, session_id=None):
+        with self._lifecycle:
+            if self._closed:
+                raise RuntimeError("process manager is closed")
+            self._starting += 1
+        try:
+            return self._start(
+                request, approval_id=approval_id, task_id=task_id,
+                session_id=session_id,
+            )
+        finally:
+            with self._lifecycle:
+                self._starting -= 1
+                self._lifecycle.notify_all()
+
+    def _start(self, request, *, approval_id=None, task_id=None, session_id=None):
         cwd = canonical_path(request.cwd or os.getcwd())
         path_request = ScopeRequest(
             "fs.read", "read", cwd, task_id=task_id, session_id=session_id,
@@ -185,7 +218,7 @@ class ProcessManager:
             process_id, process, business_pid, business_start, business_pid,
             supervisor_start, request.argv, cwd, "host", _stamp(), stdout_path,
             stderr_path, actions[-1].id, task_id, session_id, provenance_owner,
-            control_write, response_read,
+            supervised, control_write, response_read,
         )
         def pump(source, destination):
             try:
@@ -249,7 +282,13 @@ class ProcessManager:
         }
 
     def _verify_provenance(self, record):
-        if type(record) is not ManagedProcess or not isinstance(record.process, subprocess.Popen):
+        if (type(record) is not ManagedProcess
+                or type(record.supervision) is not SupervisedProcess
+                or not isinstance(record.process, subprocess.Popen)
+                or record.supervision.process is not record.process
+                or record.supervision.child_pid != record.business_pid
+                or record.supervision.child_start != record.business_start
+                or record.supervision.supervisor_start != record.supervisor_start):
             raise PermissionError("process record has no trusted creation provenance")
         with connect() as conn:
             row = conn.execute(
@@ -302,6 +341,7 @@ class ProcessManager:
         self._verify_context(record, task_id=task_id, session_id=session_id)
         return record
 
+    @_manager_state
     def _watch(self, record):
         record.process.wait()
         try:
@@ -310,6 +350,7 @@ class ProcessManager:
             with self._lock:
                 self._watch_errors[record.id] = str(exc)
 
+    @_manager_state
     def _refresh(self, record):
         code = record.process.poll()
         handles = None
@@ -335,11 +376,7 @@ class ProcessManager:
                         "stderr_ref": str(record.stderr_path),
                     })
                 finally:
-                    for descriptor in (record.control_write, record.response_read):
-                        try:
-                            os.close(descriptor)
-                        except OSError:
-                            pass
+                    record.supervision.close_control()
                     try:
                         handles[4].__exit__(None, None, None)
                     finally:
@@ -369,6 +406,7 @@ class ProcessManager:
                           action_ids=tuple(action.id for action in actions),
                           evidence_ids=(evidence.id,))
 
+    @_manager_state
     def list(self, *, task_id=None, session_id=None):
         with self._lock:
             records = tuple(self._processes.values())
@@ -396,6 +434,7 @@ class ProcessManager:
                 "completed_at": record.completed_at,
                 "management_error": self._watch_errors.get(record.id, "")}
 
+    @_manager_state
     def poll(self, process_id, *, task_id=None, session_id=None):
         record = self._owned(process_id, task_id=task_id, session_id=session_id)
         return self._read_result(
@@ -403,6 +442,7 @@ class ProcessManager:
             task_id=task_id, session_id=session_id,
         )
 
+    @_manager_state
     def wait(self, process_id, timeout=None, *, task_id=None, session_id=None):
         record = self._owned(process_id, task_id=task_id, session_id=session_id)
         def producer():
@@ -414,6 +454,7 @@ class ProcessManager:
         return self._read_result("process.wait", process_id, producer,
                                  task_id=task_id, session_id=session_id)
 
+    @_manager_state
     def logs(self, process_id, *, stream="stdout", offset=0, limit=64_000,
              task_id=None, session_id=None):
         record = self._owned(process_id, task_id=task_id, session_id=session_id)
@@ -429,6 +470,7 @@ class ProcessManager:
         return self._read_result("process.logs", process_id, producer,
                                  task_id=task_id, session_id=session_id)
 
+    @_manager_state
     def write(self, process_id, data, *, approval_id=None, task_id=None, session_id=None):
         record = self._owned(process_id, task_id=task_id, session_id=session_id)
         request = ScopeRequest(
@@ -449,6 +491,7 @@ class ProcessManager:
                           action_ids=tuple(action.id for action in actions),
                           evidence_ids=(evidence.id,))
 
+    @_manager_state
     def signal(self, process_id, signal_name="TERM", *, approval_id=None,
                task_id=None, session_id=None):
         return self._send_signal(
@@ -528,8 +571,42 @@ class ProcessManager:
                           action_ids=tuple(action.id for action in actions),
                           evidence_ids=(evidence.id,))
 
+    @_manager_state
     def kill(self, process_id, **kwargs):
         return self._send_signal(process_id, "KILL", tool="process.kill", **kwargs)
+
+    @_manager_state
+    def close(self, timeout=10.0):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        errors = []
+        with self._lifecycle:
+            self._closed = True
+            self._lifecycle.notify_all()
+            while self._starting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    errors.append("process startup did not quiesce")
+                    break
+                self._lifecycle.wait(remaining)
+        with self._lock:
+            records = tuple(self._processes.values())
+        for record in records:
+            try:
+                self._verify_provenance(record)
+                remaining = deadline - time.monotonic()
+                if record.process.poll() is None:
+                    if remaining <= 0:
+                        raise TimeoutError("managed process shutdown deadline expired")
+                    record.supervision.stop(timeout=max(0.1, remaining))
+                self._refresh(record)
+                remaining = deadline - time.monotonic()
+                if not record.finalized.wait(timeout=max(0.0, remaining)):
+                    raise TimeoutError("managed process finalization did not quiesce")
+            except Exception as exc:
+                errors.append(f"{record.id}: {exc}")
+        if errors:
+            raise RuntimeError("process manager shutdown was incomplete: " + "; ".join(errors))
+        return True
 
 
 class TerminalTools:

@@ -188,9 +188,10 @@ def search(query, *, scope=None, kind=None, limit=10, initialize=True):
         ensure_state_store()
     else:
         from . import state_store
-        if not state_store.STATE_DB_PATH.is_file():
+        database = state_store.current_state_db_path()
+        if not database.is_file():
             return []
-        readonly_path = state_store.STATE_DB_PATH
+        readonly_path = database
     query = str(query).strip()
     if not query:
         return []

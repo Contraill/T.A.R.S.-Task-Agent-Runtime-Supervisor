@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
 import os
@@ -8,6 +9,8 @@ import sqlite3
 from pathlib import Path
 
 from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
+
+_STATE_DB_PATH_OVERRIDE = ContextVar("tars_state_db_path", default=None)
 
 SCHEMA_VERSION = 19
 BASE_SCHEMA_VERSION = 3
@@ -68,25 +71,39 @@ def json_loads(value, default=None):
         return default
 
 
+def current_state_db_path() -> Path:
+    return Path(_STATE_DB_PATH_OVERRIDE.get() or STATE_DB_PATH)
+
+
+@contextmanager
+def state_db_path_scope(path):
+    token = _STATE_DB_PATH_OVERRIDE.set(Path(path))
+    try:
+        yield current_state_db_path()
+    finally:
+        _STATE_DB_PATH_OVERRIDE.reset(token)
+
+
 def connect() -> sqlite3.Connection:
-    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(STATE_DB_PATH.parent, 0o700)
-    if not STATE_DB_PATH.exists():
+    database = current_state_db_path()
+    database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(database.parent, 0o700)
+    if not database.exists():
         try:
-            fd = os.open(STATE_DB_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            fd = os.open(database, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             pass
         else:
             os.close(fd)
-    os.chmod(STATE_DB_PATH, 0o600)
-    conn = sqlite3.connect(STATE_DB_PATH, timeout=10.0)
+    os.chmod(database, 0o600)
+    conn = sqlite3.connect(database, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 10000")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     for suffix in ("", "-wal", "-shm"):
-        path = Path(str(STATE_DB_PATH) + suffix)
+        path = Path(str(database) + suffix)
         if path.exists():
             os.chmod(path, 0o600)
     return conn
@@ -877,7 +894,7 @@ def migrate_connection(conn: sqlite3.Connection) -> int:
 def ensure_state_store() -> Path:
     ensure_state_store_no_migration()
     migrate_legacy_task_store()
-    return STATE_DB_PATH
+    return current_state_db_path()
 
 
 def get_meta(key: str, default=None):
@@ -901,7 +918,8 @@ def set_meta(key: str, value) -> None:
 
 
 def ensure_state_store_no_migration() -> Path:
-    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    database = current_state_db_path()
+    database.parent.mkdir(parents=True, exist_ok=True)
     conn = connect()
     try:
         migrate_connection(conn)
@@ -913,7 +931,7 @@ def ensure_state_store_no_migration() -> Path:
             )
     finally:
         conn.close()
-    return STATE_DB_PATH
+    return database
 
 
 def health() -> dict:
@@ -947,7 +965,7 @@ def health() -> dict:
             "schema_version": version,
             "expected_schema_version": SCHEMA_VERSION,
             "counts": counts,
-            "path": str(STATE_DB_PATH),
+            "path": str(current_state_db_path()),
         }
     finally:
         conn.close()

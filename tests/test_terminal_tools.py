@@ -4,6 +4,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import threading
 from dataclasses import replace
 
@@ -126,10 +127,14 @@ def terminal(monkeypatch, tmp_path):
     monkeypatch.setattr(state_store, "TASK_INDEX_PATH", tmp_path / "index")
     policy.add_rule("sandbox_escape", "allow", target="host")
     manager = terminal_tools.ProcessManager(log_root=tmp_path / "logs")
-    return terminal_tools.TerminalTools(
+    tools = terminal_tools.TerminalTools(
         executor=execution.GuardedExecutor({"host": execution.HostBackend()}),
         processes=manager, output_limit=32, log_root=tmp_path / "foreground-logs",
-    ), tmp_path
+    )
+    try:
+        yield tools, tmp_path
+    finally:
+        manager.close(timeout=10)
 
 
 def _approve(tool, effect, target, arguments=None, *, destructive=False,
@@ -356,7 +361,7 @@ def test_fake_process_records_cannot_control_unrelated_process(terminal):
             process_group_id=os.getpgid(unrelated.pid),
             supervisor_start=terminal_tools.process_start(unrelated.pid),
         )
-        with pytest.raises(PermissionError, match="durable provenance"):
+        with pytest.raises(PermissionError, match="trusted creation provenance"):
             tools.processes.signal(fake_id, "TERM")
 
         tools.processes._processes[process_id] = replace(
@@ -365,7 +370,7 @@ def test_fake_process_records_cannot_control_unrelated_process(terminal):
             process_group_id=os.getpgid(unrelated.pid),
             supervisor_start=terminal_tools.process_start(unrelated.pid),
         )
-        with pytest.raises(PermissionError, match="durable provenance"):
+        with pytest.raises(PermissionError, match="trusted creation provenance"):
             tools.processes.kill(process_id)
         assert unrelated.poll() is None
     finally:
@@ -511,6 +516,126 @@ def test_signal_after_exit_does_not_fabricate_dispatch(terminal):
     assert truth.succeeded
     assert truth.data["requested"] is False
     assert truth.data["outcome"] == "already-exited"
+
+
+def test_process_manager_async_lifetime_stays_bound_to_creation_database(
+        monkeypatch, tmp_path):
+    first_database = tmp_path / "first" / "state.sqlite3"
+    second_database = tmp_path / "second" / "state.sqlite3"
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", first_database)
+    monkeypatch.setattr(state_store, "TASK_ROOT", tmp_path / "legacy")
+    monkeypatch.setattr(state_store, "TASK_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setattr(state_store, "TASK_INDEX_PATH", tmp_path / "index")
+    policy.add_rule("sandbox_escape", "allow", target="host")
+    manager = terminal_tools.ProcessManager(log_root=tmp_path / "logs")
+    started = manager.start(execution.ExecutionRequest(
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+        cwd=str(tmp_path), allowed_paths=(str(tmp_path,),),
+    ))
+    record = manager._processes[started.data["process_id"]]
+
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", second_database)
+    state_store.ensure_state_store()
+    assert manager.close(timeout=10) is True
+    assert record.finalized.is_set() and not manager._watch_errors
+
+    with sqlite3.connect(first_database) as first:
+        assert first.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert first.execute(
+            "SELECT state FROM action_journal WHERE id=?", (record.action_id,)
+        ).fetchone()[0] in {"succeeded", "failed"}
+        assert first.execute(
+            "SELECT COUNT(*) FROM resource_leases WHERE resource_key=?",
+            (record.id,),
+        ).fetchone()[0] == 0
+    with sqlite3.connect(second_database) as second:
+        assert second.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert second.execute(
+            "SELECT COUNT(*) FROM action_journal WHERE id=?", (record.action_id,)
+        ).fetchone()[0] == 0
+
+
+def test_lease_heartbeat_keeps_its_creation_database_context(monkeypatch, tmp_path):
+    first_database = tmp_path / "heartbeat-first" / "state.sqlite3"
+    second_database = tmp_path / "heartbeat-second" / "state.sqlite3"
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", first_database)
+    owner = terminal_tools.Owner.create("database-bound-heartbeat")
+    assert terminal_tools.claim("fixture", "resource", owner, lease_seconds=1)
+    with sqlite3.connect(first_database) as first:
+        original = first.execute(
+            "SELECT heartbeat_at FROM resource_leases WHERE resource_type='fixture' "
+            "AND resource_key='resource'"
+        ).fetchone()[0]
+    heartbeat = terminal_tools.Heartbeat(
+        "fixture", "resource", owner, lease_seconds=1)
+    heartbeat.__enter__()
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", second_database)
+    state_store.ensure_state_store()
+    deadline = time.monotonic() + 3
+    changed = False
+    while time.monotonic() < deadline:
+        with sqlite3.connect(first_database) as first:
+            changed = first.execute(
+                "SELECT heartbeat_at FROM resource_leases WHERE resource_type='fixture' "
+                "AND resource_key='resource'"
+            ).fetchone()[0] != original
+        if changed:
+            break
+        time.sleep(0.01)
+    heartbeat.__exit__(None, None, None)
+    assert changed and not heartbeat.lost and heartbeat.error is None
+    with sqlite3.connect(second_database) as second:
+        assert second.execute(
+            "SELECT COUNT(*) FROM resource_leases WHERE resource_type='fixture' "
+            "AND resource_key='resource'"
+        ).fetchone()[0] == 0
+    with state_store.state_db_path_scope(first_database):
+        terminal_tools.release("fixture", "resource", owner)
+
+
+def test_process_manager_close_fences_concurrent_start(monkeypatch, tmp_path):
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", tmp_path / "state.sqlite3")
+    monkeypatch.setattr(state_store, "TASK_ROOT", tmp_path / "legacy")
+    monkeypatch.setattr(state_store, "TASK_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setattr(state_store, "TASK_INDEX_PATH", tmp_path / "index")
+    policy.add_rule("sandbox_escape", "allow", target="host")
+    manager = terminal_tools.ProcessManager(log_root=tmp_path / "logs")
+    entered = threading.Event()
+    release_start = threading.Event()
+    actual_start = manager._start
+
+    def delayed_start(*args, **kwargs):
+        entered.set()
+        assert release_start.wait(timeout=5)
+        return actual_start(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_start", delayed_start)
+    outcome = {}
+    starter = threading.Thread(target=lambda: outcome.setdefault(
+        "started", manager.start(execution.ExecutionRequest(
+            (sys.executable, "-c", "import time; time.sleep(30)"),
+            cwd=str(tmp_path), allowed_paths=(str(tmp_path),),
+        ))))
+    starter.start()
+    assert entered.wait(timeout=5)
+    closer = threading.Thread(target=lambda: outcome.setdefault(
+        "closed", manager.close(timeout=10)))
+    closer.start()
+    with manager._lifecycle:
+        assert manager._lifecycle.wait_for(lambda: manager._closed, timeout=5)
+    assert closer.is_alive()
+    release_start.set()
+    starter.join(timeout=10)
+    closer.join(timeout=10)
+    assert not starter.is_alive() and not closer.is_alive()
+    assert outcome["closed"] is True
+    record = manager._processes[outcome["started"].data["process_id"]]
+    assert record.finalized.is_set() and record.process.poll() is not None
+    with pytest.raises(RuntimeError, match="closed"):
+        manager.start(execution.ExecutionRequest(
+            (sys.executable, "-c", "pass"), cwd=str(tmp_path),
+            allowed_paths=(str(tmp_path),),
+        ))
 
 
 def test_background_process_dies_with_owning_manager_process(monkeypatch, tmp_path):
