@@ -298,10 +298,14 @@ def test_process_kill_is_destructive_and_denied_without_approval(terminal):
 
 def test_process_operations_require_exact_trusted_task_origin(terminal):
     tools, root = terminal
-    owner = tasks.create_task("own managed process", "general")
-    stranger = tasks.create_task("must not control another task process", "general")
     owner_session = sessions.create_session()
     stranger_session = sessions.create_session()
+    owner = tasks.create_task(
+        "own managed process", "general",
+        conversation_id=owner_session.conversation_id)
+    stranger = tasks.create_task(
+        "must not control another task process", "general",
+        conversation_id=stranger_session.conversation_id)
     started = tools.run(
         (sys.executable, "-c", "import time; time.sleep(30)"), cwd=str(root),
         allowed_paths=(str(root),), background=True, task_id=owner.id,

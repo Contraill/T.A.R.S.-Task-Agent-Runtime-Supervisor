@@ -171,18 +171,25 @@ def test_older_schema_bundle_is_migrated_in_the_real_restore_path(source, tmp_pa
     manifest = json.loads(entries.pop("manifest.json"))
     database = tmp_path / "older.sqlite3"
     database.write_bytes(entries[backup.DB_MEMBER])
+    older_version = state_store.SCHEMA_VERSION - 1
     conn = sqlite3.connect(database)
     try:
-        conn.execute("DROP TABLE control_cancellations")
+        for name, introduced in state_store._SCHEMA_INTRODUCED.items():
+            if introduced > older_version:
+                object_type = conn.execute(
+                    "SELECT type FROM sqlite_master WHERE name=?", (name,),
+                ).fetchone()[0]
+                conn.execute(f'DROP {object_type.upper()} "{name}"')
         conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
-                     (str(state_store.SCHEMA_VERSION - 1),))
+                     (str(older_version),))
         conn.commit()
         assert conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='control_cancellations'").fetchone() is None
+            "SELECT 1 FROM sqlite_master WHERE name='messages_lineage_insert'"
+        ).fetchone() is None
     finally:
         conn.close()
     entries[backup.DB_MEMBER] = database.read_bytes()
-    manifest["schema_version"] = state_store.SCHEMA_VERSION - 1
+    manifest["schema_version"] = older_version
     manifest["files"][backup.DB_MEMBER] = {
         "size": len(entries[backup.DB_MEMBER]),
         "sha256": hashlib.sha256(entries[backup.DB_MEMBER]).hexdigest(),
@@ -201,7 +208,8 @@ def test_older_schema_bundle_is_migrated_in_the_real_restore_path(source, tmp_pa
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(
                 state_store.SCHEMA_VERSION)
         assert conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='runtime_routes'").fetchone()
+            "SELECT 1 FROM sqlite_master WHERE name='messages_lineage_insert'"
+        ).fetchone()
     finally:
         conn.close()
 

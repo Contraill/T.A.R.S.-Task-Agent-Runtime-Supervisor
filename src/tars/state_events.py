@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import uuid
 
-from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
+from .state_store import (connect, ensure_state_store, json_dumps, json_loads, now_utc,
+                          resolve_lineage_in_transaction, transaction)
 
 EVENT_TYPES = {
     "user_message", "assistant_response", "model_invocation", "tool_proposal",
@@ -55,6 +56,9 @@ def insert_state_event(conn, event_type, message="", *, session_id=None,
     """Insert an event using the caller's transaction for atomic state changes."""
     if event_type not in EVENT_TYPES:
         raise ValueError(f"invalid state event type: {event_type}")
+    conversation_id = resolve_lineage_in_transaction(
+        conn, task_id=task_id, session_id=session_id,
+        conversation_id=conversation_id)
     event_uuid = "sev-" + uuid.uuid4().hex
     conn.execute(
         """INSERT INTO state_events(event_uuid,session_id,conversation_id,task_id,

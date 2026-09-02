@@ -428,7 +428,8 @@ def test_real_v18_layout_adds_control_cancellation_schema(isolated_state):
     state_store.ensure_state_store_no_migration()
     with sqlite3.connect(isolated_state) as conn:
         assert conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "19"
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(
+                state_store.SCHEMA_VERSION)
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='control_cancellations'").fetchone()
         raced = conn.execute(

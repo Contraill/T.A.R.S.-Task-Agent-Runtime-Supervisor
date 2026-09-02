@@ -13,7 +13,7 @@ from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
 
 _STATE_DB_PATH_OVERRIDE = ContextVar("tars_state_db_path", default=None)
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 BASE_SCHEMA_VERSION = 3
 
 # Schema objects were introduced monotonically in the public state-store history.
@@ -52,6 +52,27 @@ _SCHEMA_INTRODUCED = {
     "idx_runtime_routes_task_created": 17,
     "resource_leases": 18, "idx_resource_leases_expiry": 18,
     "control_cancellations": 19, "idx_control_cancellations_state": 19,
+    "messages_lineage_insert": 20, "messages_lineage_update": 20,
+    "sessions_conversation_immutable": 20,
+    "tasks_lineage_insert": 20, "tasks_lineage_update": 20,
+    "tasks_conversation_propagate": 20,
+    "state_events_lineage_insert": 20, "state_events_lineage_update": 20,
+    "task_events_lineage_insert": 20, "task_events_lineage_update": 20,
+    "evidence_lineage_insert": 20, "evidence_records_immutable_update": 20,
+    "evidence_records_immutable_delete": 20,
+    "checkpoints_lineage_insert": 20,
+    "context_projections_lineage_insert": 20,
+    "context_projections_lineage_update": 20,
+    "context_epochs_lineage_insert": 20, "context_epochs_lineage_update": 20,
+    "task_runs_lineage_insert": 20, "task_runs_lineage_update": 20,
+    "task_controls_lineage_insert": 20, "task_controls_lineage_update": 20,
+    "approvals_lineage_insert": 20, "approvals_lineage_update": 20,
+    "action_journal_lineage_insert": 20, "action_journal_lineage_update": 20,
+    "delegations_lineage_insert": 20, "delegations_lineage_update": 20,
+    "delegation_contracts_lineage_insert": 20,
+    "delegation_contracts_lineage_update": 20,
+    "schedule_runs_lineage_insert": 20, "schedule_runs_lineage_update": 20,
+    "handoffs_lineage_insert": 20, "handoffs_lineage_update": 20,
 }
 
 
@@ -70,6 +91,40 @@ def json_loads(value, default=None):
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return default
+
+
+def resolve_lineage_in_transaction(conn, *, task_id=None, session_id=None,
+                                   conversation_id=None):
+    """Resolve one canonical conversation for task/session-linked durable state."""
+    task_conversation = None
+    session_conversation = None
+    if task_id is not None:
+        row = conn.execute(
+            "SELECT conversation_id FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown task: {task_id}")
+        task_conversation = row["conversation_id"]
+    if session_id is not None:
+        row = conn.execute(
+            "SELECT conversation_id FROM sessions WHERE id=?", (session_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown session: {session_id}")
+        session_conversation = row["conversation_id"]
+    if (task_id is not None and session_id is not None
+            and task_conversation != session_conversation):
+        raise ValueError("task and session belong to different conversations")
+    if conversation_id is not None:
+        if task_id is not None and conversation_id != task_conversation:
+            raise ValueError("task does not belong to the supplied conversation")
+        if session_id is not None and conversation_id != session_conversation:
+            raise ValueError("session does not belong to the supplied conversation")
+        if task_id is None and session_id is None and not conn.execute(
+                "SELECT 1 FROM conversations WHERE id=?", (conversation_id,)).fetchone():
+            raise KeyError(f"unknown conversation: {conversation_id}")
+        return conversation_id
+    return task_conversation if task_id is not None else session_conversation
 
 
 def current_state_db_path() -> Path:
@@ -720,6 +775,491 @@ def _schema_sql() -> str:
     );
     CREATE INDEX IF NOT EXISTS idx_routing_task_created
         ON routing_decisions(task_id, created_at DESC);
+
+    CREATE TRIGGER IF NOT EXISTS messages_lineage_insert
+    BEFORE INSERT ON messages
+    WHEN NEW.related_task_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id=NEW.related_task_id
+          AND t.conversation_id IS NEW.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'message task lineage does not match conversation');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_lineage_update
+    BEFORE UPDATE ON messages
+    WHEN NEW.related_task_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id=NEW.related_task_id
+          AND t.conversation_id IS NEW.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'message task lineage does not match conversation');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS sessions_conversation_immutable
+    BEFORE UPDATE OF conversation_id ON sessions
+    WHEN NEW.conversation_id IS NOT OLD.conversation_id
+    BEGIN
+        SELECT RAISE(ABORT, 'session conversation lineage is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS tasks_lineage_insert
+    BEFORE INSERT ON tasks
+    BEGIN
+        SELECT CASE WHEN NEW.parent_task_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM tasks p
+            WHERE p.id=NEW.parent_task_id
+              AND p.conversation_id IS NEW.conversation_id
+        ) THEN RAISE(ABORT, 'child task lineage does not match parent') END;
+        SELECT CASE
+            WHEN NOT json_valid(NEW.evidence_refs_json)
+                THEN RAISE(ABORT, 'task evidence references must be valid JSON')
+            WHEN json_type(NEW.evidence_refs_json) != 'array'
+                THEN RAISE(ABORT, 'task evidence references must be an array')
+        END;
+        SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM json_each(NEW.evidence_refs_json) r
+            WHERE r.type != 'text' OR NOT EXISTS (
+                SELECT 1 FROM evidence_records e
+                WHERE e.id=r.value AND (
+                    e.task_id=NEW.id OR (
+                        NEW.parent_task_id IS NOT NULL
+                        AND e.task_id=NEW.parent_task_id
+                    )
+                )
+            )
+        ) THEN RAISE(ABORT, 'task evidence reference is outside its lineage') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS tasks_lineage_update
+    BEFORE UPDATE ON tasks
+    BEGIN
+        SELECT CASE WHEN NEW.parent_task_id IS NOT OLD.parent_task_id
+            THEN RAISE(ABORT, 'task parent lineage is immutable') END;
+        SELECT CASE WHEN OLD.conversation_id IS NOT NULL
+                         AND NEW.conversation_id IS NOT OLD.conversation_id
+            THEN RAISE(ABORT, 'task conversation lineage is already bound') END;
+        SELECT CASE WHEN NEW.conversation_id IS NOT OLD.conversation_id AND EXISTS (
+            SELECT 1 FROM tasks c
+            WHERE c.parent_task_id=NEW.id
+              AND c.conversation_id IS NOT NEW.conversation_id
+        ) THEN RAISE(ABORT, 'task conversation cannot diverge from child lineage') END;
+        SELECT CASE WHEN NEW.parent_task_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM tasks p
+            WHERE p.id=NEW.parent_task_id
+              AND p.conversation_id IS NEW.conversation_id
+        ) THEN RAISE(ABORT, 'child task lineage does not match parent') END;
+        SELECT CASE
+            WHEN NOT json_valid(NEW.evidence_refs_json)
+                THEN RAISE(ABORT, 'task evidence references must be valid JSON')
+            WHEN json_type(NEW.evidence_refs_json) != 'array'
+                THEN RAISE(ABORT, 'task evidence references must be an array')
+        END;
+        SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM json_each(NEW.evidence_refs_json) r
+            WHERE r.type != 'text' OR NOT EXISTS (
+                SELECT 1 FROM evidence_records e
+                WHERE e.id=r.value AND (
+                    e.task_id=NEW.id OR (
+                        NEW.parent_task_id IS NOT NULL
+                        AND e.task_id=NEW.parent_task_id
+                    )
+                )
+            )
+        ) THEN RAISE(ABORT, 'task evidence reference is outside its lineage') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS tasks_conversation_propagate
+    AFTER UPDATE OF conversation_id ON tasks
+    WHEN OLD.conversation_id IS NULL AND NEW.conversation_id IS NOT NULL
+    BEGIN
+        UPDATE state_events SET conversation_id=NEW.conversation_id
+        WHERE task_id=NEW.id AND conversation_id IS NULL;
+        UPDATE task_events SET conversation_id=NEW.conversation_id
+        WHERE task_id=NEW.id AND conversation_id IS NULL;
+        UPDATE task_runs SET conversation_id=NEW.conversation_id
+        WHERE task_id=NEW.id AND conversation_id IS NULL;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS state_events_lineage_insert
+    BEFORE INSERT ON state_events
+    BEGIN
+        SELECT CASE WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM sessions s
+            WHERE s.id=NEW.session_id
+              AND s.conversation_id IS NEW.conversation_id
+        ) THEN RAISE(ABORT, 'state event session lineage does not match conversation') END;
+        SELECT CASE WHEN NEW.task_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM tasks t
+            WHERE t.id=NEW.task_id
+              AND t.conversation_id IS NEW.conversation_id
+        ) THEN RAISE(ABORT, 'state event task lineage does not match conversation') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS state_events_lineage_update
+    BEFORE UPDATE ON state_events
+    BEGIN
+        SELECT CASE WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM sessions s
+            WHERE s.id=NEW.session_id
+              AND s.conversation_id IS NEW.conversation_id
+        ) THEN RAISE(ABORT, 'state event session lineage does not match conversation') END;
+        SELECT CASE WHEN NEW.task_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM tasks t
+            WHERE t.id=NEW.task_id
+              AND t.conversation_id IS NEW.conversation_id
+        ) THEN RAISE(ABORT, 'state event task lineage does not match conversation') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS task_events_lineage_insert
+    BEFORE INSERT ON task_events
+    WHEN NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id IS NEW.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'task event lineage does not match conversation');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS task_events_lineage_update
+    BEFORE UPDATE ON task_events
+    WHEN NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id IS NEW.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'task event lineage does not match conversation');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS evidence_lineage_insert
+    BEFORE INSERT ON evidence_records
+    WHEN NEW.event_uuid IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM state_events e
+        WHERE e.event_uuid=NEW.event_uuid
+          AND e.task_id IS NEW.task_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'evidence event lineage does not match task');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS evidence_records_immutable_update
+    BEFORE UPDATE ON evidence_records
+    BEGIN
+        SELECT RAISE(ABORT, 'evidence records are immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS evidence_records_immutable_delete
+    BEFORE DELETE ON evidence_records
+    BEGIN
+        SELECT RAISE(ABORT, 'evidence records are immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS checkpoints_lineage_insert
+    BEFORE INSERT ON checkpoints
+    BEGIN
+        SELECT CASE
+            WHEN NOT json_valid(NEW.evidence_refs_json)
+                THEN RAISE(ABORT, 'checkpoint evidence references must be valid JSON')
+            WHEN json_type(NEW.evidence_refs_json) != 'array'
+                THEN RAISE(ABORT, 'checkpoint evidence references must be an array')
+        END;
+        SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM json_each(NEW.evidence_refs_json) r
+            WHERE r.type != 'text' OR NOT EXISTS (
+                SELECT 1 FROM evidence_records e
+                JOIN tasks t ON t.id=NEW.task_id
+                WHERE e.id=r.value AND (
+                    e.task_id=NEW.task_id OR (
+                        t.parent_task_id IS NOT NULL
+                        AND e.task_id=t.parent_task_id
+                    )
+                )
+            )
+        ) THEN RAISE(ABORT, 'checkpoint evidence reference is outside task lineage') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS context_projections_lineage_insert
+    BEFORE INSERT ON context_projections
+    WHEN NEW.task_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id IS NEW.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'context projection lineage does not match task');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS context_projections_lineage_update
+    BEFORE UPDATE ON context_projections
+    WHEN NEW.task_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id IS NEW.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'context projection lineage does not match task');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS context_epochs_lineage_insert
+    BEFORE INSERT ON context_epochs
+    WHEN NOT EXISTS (
+        SELECT 1 FROM tasks t JOIN checkpoints c ON c.id=NEW.checkpoint_id
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id=NEW.conversation_id
+          AND c.task_id=NEW.task_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'context epoch lineage does not match task checkpoint');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS context_epochs_lineage_update
+    BEFORE UPDATE ON context_epochs
+    WHEN NOT EXISTS (
+        SELECT 1 FROM tasks t JOIN checkpoints c ON c.id=NEW.checkpoint_id
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id=NEW.conversation_id
+          AND c.task_id=NEW.task_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'context epoch lineage does not match task checkpoint');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS task_runs_lineage_insert
+    BEFORE INSERT ON task_runs
+    WHEN NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id IS NEW.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'task run lineage does not match conversation');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS task_runs_lineage_update
+    BEFORE UPDATE ON task_runs
+    WHEN NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id IS NEW.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'task run lineage does not match conversation');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS task_controls_lineage_insert
+    BEFORE INSERT ON task_controls
+    WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM tasks t JOIN sessions s ON s.id=NEW.session_id
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id=s.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'task control session lineage does not match task');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS task_controls_lineage_update
+    BEFORE UPDATE ON task_controls
+    WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM tasks t JOIN sessions s ON s.id=NEW.session_id
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id=s.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'task control session lineage does not match task');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS approvals_lineage_insert
+    BEFORE INSERT ON approvals
+    WHEN NEW.task_id IS NOT NULL AND NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM tasks t JOIN sessions s ON s.id=NEW.session_id
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id=s.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'approval session lineage does not match task');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS approvals_lineage_update
+    BEFORE UPDATE ON approvals
+    WHEN NEW.task_id IS NOT NULL AND NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM tasks t JOIN sessions s ON s.id=NEW.session_id
+        WHERE t.id=NEW.task_id
+          AND t.conversation_id=s.conversation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'approval session lineage does not match task');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS action_journal_lineage_insert
+    BEFORE INSERT ON action_journal
+    BEGIN
+        SELECT CASE WHEN NEW.task_id IS NOT NULL AND NEW.session_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM tasks t JOIN sessions s ON s.id=NEW.session_id
+                WHERE t.id=NEW.task_id
+                  AND t.conversation_id=s.conversation_id
+            ) THEN RAISE(ABORT, 'action session lineage does not match task') END;
+        SELECT CASE WHEN NOT EXISTS (
+            SELECT 1 FROM state_events e
+            WHERE e.event_uuid=NEW.event_uuid
+              AND e.task_id IS NEW.task_id
+              AND e.session_id IS NEW.session_id
+        ) THEN RAISE(ABORT, 'action lineage does not match state event') END;
+        SELECT CASE WHEN NEW.approval_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM approvals a
+            WHERE a.id=NEW.approval_id
+              AND a.task_id IS NEW.task_id
+              AND a.session_id IS NEW.session_id
+        ) THEN RAISE(ABORT, 'action lineage does not match approval') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS action_journal_lineage_update
+    BEFORE UPDATE ON action_journal
+    BEGIN
+        SELECT CASE WHEN NEW.task_id IS NOT NULL AND NEW.session_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM tasks t JOIN sessions s ON s.id=NEW.session_id
+                WHERE t.id=NEW.task_id
+                  AND t.conversation_id=s.conversation_id
+            ) THEN RAISE(ABORT, 'action session lineage does not match task') END;
+        SELECT CASE WHEN NOT EXISTS (
+            SELECT 1 FROM state_events e
+            WHERE e.event_uuid=NEW.event_uuid
+              AND e.task_id IS NEW.task_id
+              AND e.session_id IS NEW.session_id
+        ) THEN RAISE(ABORT, 'action lineage does not match state event') END;
+        SELECT CASE WHEN NEW.approval_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM approvals a
+            WHERE a.id=NEW.approval_id
+              AND a.task_id IS NEW.task_id
+              AND a.session_id IS NEW.session_id
+        ) THEN RAISE(ABORT, 'action lineage does not match approval') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS delegations_lineage_insert
+    BEFORE INSERT ON delegations
+    BEGIN
+        SELECT CASE WHEN NOT EXISTS (
+            SELECT 1 FROM tasks p JOIN tasks c ON c.id=NEW.child_task_id
+            WHERE p.id=NEW.parent_task_id
+              AND c.parent_task_id=NEW.parent_task_id
+              AND c.conversation_id IS p.conversation_id
+        ) THEN RAISE(ABORT, 'delegation lineage does not match parent and child') END;
+        SELECT CASE
+            WHEN NOT json_valid(NEW.evidence_refs_json)
+                THEN RAISE(ABORT, 'delegation evidence references must be valid JSON')
+            WHEN json_type(NEW.evidence_refs_json) != 'array'
+                THEN RAISE(ABORT, 'delegation evidence references must be an array')
+        END;
+        SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM json_each(NEW.evidence_refs_json) r
+            WHERE r.type != 'text' OR NOT EXISTS (
+                SELECT 1 FROM evidence_records e
+                WHERE e.id=r.value AND e.task_id=NEW.parent_task_id
+            )
+        ) THEN RAISE(ABORT, 'delegation evidence is not owned by its parent task') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS delegations_lineage_update
+    BEFORE UPDATE ON delegations
+    BEGIN
+        SELECT CASE WHEN NEW.parent_task_id IS NOT OLD.parent_task_id
+                          OR NEW.child_task_id IS NOT OLD.child_task_id
+            THEN RAISE(ABORT, 'delegation task lineage is immutable') END;
+        SELECT CASE WHEN NOT EXISTS (
+            SELECT 1 FROM tasks p JOIN tasks c ON c.id=NEW.child_task_id
+            WHERE p.id=NEW.parent_task_id
+              AND c.parent_task_id=NEW.parent_task_id
+              AND c.conversation_id IS p.conversation_id
+        ) THEN RAISE(ABORT, 'delegation lineage does not match parent and child') END;
+        SELECT CASE
+            WHEN NOT json_valid(NEW.evidence_refs_json)
+                THEN RAISE(ABORT, 'delegation evidence references must be valid JSON')
+            WHEN json_type(NEW.evidence_refs_json) != 'array'
+                THEN RAISE(ABORT, 'delegation evidence references must be an array')
+        END;
+        SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM json_each(NEW.evidence_refs_json) r
+            WHERE r.type != 'text' OR NOT EXISTS (
+                SELECT 1 FROM evidence_records e
+                WHERE e.id=r.value AND e.task_id=NEW.parent_task_id
+            )
+        ) THEN RAISE(ABORT, 'delegation evidence is not owned by its parent task') END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS delegation_contracts_lineage_insert
+    BEFORE INSERT ON delegation_contracts
+    WHEN NEW.parent_delegation_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM delegations d JOIN delegations p
+          ON p.id=NEW.parent_delegation_id
+        WHERE d.id=NEW.delegation_id
+          AND p.child_task_id=d.parent_task_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'delegation contract parent lineage does not match');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS delegation_contracts_lineage_update
+    BEFORE UPDATE ON delegation_contracts
+    WHEN NEW.parent_delegation_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM delegations d JOIN delegations p
+          ON p.id=NEW.parent_delegation_id
+        WHERE d.id=NEW.delegation_id
+          AND p.child_task_id=d.parent_task_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'delegation contract parent lineage does not match');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS schedule_runs_lineage_insert
+    BEFORE INSERT ON schedule_runs
+    WHEN NOT EXISTS (
+        SELECT 1 FROM schedules s
+        WHERE s.id=NEW.schedule_id AND s.task_id=NEW.task_id
+    ) OR (NEW.checkpoint_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM checkpoints c
+        WHERE c.id=NEW.checkpoint_id AND c.task_id=NEW.task_id
+    ))
+    BEGIN
+        SELECT RAISE(ABORT, 'schedule run lineage does not match task checkpoint');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS schedule_runs_lineage_update
+    BEFORE UPDATE ON schedule_runs
+    WHEN NOT EXISTS (
+        SELECT 1 FROM schedules s
+        WHERE s.id=NEW.schedule_id AND s.task_id=NEW.task_id
+    ) OR (NEW.checkpoint_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM checkpoints c
+        WHERE c.id=NEW.checkpoint_id AND c.task_id=NEW.task_id
+    ))
+    BEGIN
+        SELECT RAISE(ABORT, 'schedule run lineage does not match task checkpoint');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS handoffs_lineage_insert
+    BEFORE INSERT ON handoffs
+    WHEN NOT EXISTS (
+        SELECT 1 FROM checkpoints c
+        WHERE c.id=NEW.checkpoint_id AND c.task_id=NEW.task_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'handoff checkpoint lineage does not match task');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS handoffs_lineage_update
+    BEFORE UPDATE ON handoffs
+    WHEN NOT EXISTS (
+        SELECT 1 FROM checkpoints c
+        WHERE c.id=NEW.checkpoint_id AND c.task_id=NEW.task_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'handoff checkpoint lineage does not match task');
+    END;
     """
 
 
@@ -833,6 +1373,174 @@ def _expected_schema() -> dict[str, tuple[str, ...]]:
     return expected
 
 
+def _canonical_schema_sql(value: str | None) -> str:
+    return " ".join((value or "").split())
+
+
+@lru_cache(maxsize=1)
+def _expected_lineage_triggers() -> dict[str, str]:
+    names = {
+        name for name, introduced in _SCHEMA_INTRODUCED.items()
+        if introduced == 20
+    }
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        for statement in _schema_statements():
+            conn.execute(statement)
+        return {
+            name: _canonical_schema_sql(conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (name,),
+            ).fetchone()[0])
+            for name in names
+        }
+    finally:
+        conn.close()
+
+
+def _backfill_lineage(conn: sqlite3.Connection) -> None:
+    """Fill only conversation lineage that is uniquely implied by durable parents."""
+    conn.execute(
+        """UPDATE state_events
+           SET conversation_id=COALESCE(
+               (SELECT s.conversation_id FROM sessions s WHERE s.id=state_events.session_id),
+               (SELECT t.conversation_id FROM tasks t WHERE t.id=state_events.task_id)
+           )
+           WHERE conversation_id IS NULL
+             AND (session_id IS NOT NULL OR task_id IS NOT NULL)
+             AND NOT EXISTS (
+                 SELECT 1 FROM sessions s JOIN tasks t
+                   ON t.id=state_events.task_id
+                 WHERE s.id=state_events.session_id
+                   AND s.conversation_id IS NOT t.conversation_id
+             )"""
+    )
+
+
+def lineage_errors(conn: sqlite3.Connection) -> list[str]:
+    """Return aggregate durable-reference contradictions without exposing payloads."""
+    checks = {
+        "foreign key": "SELECT COUNT(*) FROM pragma_foreign_key_check",
+        "message task/conversation": """
+            SELECT COUNT(*) FROM messages m
+            WHERE m.related_task_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM tasks t WHERE t.id=m.related_task_id
+                AND t.conversation_id IS m.conversation_id)""",
+        "child task/parent": """
+            SELECT COUNT(*) FROM tasks c JOIN tasks p ON p.id=c.parent_task_id
+            WHERE c.conversation_id IS NOT p.conversation_id""",
+        "state event/session": """
+            SELECT COUNT(*) FROM state_events e JOIN sessions s ON s.id=e.session_id
+            WHERE e.conversation_id IS NOT s.conversation_id""",
+        "state event/task": """
+            SELECT COUNT(*) FROM state_events e JOIN tasks t ON t.id=e.task_id
+            WHERE e.conversation_id IS NOT t.conversation_id""",
+        "task event/conversation": """
+            SELECT COUNT(*) FROM task_events e JOIN tasks t ON t.id=e.task_id
+            WHERE e.conversation_id IS NOT t.conversation_id""",
+        "evidence event/task": """
+            SELECT COUNT(*) FROM evidence_records e
+            WHERE e.event_uuid IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM state_events s WHERE s.event_uuid=e.event_uuid
+                AND s.task_id IS e.task_id)""",
+        "task evidence JSON": """
+            SELECT COUNT(*) FROM tasks
+            WHERE NOT json_valid(evidence_refs_json)
+               OR json_type(evidence_refs_json)!='array'""",
+        "task evidence lineage": """
+            SELECT COUNT(*) FROM tasks t,
+            json_each(CASE WHEN json_valid(t.evidence_refs_json)
+                           THEN t.evidence_refs_json ELSE '[]' END) r
+            WHERE r.type!='text' OR NOT EXISTS (
+                SELECT 1 FROM evidence_records e WHERE e.id=r.value AND (
+                    e.task_id=t.id OR (t.parent_task_id IS NOT NULL
+                    AND e.task_id=t.parent_task_id)))""",
+        "checkpoint evidence JSON": """
+            SELECT COUNT(*) FROM checkpoints
+            WHERE NOT json_valid(evidence_refs_json)
+               OR json_type(evidence_refs_json)!='array'""",
+        "checkpoint evidence lineage": """
+            SELECT COUNT(*) FROM checkpoints c JOIN tasks t ON t.id=c.task_id,
+            json_each(CASE WHEN json_valid(c.evidence_refs_json)
+                           THEN c.evidence_refs_json ELSE '[]' END) r
+            WHERE r.type!='text' OR NOT EXISTS (
+                SELECT 1 FROM evidence_records e WHERE e.id=r.value AND (
+                    e.task_id=c.task_id OR (t.parent_task_id IS NOT NULL
+                    AND e.task_id=t.parent_task_id)))""",
+        "context projection/task": """
+            SELECT COUNT(*) FROM context_projections p JOIN tasks t ON t.id=p.task_id
+            WHERE p.conversation_id IS NOT t.conversation_id""",
+        "context epoch/task checkpoint": """
+            SELECT COUNT(*) FROM context_epochs e JOIN tasks t ON t.id=e.task_id
+            JOIN checkpoints c ON c.id=e.checkpoint_id
+            WHERE e.conversation_id IS NOT t.conversation_id
+               OR c.task_id IS NOT e.task_id""",
+        "task run/conversation": """
+            SELECT COUNT(*) FROM task_runs r JOIN tasks t ON t.id=r.task_id
+            WHERE r.conversation_id IS NOT t.conversation_id""",
+        "task control/session": """
+            SELECT COUNT(*) FROM task_controls c JOIN tasks t ON t.id=c.task_id
+            JOIN sessions s ON s.id=c.session_id
+            WHERE t.conversation_id IS NOT s.conversation_id""",
+        "approval/session": """
+            SELECT COUNT(*) FROM approvals a JOIN tasks t ON t.id=a.task_id
+            JOIN sessions s ON s.id=a.session_id
+            WHERE t.conversation_id IS NOT s.conversation_id""",
+        "action/session event approval": """
+            SELECT COUNT(*) FROM action_journal a
+            WHERE (a.task_id IS NOT NULL AND a.session_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM tasks t JOIN sessions s ON s.id=a.session_id
+                WHERE t.id=a.task_id AND t.conversation_id=s.conversation_id))
+            OR NOT EXISTS (
+                SELECT 1 FROM state_events e WHERE e.event_uuid=a.event_uuid
+                AND e.task_id IS a.task_id AND e.session_id IS a.session_id)
+            OR (a.approval_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM approvals p WHERE p.id=a.approval_id
+                AND p.task_id IS a.task_id AND p.session_id IS a.session_id))""",
+        "delegation JSON": """
+            SELECT COUNT(*) FROM delegations
+            WHERE NOT json_valid(evidence_refs_json)
+               OR json_type(evidence_refs_json)!='array'""",
+        "delegation task/evidence": """
+            SELECT COUNT(*) FROM delegations d
+            WHERE NOT EXISTS (
+                SELECT 1 FROM tasks p JOIN tasks c ON c.id=d.child_task_id
+                WHERE p.id=d.parent_task_id AND c.parent_task_id=d.parent_task_id
+                AND c.conversation_id IS p.conversation_id)
+            OR EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN json_valid(d.evidence_refs_json)
+                    THEN d.evidence_refs_json ELSE '[]' END) r
+                WHERE r.type!='text' OR NOT EXISTS (
+                    SELECT 1 FROM evidence_records e WHERE e.id=r.value
+                    AND e.task_id=d.parent_task_id))""",
+        "delegation contract parent": """
+            SELECT COUNT(*) FROM delegation_contracts c
+            WHERE c.parent_delegation_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM delegations d JOIN delegations p
+                  ON p.id=c.parent_delegation_id
+                WHERE d.id=c.delegation_id
+                  AND p.child_task_id=d.parent_task_id)""",
+        "schedule run/task checkpoint": """
+            SELECT COUNT(*) FROM schedule_runs r
+            WHERE NOT EXISTS (SELECT 1 FROM schedules s
+                WHERE s.id=r.schedule_id AND s.task_id=r.task_id)
+            OR (r.checkpoint_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM checkpoints c WHERE c.id=r.checkpoint_id
+                AND c.task_id=r.task_id))""",
+        "handoff/task checkpoint": """
+            SELECT COUNT(*) FROM handoffs h WHERE NOT EXISTS (
+                SELECT 1 FROM checkpoints c WHERE c.id=h.checkpoint_id
+                AND c.task_id=h.task_id)""",
+    }
+    errors = []
+    for label, query in checks.items():
+        count = int(conn.execute(query).fetchone()[0])
+        if count:
+            errors.append(f"{label} lineage violations: {count}")
+    return errors
+
+
 def schema_errors(conn: sqlite3.Connection) -> list[str]:
     errors = []
     for name, columns in _expected_schema().items():
@@ -843,6 +1551,16 @@ def schema_errors(conn: sqlite3.Connection) -> list[str]:
         actual = tuple(item[1] for item in conn.execute(f'PRAGMA table_info("{name}")'))
         if actual != columns:
             errors.append(f"schema columns differ for {name}: {actual!r} != {columns!r}")
+    for name, expected_sql in _expected_lineage_triggers().items():
+        row = conn.execute(
+            "SELECT type,sql FROM sqlite_master WHERE name=?", (name,),
+        ).fetchone()
+        if row is not None and (
+                row[0] != "trigger"
+                or _canonical_schema_sql(row[1]) != expected_sql):
+            errors.append(f"schema definition differs for {name}")
+    if not errors:
+        errors.extend(lineage_errors(conn))
     return errors
 
 
@@ -899,6 +1617,13 @@ def migrate_connection(conn: sqlite3.Connection) -> int:
                 "INSERT INTO meta(key,value) VALUES('schema_version',?)", (str(version),))
         while version < SCHEMA_VERSION:
             target = version + 1
+            if target == 20:
+                _backfill_lineage(conn)
+                errors = lineage_errors(conn)
+                if errors:
+                    raise RuntimeError(
+                        "state lineage migration refused contradictory rows: "
+                        + "; ".join(errors))
             _apply_schema_level(conn, target)
             if target == 19:
                 _migrate_control_cancellations(conn)

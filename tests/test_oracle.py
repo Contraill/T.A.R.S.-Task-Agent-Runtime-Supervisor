@@ -46,7 +46,9 @@ def test_oracle_delegation_requires_explicit_evidence_contract(monkeypatch):
             {}, "task-one", "review", evidence_refs=(),
             required_evidence_types=("analysis",), parent_authority={}, parent_tools=(),
             router_factory=Router)
-    monkeypatch.setattr(oracle, "load_evidence", lambda evidence_id: SimpleNamespace(id=evidence_id))
+    monkeypatch.setattr(
+        oracle, "load_evidence",
+        lambda evidence_id: SimpleNamespace(id=evidence_id, task_id="task-one"))
     captured = {}
     monkeypatch.setattr(oracle, "create_child", lambda *args, **kwargs: captured | kwargs)
     result = oracle.create_oracle_delegation(
@@ -66,7 +68,9 @@ def test_oracle_delegation_fails_before_creation_when_route_unavailable(monkeypa
 
     monkeypatch.setattr(
         oracle, "create_child", lambda *args, **kwargs: pytest.fail("child was created"))
-    monkeypatch.setattr(oracle, "load_evidence", lambda evidence_id: SimpleNamespace(id=evidence_id))
+    monkeypatch.setattr(
+        oracle, "load_evidence",
+        lambda evidence_id: SimpleNamespace(id=evidence_id, task_id="task-one"))
     with pytest.raises(RuntimeRouteUnavailable, match="Colibri is offline"):
         oracle.create_oracle_delegation(
             {}, "task-one", "review", evidence_refs=("ev-one",),

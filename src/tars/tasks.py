@@ -93,9 +93,14 @@ def create_task_in_transaction(conn, goal, owner_role, *, task_id=None, kind="pr
     """Insert a task as part of a caller-owned authoritative transaction."""
     if kind not in TASK_KINDS:
         raise ValueError(f"invalid task kind: {kind}")
-    if parent_task_id is not None and not conn.execute(
-            "SELECT 1 FROM tasks WHERE id=?", (parent_task_id,)).fetchone():
-        raise KeyError(f"unknown task: {parent_task_id}")
+    if parent_task_id is not None:
+        parent = conn.execute(
+            "SELECT conversation_id FROM tasks WHERE id=?", (parent_task_id,),
+        ).fetchone()
+        if parent is None:
+            raise KeyError(f"unknown task: {parent_task_id}")
+        if parent["conversation_id"] != conversation_id:
+            raise ValueError("child task must share its parent conversation")
     task_id = task_id or _new_task_id()
     stamp = created_at or now_utc()
     conn.execute(

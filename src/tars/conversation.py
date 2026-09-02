@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 import uuid
 
-from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, set_meta, get_meta, transaction
+from .state_store import (connect, ensure_state_store, get_meta, json_dumps, json_loads,
+                          now_utc, resolve_lineage_in_transaction, set_meta, transaction)
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,9 @@ def add_message(
     with transaction(immediate=True) as conn:
         if not conn.execute("SELECT 1 FROM conversations WHERE id=?", (conversation_id,)).fetchone():
             raise KeyError(f"unknown conversation: {conversation_id}")
+        resolve_lineage_in_transaction(
+            conn, task_id=related_task_id, session_id=session_id,
+            conversation_id=conversation_id)
         seq = conn.execute(
             "SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE conversation_id=?",
             (conversation_id,),

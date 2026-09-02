@@ -41,7 +41,9 @@ def create_oracle_delegation(
     if not required_evidence_types:
         raise ValueError("Oracle delegation requires explicit output evidence types")
     for evidence_id in evidence_refs:
-        load_evidence(evidence_id)
+        record = load_evidence(evidence_id)
+        if record.task_id != parent_task_id:
+            raise PermissionError("Oracle input evidence belongs to another task")
     route = router_factory(cfg).resolve(
         "oracle", required_capabilities=("deep-reasoning",), persist=True)
     if not route.ready:

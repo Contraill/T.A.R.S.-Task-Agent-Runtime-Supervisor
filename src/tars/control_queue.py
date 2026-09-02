@@ -5,7 +5,8 @@ import uuid
 
 from .state_events import insert_state_event
 from .ownership import Owner, claim_in_transaction, owner_alive
-from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
+from .state_store import (connect, ensure_state_store, json_dumps, json_loads, now_utc,
+                          resolve_lineage_in_transaction, transaction)
 from .tasks import load_task, require_task_write_in_transaction
 
 
@@ -98,6 +99,8 @@ def enqueue(task_id, kind, message="", *, session_id=None, payload=None,
     control_id = "control-" + uuid.uuid4().hex
     stamp = now_utc()
     with transaction(immediate=True) as conn:
+        resolve_lineage_in_transaction(
+            conn, task_id=task_id, session_id=session_id)
         stored_payload = dict(payload or {})
         cancellation = dict(_cancellation) if _cancellation is not None else None
         if cancellation is not None:

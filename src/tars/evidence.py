@@ -37,6 +37,14 @@ def record(evidence_type, source, content, *, task_id=None, event_uuid=None,
     evidence_id = "evidence-" + uuid.uuid4().hex
     ensure_state_store()
     with transaction(immediate=True) as conn:
+        if event_uuid is not None:
+            event = conn.execute(
+                "SELECT task_id FROM state_events WHERE event_uuid=?", (event_uuid,),
+            ).fetchone()
+            if event is None:
+                raise KeyError(f"unknown state event: {event_uuid}")
+            if event["task_id"] != task_id:
+                raise PermissionError("evidence event belongs to another task")
         conn.execute(
             """INSERT INTO evidence_records(id,task_id,event_uuid,evidence_type,source,
                content_sha256,result_ref,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
