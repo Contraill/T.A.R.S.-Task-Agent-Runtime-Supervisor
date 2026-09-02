@@ -15,6 +15,7 @@ def isolated_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(memory, "MEMORY_ROOT", memory_root)
     monkeypatch.setattr(memory, "MEMORY_HISTORY_ROOT", memory_root / ".history")
     persona = tmp_path / "persona"
+    monkeypatch.setattr(identity, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(identity, "IDENTITY_PATH", persona / "IDENTITY.md")
     monkeypatch.setattr(identity, "SOUL_PATH", persona / "SOUL.md")
     monkeypatch.setattr(identity, "ROLE_PERSONA_ROOT", persona / "roles")

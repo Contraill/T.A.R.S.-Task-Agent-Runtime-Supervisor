@@ -18,6 +18,7 @@ from .model_integrity import inspect_model_artifact
 from .registry import (
     ensure_registry,
     get_model,
+    registry_transaction,
     role_for_alias,
     save_registry,
     validate_model_alias,
@@ -104,20 +105,21 @@ def _register(alias: str, path: Path, digest: str, *, name: str, source: str,
               quant: str = "unknown", native_context: int = 0, size: int,
               runtime_compatible: bool) -> None:
     validate_model_alias(alias)
-    registry = ensure_registry()
-    if alias in registry["models"]:
-        raise ValueError(f"model alias already exists: {alias}")
-    candidate = json.loads(json.dumps(registry))
-    candidate["version"] = max(3, int(candidate.get("version", 2)))
-    candidate["models"][alias] = {
-        "name": name, "path": str(path), "sha256": digest,
-        "artifact_sha256": digest, "backend": "llama.cpp", "quant": quant,
-        "native_context": native_context, "source": source,
-        "source_revision": source_revision, "license": license_name,
-        "size": int(size), "integrity_verified": True,
-        "runtime_compatible": bool(runtime_compatible),
-    }
-    save_registry(candidate)
+    with registry_transaction():
+        registry = ensure_registry()
+        if alias in registry["models"]:
+            raise ValueError(f"model alias already exists: {alias}")
+        candidate = json.loads(json.dumps(registry))
+        candidate["version"] = max(3, int(candidate.get("version", 2)))
+        candidate["models"][alias] = {
+            "name": name, "path": str(path), "sha256": digest,
+            "artifact_sha256": digest, "backend": "llama.cpp", "quant": quant,
+            "native_context": native_context, "source": source,
+            "source_revision": source_revision, "license": license_name,
+            "size": int(size), "integrity_verified": True,
+            "runtime_compatible": bool(runtime_compatible),
+        }
+        save_registry(candidate)
 
 
 def _gguf_header_compatible(header: bytes) -> bool:
@@ -248,10 +250,14 @@ def verify_model(alias: str) -> VerificationResult:
     inspection = inspect_model_artifact(model.path)
     digest = inspection.sha256
     if digest != model.sha256:
-        registry = ensure_registry()
-        registry["models"][alias]["integrity_verified"] = False
-        registry["models"][alias]["runtime_compatible"] = False
-        save_registry(registry)
+        with registry_transaction():
+            registry = ensure_registry()
+            current = registry["models"].get(alias)
+            if current is None or current.get("sha256") != model.sha256:
+                raise RuntimeError("model registry changed during verification")
+            current["integrity_verified"] = False
+            current["runtime_compatible"] = False
+            save_registry(registry)
         raise ValueError(f"SHA-256 mismatch for {alias}: expected {model.sha256}, got {digest}")
     compatible = (model.backend == "llama.cpp" and
                   _gguf_header_compatible(inspection.header))
@@ -261,46 +267,54 @@ def verify_model(alias: str) -> VerificationResult:
                       calibration.get("model_sha256", digest) == digest)
     except (FileNotFoundError, KeyError):
         calibrated = False
-    registry = ensure_registry()
-    registry["models"][alias]["integrity_verified"] = True
-    registry["models"][alias]["runtime_compatible"] = compatible
-    save_registry(registry)
+    with registry_transaction():
+        registry = ensure_registry()
+        current = registry["models"].get(alias)
+        if current is None or current.get("sha256") != model.sha256:
+            raise RuntimeError("model registry changed during verification")
+        current["integrity_verified"] = True
+        current["runtime_compatible"] = compatible
+        save_registry(registry)
     return VerificationResult(alias, digest, True, compatible, calibrated)
 
 
 def remove_model(alias: str) -> bool:
     validate_model_alias(alias)
-    assigned = role_for_alias(alias)
-    if assigned:
-        raise ValueError(f"model {alias} is assigned to Roles: {', '.join(assigned)}")
-    registry = ensure_registry()
-    if alias not in registry["models"]:
-        raise KeyError(f"unknown model alias: {alias}")
-    removed = registry["models"][alias]
-    path = Path(removed["path"]).expanduser()
-    digest = removed.get("artifact_sha256", removed.get("sha256", ""))
-    candidate = json.loads(json.dumps(registry))
-    del candidate["models"][alias]
-    save_registry(candidate)
-    digest_shared = any(
-        info.get("artifact_sha256", info.get("sha256", "")) == digest
-        for info in candidate["models"].values()
-    )
-    valid_digest = bool(re.fullmatch(r"[0-9a-f]{64}", digest))
-    if valid_digest and not digest_shared:
-        calibration_path(digest).unlink(missing_ok=True)
-    shared = any(Path(info["path"]).expanduser() == path for info in candidate["models"].values())
-    expected = _artifact_path(digest) if valid_digest else None
-    if not shared and expected is not None and path.absolute() == expected.absolute():
-        MODEL_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
-        anchor = AnchoredRoot(MODEL_ARTIFACT_ROOT.resolve(strict=True))
-        try:
-            anchor.delete((digest[:2], f"{digest}.gguf"))
+    with registry_transaction():
+        assigned = role_for_alias(alias)
+        if assigned:
+            raise ValueError(f"model {alias} is assigned to Roles: {', '.join(assigned)}")
+        registry = ensure_registry()
+        if alias not in registry["models"]:
+            raise KeyError(f"unknown model alias: {alias}")
+        removed = registry["models"][alias]
+        path = Path(removed["path"]).expanduser()
+        digest = removed.get("artifact_sha256", removed.get("sha256", ""))
+        candidate = json.loads(json.dumps(registry))
+        del candidate["models"][alias]
+        save_registry(candidate)
+        digest_shared = any(
+            info.get("artifact_sha256", info.get("sha256", "")) == digest
+            for info in candidate["models"].values()
+        )
+        valid_digest = bool(re.fullmatch(r"[0-9a-f]{64}", digest))
+        if valid_digest and not digest_shared:
+            calibration_path(digest).unlink(missing_ok=True)
+        shared = any(
+            Path(info["path"]).expanduser() == path
+            for info in candidate["models"].values()
+        )
+        expected = _artifact_path(digest) if valid_digest else None
+        if not shared and expected is not None and path.absolute() == expected.absolute():
+            MODEL_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+            anchor = AnchoredRoot(MODEL_ARTIFACT_ROOT.resolve(strict=True))
             try:
-                anchor.delete((digest[:2],))
-            except OSError:
-                pass
-        finally:
-            anchor.close()
-        return True
-    return False
+                anchor.delete((digest[:2], f"{digest}.gguf"))
+                try:
+                    anchor.delete((digest[:2],))
+                except OSError:
+                    pass
+            finally:
+                anchor.close()
+            return True
+        return False

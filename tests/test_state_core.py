@@ -542,6 +542,7 @@ def test_legacy_import_failures_are_observable_retryable_and_idempotent(isolated
 
 def test_identity_inheritance_and_prompt_explain(monkeypatch, tmp_path):
     persona = tmp_path / "persona"
+    monkeypatch.setattr(identity, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(identity, "IDENTITY_PATH", persona / "IDENTITY.md")
     monkeypatch.setattr(identity, "SOUL_PATH", persona / "SOUL.md")
     monkeypatch.setattr(identity, "ROLE_PERSONA_ROOT", persona / "roles")

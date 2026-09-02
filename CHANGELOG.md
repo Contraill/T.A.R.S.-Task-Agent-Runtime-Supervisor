@@ -9,6 +9,8 @@
 - added staged local rollback, schema migration and truthful post-restore reconciliation results
 - made multi-file restore crash-recoverable with durable journals, fsynced commit/rollback,
   startup fencing and explicit or automatic recovery
+- serialized model, Role, UI and generated-runtime configuration updates across processes,
+  with generation fencing for stale registry snapshots and backup/restore exclusion
 
 ## 0.8.5 - SecretStore
 

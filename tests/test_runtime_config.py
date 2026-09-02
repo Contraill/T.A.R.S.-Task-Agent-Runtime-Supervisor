@@ -4,7 +4,16 @@ import hashlib
 
 import pytest
 
+from tars import roles as role_registry
 from tars import runtime_config
+
+
+@pytest.fixture(autouse=True)
+def isolated_role_registry_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        role_registry, "ROLE_REGISTRY_PATH", tmp_path / "role-registry.toml"
+    )
+    monkeypatch.setattr(role_registry, "STATE_ROOT", tmp_path / "state")
 
 
 def _role(role_id, runtime_id, model, *, execution="chat", profile="normal"):

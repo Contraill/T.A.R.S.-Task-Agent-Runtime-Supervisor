@@ -4,6 +4,12 @@ from tars import roles
 from tars import registry
 
 
+@pytest.fixture(autouse=True)
+def isolated_installation_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(roles, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(registry, "STATE_ROOT", tmp_path / "state")
+
+
 def _registry(runtime_id):
     return {
         "version": 1,

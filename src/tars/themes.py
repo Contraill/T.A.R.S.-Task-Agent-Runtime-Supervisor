@@ -5,7 +5,14 @@ from pathlib import Path
 import re
 import tomllib
 
-from .config import THEME_ROOT, UI_PREFS_PATH
+from .config import STATE_ROOT, THEME_ROOT, UI_PREFS_PATH
+from .file_transactions import (
+    atomic_write_anchored_text,
+    exclusive_file_lock,
+    installation_transaction,
+    read_anchored_text,
+    regular_file_exists,
+)
 
 
 VALID_LOGOS = ("auto", "compact", "minimal", "none")
@@ -78,27 +85,36 @@ _BUILTINS: dict[str, Theme] = {
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
-def ensure_ui_store() -> None:
-    UI_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    THEME_ROOT.mkdir(parents=True, exist_ok=True)
-    if not UI_PREFS_PATH.exists():
-        _write_prefs({"theme": "terminal", "logo": "auto"})
+def _prefs_lock_path() -> Path:
+    return UI_PREFS_PATH.parent / ".tars-ui-prefs.lock"
 
 
-def _write_prefs(values: dict[str, str]) -> None:
+def _write_prefs_unlocked(values: dict[str, str], anchor) -> None:
     theme = values.get("theme", "terminal")
     logo = values.get("logo", "auto")
-    UI_PREFS_PATH.write_text(
+    atomic_write_anchored_text(
+        anchor,
+        UI_PREFS_PATH.name,
         f'theme = "{theme}"\nlogo = "{logo}"\n',
-        encoding="utf-8",
     )
 
 
-def load_ui_prefs() -> dict[str, str]:
-    ensure_ui_store()
+def _ensure_prefs_unlocked(anchor) -> None:
+    if not regular_file_exists(anchor, UI_PREFS_PATH.name):
+        _write_prefs_unlocked({"theme": "terminal", "logo": "auto"}, anchor)
+
+
+def ensure_ui_store() -> None:
+    with installation_transaction(STATE_ROOT):
+        THEME_ROOT.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(_prefs_lock_path()) as anchor:
+            _ensure_prefs_unlocked(anchor)
+
+
+def _load_prefs_unlocked(anchor) -> dict[str, str]:
+    _ensure_prefs_unlocked(anchor)
     try:
-        with UI_PREFS_PATH.open("rb") as handle:
-            raw = tomllib.load(handle)
+        raw = tomllib.loads(read_anchored_text(anchor, UI_PREFS_PATH.name))
     except (OSError, tomllib.TOMLDecodeError):
         raw = {}
     theme = str(raw.get("theme", "terminal"))
@@ -108,11 +124,19 @@ def load_ui_prefs() -> dict[str, str]:
     return {"theme": theme, "logo": logo}
 
 
+def load_ui_prefs() -> dict[str, str]:
+    with installation_transaction(STATE_ROOT):
+        with exclusive_file_lock(_prefs_lock_path()) as anchor:
+            return _load_prefs_unlocked(anchor)
+
+
 def set_theme(theme_id: str) -> Theme:
-    theme = get_theme(theme_id)
-    prefs = load_ui_prefs()
-    prefs["theme"] = theme.id
-    _write_prefs(prefs)
+    with installation_transaction(STATE_ROOT):
+        theme = get_theme(theme_id)
+        with exclusive_file_lock(_prefs_lock_path()) as anchor:
+            prefs = _load_prefs_unlocked(anchor)
+            prefs["theme"] = theme.id
+            _write_prefs_unlocked(prefs, anchor)
     return theme
 
 
@@ -120,9 +144,11 @@ def set_logo(mode: str) -> str:
     mode = mode.strip().lower()
     if mode not in VALID_LOGOS:
         raise ValueError(f"invalid logo mode {mode!r}; choose: {', '.join(VALID_LOGOS)}")
-    prefs = load_ui_prefs()
-    prefs["logo"] = mode
-    _write_prefs(prefs)
+    with installation_transaction(STATE_ROOT):
+        with exclusive_file_lock(_prefs_lock_path()) as anchor:
+            prefs = _load_prefs_unlocked(anchor)
+            prefs["logo"] = mode
+            _write_prefs_unlocked(prefs, anchor)
     return mode
 
 

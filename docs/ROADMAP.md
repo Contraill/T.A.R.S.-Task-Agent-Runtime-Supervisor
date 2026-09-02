@@ -21,10 +21,11 @@ Status: implemented.
 - generated llama-swap config from Role + Model + Calibration state
 - read-only runtime plan/render/status surfaces
 - transactional Role/model/profile switching
+- cross-process registry/config locking and stale-generation rejection
 - runtime health checks and automatic config rollback
 - Zero-Idle policy invariants enforced by the generator
 
-Exit gates: generated normal profiles match the calibrated reference runtime; apply never leaves a broken config active; failed switch restores both runtime config and Role Registry; no runtime management path enables persistent performance monitoring.
+Exit gates: generated normal profiles match the calibrated reference runtime; apply never leaves a broken config active; failed switch restores both runtime config and Role Registry; concurrent writers cannot erase a committed registry, preference or runtime-config update; no runtime management path enables persistent performance monitoring.
 
 ## v0.5.1 — model manager
 

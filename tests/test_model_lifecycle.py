@@ -15,6 +15,14 @@ def _registry():
     return {"version": 3, "models": {}}
 
 
+@pytest.fixture(autouse=True)
+def isolated_registry_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        model_registry, "REGISTRY_PATH", tmp_path / "model-registry.toml"
+    )
+    monkeypatch.setattr(model_registry, "STATE_ROOT", tmp_path / "state")
+
+
 def test_compatibility_manifest_is_versioned_and_architecture_neutral():
     manifest = lifecycle.COMPATIBILITY_MANIFEST
     assert manifest["schema_version"] == 1

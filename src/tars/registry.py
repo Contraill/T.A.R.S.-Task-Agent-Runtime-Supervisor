@@ -1,11 +1,16 @@
 import json
-import os
 import re
-import tempfile
 import tomllib
-from pathlib import Path
+from contextlib import contextmanager
 
-from .config import DATA_ROOT, REGISTRY_PATH
+from .config import DATA_ROOT, REGISTRY_PATH, STATE_ROOT
+from .file_transactions import (
+    atomic_write_anchored_text,
+    exclusive_file_lock,
+    installation_transaction,
+    read_anchored_text,
+    regular_file_exists,
+)
 from .models import ModelRecord
 
 MODEL_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -18,6 +23,9 @@ def validate_model_alias(value):
 
 
 def _validate_registry(data):
+    generation = data.get("generation", 0)
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError("model registry generation must be a non-negative integer")
     models = data.get("models", {})
     if not isinstance(models, dict):
         raise ValueError("model registry models must be a table")
@@ -33,6 +41,7 @@ def default_registry():
     models_root = DATA_ROOT / "models"
     return {
         "version": 2,
+        "generation": 0,
         "models": {
             "qwen3.5-9b": {
                 "name": "Qwen3.5-9B",
@@ -66,7 +75,10 @@ def default_registry():
 
 
 def serialize_registry(data):
-    lines = ["version = " + str(int(data.get("version", 2)))]
+    lines = [
+        "version = " + str(int(data.get("version", 2))),
+        "generation = " + str(int(data.get("generation", 0))),
+    ]
 
     for alias in sorted(data.get("models", {})):
         model = data["models"][alias]
@@ -95,43 +107,61 @@ def serialize_registry(data):
     return "\n".join(lines) + "\n"
 
 
-def save_registry(data):
-    _validate_registry(data)
-    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = serialize_registry(data)
+def _registry_lock_path():
+    return REGISTRY_PATH.parent / ".tars-registries.lock"
 
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".model-registry.",
-        suffix=".toml",
-        dir=REGISTRY_PATH.parent,
-        text=True,
+
+@contextmanager
+def registry_transaction():
+    with installation_transaction(STATE_ROOT):
+        with exclusive_file_lock(_registry_lock_path()) as anchor:
+            yield anchor
+
+
+def _save_registry_unlocked(data, anchor):
+    _validate_registry(data)
+    exists = regular_file_exists(anchor, REGISTRY_PATH.name)
+    if exists:
+        current_generation = _load_registry_unlocked(anchor).get("generation", 0)
+        supplied_generation = data.get("generation")
+        if supplied_generation is None or supplied_generation != current_generation:
+            raise RuntimeError("stale model registry update refused")
+        next_generation = current_generation + 1
+    else:
+        next_generation = data.get("generation", 0)
+    candidate = json.loads(json.dumps(data))
+    candidate["generation"] = next_generation
+    atomic_write_anchored_text(
+        anchor, REGISTRY_PATH.name, serialize_registry(candidate)
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, REGISTRY_PATH)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    data["generation"] = next_generation
+
+
+def save_registry(data):
+    with registry_transaction() as anchor:
+        _save_registry_unlocked(data, anchor)
 
 
 def ensure_registry():
-    if not REGISTRY_PATH.exists():
-        save_registry(default_registry())
-    return load_registry()
+    with registry_transaction() as anchor:
+        if not regular_file_exists(anchor, REGISTRY_PATH.name):
+            _save_registry_unlocked(default_registry(), anchor)
+        return _load_registry_unlocked(anchor)
 
 
-def load_registry():
-    with REGISTRY_PATH.open("rb") as handle:
-        data = tomllib.load(handle)
-
+def _load_registry_unlocked(anchor):
+    data = tomllib.loads(read_anchored_text(anchor, REGISTRY_PATH.name))
     data.setdefault("models", {})
+    data.setdefault("generation", 0)
     _validate_registry(data)
     for info in data["models"].values():
         info.setdefault("backend", "llama.cpp")
     return data
+
+
+def load_registry():
+    with registry_transaction() as anchor:
+        return _load_registry_unlocked(anchor)
 
 
 def models():
@@ -154,12 +184,13 @@ def set_thinking_control(alias, control):
     validate_model_alias(alias)
     if control not in {"unknown", "toggle"}:
         raise ValueError("thinking control must be unknown or toggle")
-    data = ensure_registry()
-    if alias not in data["models"]:
-        raise KeyError(f"unknown model alias: {alias}")
-    data["models"][alias]["thinking_control"] = control
-    save_registry(data)
-    return get_model(alias)
+    with registry_transaction():
+        data = ensure_registry()
+        if alias not in data["models"]:
+            raise KeyError(f"unknown model alias: {alias}")
+        data["models"][alias]["thinking_control"] = control
+        save_registry(data)
+        return ModelRecord.from_dict(alias, data["models"][alias])
 
 
 def role_for_alias(alias):

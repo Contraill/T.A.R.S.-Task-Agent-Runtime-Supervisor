@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import os
@@ -21,6 +20,7 @@ from . import __version__
 from . import config, state_store
 from .secret_store import parse_reference
 from .policy import redact
+from .file_transactions import INSTALLATION_LOCK_NAME, installation_transaction
 from .secure_paths import AnchoredRoot, select_anchor
 from . import memory
 
@@ -33,7 +33,7 @@ DB_MEMBER = "state/tars-state.sqlite3"
 RESTORE_JOURNAL_VERSION = 1
 RESTORE_PREFIX = ".tars-restore-"
 RESTORE_JOURNAL = "journal.json"
-RESTORE_LOCK = ".tars-restore.lock"
+RESTORE_LOCK = INSTALLATION_LOCK_NAME
 RESTORE_MARKER = config.RESTORE_RECOVERY_MARKER
 
 
@@ -638,19 +638,8 @@ def _validate_restore_journal(root, transaction_name, journal, paths):
 
 @contextmanager
 def _restore_lock(paths):
-    lock_parent = Path(paths.state_root).parent
-    root = AnchoredRoot.open_or_create(lock_parent)
-    lock_fd = -1
-    try:
-        lock_fd = root.open((RESTORE_LOCK,), os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lock_fd, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    with installation_transaction(paths.state_root) as root:
         yield root
-    finally:
-        if lock_fd >= 0:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
-        root.close()
 
 
 def _open_restore_parent(item):

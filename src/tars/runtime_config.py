@@ -5,13 +5,10 @@ from datetime import datetime, timezone
 import copy
 import hashlib
 import json
-import os
 from pathlib import Path
 import shlex
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 from .calibration import load_calibration
@@ -27,6 +24,14 @@ from .config import (
     RUNTIME_CONFIG_BACKUP_ROOT,
     runtime_base_url,
 )
+from .file_transactions import (
+    atomic_write_anchored_text,
+    atomic_write_text,
+    durable_unlink_anchored,
+    exclusive_file_lock,
+    read_anchored_text,
+    regular_file_exists,
+)
 from .registry import get_model
 from .runtime_backends import backend_binding_ready
 from .runtime_http import request_json
@@ -34,6 +39,7 @@ from .roles import (
     get_role,
     list_roles,
     load_role_registry,
+    role_registry_transaction,
     resolve_role_id,
     save_role_registry,
     validate_runtime_id,
@@ -319,28 +325,15 @@ def render_runtime_config(plan: RuntimePlan | None = None) -> str:
     return rendered
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-        try:
-            dir_fd = os.open(path.parent, os.O_DIRECTORY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
-    finally:
-        if os.path.exists(temp_name):
-            os.unlink(temp_name)
+def _atomic_write(path: Path, text: str, *, anchor=None) -> None:
+    if anchor is None:
+        atomic_write_text(path, text)
+    else:
+        atomic_write_anchored_text(anchor, path.name, text)
+
+
+def _runtime_config_lock_path() -> Path:
+    return LLAMA_SWAP_CONFIG_PATH.parent / ".tars-runtime-config.lock"
 
 
 def _service_active() -> bool:
@@ -414,12 +407,13 @@ def _wait_healthy(cfg, expected_ids: set[str], timeout: float = 15.0) -> None:
     raise RuntimeError(last_error)
 
 
-def runtime_config_status(cfg) -> RuntimeConfigStatus:
+def _runtime_config_status_locked(cfg, config_anchor) -> RuntimeConfigStatus:
     generated = render_runtime_config(build_runtime_plan())
     generated_sha = _sha256_text(generated)
-    installed = LLAMA_SWAP_CONFIG_PATH.exists()
+    installed = regular_file_exists(config_anchor, LLAMA_SWAP_CONFIG_PATH.name)
     installed_text = (
-        LLAMA_SWAP_CONFIG_PATH.read_text(encoding="utf-8") if installed else None
+        read_anchored_text(config_anchor, LLAMA_SWAP_CONFIG_PATH.name)
+        if installed else None
     )
     installed_sha = _sha256_text(installed_text) if installed_text is not None else None
     try:
@@ -437,7 +431,13 @@ def runtime_config_status(cfg) -> RuntimeConfigStatus:
     )
 
 
-def apply_runtime_config(cfg) -> RuntimeApplyResult:
+def runtime_config_status(cfg) -> RuntimeConfigStatus:
+    with role_registry_transaction():
+        with exclusive_file_lock(_runtime_config_lock_path()) as config_anchor:
+            return _runtime_config_status_locked(cfg, config_anchor)
+
+
+def _apply_runtime_config_locked(cfg, config_anchor) -> RuntimeApplyResult:
     plan = build_runtime_plan(require_files=True)
     candidate = render_runtime_config(plan)
     digest = _sha256_text(candidate)
@@ -446,8 +446,8 @@ def apply_runtime_config(cfg) -> RuntimeApplyResult:
     was_active = _service_active()
     previous = None
     backup_path = None
-    if LLAMA_SWAP_CONFIG_PATH.exists():
-        previous = LLAMA_SWAP_CONFIG_PATH.read_text(encoding="utf-8")
+    if regular_file_exists(config_anchor, LLAMA_SWAP_CONFIG_PATH.name):
+        previous = read_anchored_text(config_anchor, LLAMA_SWAP_CONFIG_PATH.name)
         if previous == candidate:
             if was_active:
                 _wait_healthy(cfg, expected_ids)
@@ -467,9 +467,9 @@ def apply_runtime_config(cfg) -> RuntimeApplyResult:
         RUNTIME_CONFIG_BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         backup_path = RUNTIME_CONFIG_BACKUP_ROOT / f"llama-swap-{stamp}.yaml"
-        shutil.copy2(LLAMA_SWAP_CONFIG_PATH, backup_path)
+        atomic_write_text(backup_path, previous)
 
-    _atomic_write(LLAMA_SWAP_CONFIG_PATH, candidate)
+    _atomic_write(LLAMA_SWAP_CONFIG_PATH, candidate, anchor=config_anchor)
     try:
         if was_active:
             _restart_service()
@@ -480,12 +480,9 @@ def apply_runtime_config(cfg) -> RuntimeApplyResult:
             stop_runtime_service()
     except Exception as exc:
         if previous is None:
-            try:
-                LLAMA_SWAP_CONFIG_PATH.unlink()
-            except FileNotFoundError:
-                pass
+            durable_unlink_anchored(config_anchor, LLAMA_SWAP_CONFIG_PATH.name)
         else:
-            _atomic_write(LLAMA_SWAP_CONFIG_PATH, previous)
+            _atomic_write(LLAMA_SWAP_CONFIG_PATH, previous, anchor=config_anchor)
 
         rollback_error = None
         try:
@@ -512,6 +509,14 @@ def apply_runtime_config(cfg) -> RuntimeApplyResult:
     )
 
 
+def apply_runtime_config(cfg) -> RuntimeApplyResult:
+    # The registry lock is always acquired before the runtime-config lock. It
+    # keeps the generated plan stable through service validation and rollback.
+    with role_registry_transaction():
+        with exclusive_file_lock(_runtime_config_lock_path()) as config_anchor:
+            return _apply_runtime_config_locked(cfg, config_anchor)
+
+
 def switch_role_runtime(
     cfg,
     role_name: str,
@@ -520,45 +525,51 @@ def switch_role_runtime(
     profile_name: str | None = None,
     unassign: bool = False,
 ) -> RuntimeSwitchResult:
-    role_id = resolve_role_id(role_name)
-    current = get_role(role_id)
-    target_model = "" if unassign else (model_alias or current.model)
-    target_profile = profile_name or current.profile
-    if not target_model and not unassign:
-        raise ValueError(f"role {role_id} has no model binding")
-    if target_profile not in {"compact", "normal", "extended"}:
-        raise ValueError("profile must be compact, normal or extended")
+    with role_registry_transaction():
+        role_id = resolve_role_id(role_name)
+        current = get_role(role_id)
+        target_model = "" if unassign else (model_alias or current.model)
+        target_profile = profile_name or current.profile
+        if not target_model and not unassign:
+            raise ValueError(f"role {role_id} has no model binding")
+        if target_profile not in {"compact", "normal", "extended"}:
+            raise ValueError("profile must be compact, normal or extended")
 
-    if target_model:
-        model = get_model(target_model)
-        if _is_llama_cpp_model(model):
-            calibration = load_calibration(model.alias)
-            if calibration.get("status") != "ready":
-                raise RuntimeError(f"calibration for {target_model} is not ready")
-            if target_profile not in (calibration.get("profiles") or {}):
-                raise KeyError(f"{target_model} has no calibration profile {target_profile!r}")
-        else:
-            if not backend_binding_ready(model):
-                raise RuntimeError(f"runtime backend binding for {target_model} is not ready")
+        if target_model:
+            model = get_model(target_model)
+            if _is_llama_cpp_model(model):
+                calibration = load_calibration(model.alias)
+                if calibration.get("status") != "ready":
+                    raise RuntimeError(f"calibration for {target_model} is not ready")
+                if target_profile not in (calibration.get("profiles") or {}):
+                    raise KeyError(
+                        f"{target_model} has no calibration profile {target_profile!r}"
+                    )
+            elif not backend_binding_ready(model):
+                raise RuntimeError(
+                    f"runtime backend binding for {target_model} is not ready"
+                )
 
-    before = load_role_registry()
-    candidate = copy.deepcopy(before)
-    info = candidate["roles"][role_id]
-    info["model"] = target_model
-    info["profile"] = target_profile
-    if not unassign and not info.get("enabled", True):
-        raise ValueError(f"role {role_id} is disabled")
+        before = load_role_registry()
+        candidate = copy.deepcopy(before)
+        info = candidate["roles"][role_id]
+        info["model"] = target_model
+        info["profile"] = target_profile
+        if not unassign and not info.get("enabled", True):
+            raise ValueError(f"role {role_id} is disabled")
 
-    save_role_registry(candidate)
-    try:
-        applied = apply_runtime_config(cfg)
-    except Exception:
-        save_role_registry(before)
-        raise
+        save_role_registry(candidate)
+        try:
+            applied = apply_runtime_config(cfg)
+        except Exception:
+            if "generation" in candidate:
+                before["generation"] = candidate["generation"]
+            save_role_registry(before)
+            raise
 
-    return RuntimeSwitchResult(
-        role_id=role_id,
-        model_alias=target_model,
-        profile_name=target_profile,
-        apply=applied,
-    )
+        return RuntimeSwitchResult(
+            role_id=role_id,
+            model_alias=target_model,
+            profile_name=target_profile,
+            apply=applied,
+        )

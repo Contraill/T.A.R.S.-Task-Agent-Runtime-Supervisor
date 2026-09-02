@@ -15,6 +15,12 @@ tars model remove <alias>
 
 Downloads resume from a partial cache file when the source supports HTTP range requests. `--sha256` supplies an expected digest. Pull and import perform disk-space preflight, verify the artifact digest, require GGUF compatibility, then update the registry atomically.
 
+Model and Role registry mutations share a stable cross-process transaction lock. Each
+committed registry generation is persisted, so a caller attempting to save a stale
+snapshot is rejected instead of erasing a concurrent update. Model removal and Role
+binding use the same transaction boundary, preventing dangling bindings. Portable
+backup and restore share an installation-wide outer lock with these transactions.
+
 Readiness progresses through acquisition, integrity verification, runtime compatibility and calibration. A local llama.cpp model is not eligible for generated runtime configuration until calibration for its exact SHA-256 artifact is ready.
 
 Run `tars calibrate <alias>` for the minimum objective pass, or add `--mid` or `--max` for broader context, CPU, placement and pressure searches. `--fresh` ignores compatible stage cache entries without allowing a shallower result to replace a deeper one.

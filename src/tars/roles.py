@@ -1,11 +1,17 @@
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
-import os
 import re
-import tempfile
 import tomllib
 
-from .config import ROLE_REGISTRY_PATH
+from .config import ROLE_REGISTRY_PATH, STATE_ROOT
+from .file_transactions import (
+    atomic_write_anchored_text,
+    exclusive_file_lock,
+    installation_transaction,
+    read_anchored_text,
+    regular_file_exists,
+)
 from .registry import ensure_registry
 
 ROLE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
@@ -63,6 +69,7 @@ def validate_runtime_id(value):
 def default_role_registry():
     return {
         "version": 1,
+        "generation": 0,
         "default_role": "general",
         "roles": {
             "general": {
@@ -137,6 +144,7 @@ def default_role_registry():
 def serialize_role_registry(data):
     lines = [
         "version = " + str(int(data.get("version", 1))),
+        "generation = " + str(int(data.get("generation", 0))),
         f"default_role = {_quote(data.get('default_role', 'general'))}",
     ]
 
@@ -159,28 +167,45 @@ def serialize_role_registry(data):
     return "\n".join(lines) + "\n"
 
 
-def save_role_registry(data):
-    _validate_registry(data)
-    ROLE_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _role_registry_lock_path():
+    return ROLE_REGISTRY_PATH.parent / ".tars-registries.lock"
 
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".role-registry.",
-        suffix=".toml",
-        dir=ROLE_REGISTRY_PATH.parent,
-        text=True,
+
+@contextmanager
+def role_registry_transaction():
+    with installation_transaction(STATE_ROOT):
+        with exclusive_file_lock(_role_registry_lock_path()) as anchor:
+            yield anchor
+
+
+def _save_role_registry_unlocked(data, anchor):
+    _validate_registry(data)
+    exists = regular_file_exists(anchor, ROLE_REGISTRY_PATH.name)
+    if exists:
+        current_generation = _load_role_registry_unlocked(anchor).get("generation", 0)
+        supplied_generation = data.get("generation")
+        if supplied_generation is None or supplied_generation != current_generation:
+            raise RuntimeError("stale role registry update refused")
+        next_generation = current_generation + 1
+    else:
+        next_generation = data.get("generation", 0)
+    candidate = json.loads(json.dumps(data))
+    candidate["generation"] = next_generation
+    atomic_write_anchored_text(
+        anchor, ROLE_REGISTRY_PATH.name, serialize_role_registry(candidate)
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(serialize_role_registry(data))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, ROLE_REGISTRY_PATH)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    data["generation"] = next_generation
+
+
+def save_role_registry(data):
+    with role_registry_transaction() as anchor:
+        _save_role_registry_unlocked(data, anchor)
 
 
 def _validate_registry(data):
+    generation = data.get("generation", 0)
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError("role registry generation must be a non-negative integer")
     roles = data.get("roles", {})
     if not roles:
         raise ValueError("at least one role is required")
@@ -212,18 +237,24 @@ def _validate_registry(data):
 
 
 def ensure_role_registry():
-    if not ROLE_REGISTRY_PATH.exists():
-        save_role_registry(default_role_registry())
-    return load_role_registry()
+    with role_registry_transaction() as anchor:
+        if not regular_file_exists(anchor, ROLE_REGISTRY_PATH.name):
+            _save_role_registry_unlocked(default_role_registry(), anchor)
+        return _load_role_registry_unlocked(anchor)
+
+
+def _load_role_registry_unlocked(anchor):
+    data = tomllib.loads(read_anchored_text(anchor, ROLE_REGISTRY_PATH.name))
+    data.setdefault("roles", {})
+    data.setdefault("default_role", "general")
+    data.setdefault("generation", 0)
+    _validate_registry(data)
+    return data
 
 
 def load_role_registry():
-    with ROLE_REGISTRY_PATH.open("rb") as handle:
-        data = tomllib.load(handle)
-    data.setdefault("roles", {})
-    data.setdefault("default_role", "general")
-    _validate_registry(data)
-    return data
+    with role_registry_transaction() as anchor:
+        return _load_role_registry_unlocked(anchor)
 
 
 def list_roles(include_disabled=True):
@@ -239,14 +270,14 @@ def list_roles(include_disabled=True):
 
 
 def get_role(role_id):
-    resolved = resolve_role_id(role_id)
-    data = ensure_role_registry()
-    return RoleRecord.from_dict(resolved, data["roles"][resolved])
+    with role_registry_transaction():
+        data = ensure_role_registry()
+        resolved = _resolve_role_id_from(data, role_id)
+        return RoleRecord.from_dict(resolved, data["roles"][resolved])
 
 
-def resolve_role_id(name):
+def _resolve_role_id_from(data, name):
     key = name.strip().lower()
-    data = ensure_role_registry()
 
     if key in data["roles"]:
         return key
@@ -260,6 +291,11 @@ def resolve_role_id(name):
             return role_id
 
     raise KeyError(f"unknown role: {name}")
+
+
+def resolve_role_id(name):
+    with role_registry_transaction():
+        return _resolve_role_id_from(ensure_role_registry(), name)
 
 
 def default_role_id():
@@ -279,72 +315,78 @@ def create_role(
     description="",
 ):
     role_id = role_id.lower()
-    data = ensure_role_registry()
-    if role_id in data["roles"]:
-        raise ValueError(f"role already exists: {role_id}")
+    with role_registry_transaction():
+        data = ensure_role_registry()
+        if role_id in data["roles"]:
+            raise ValueError(f"role already exists: {role_id}")
 
-    data["roles"][role_id] = {
-        "display_name": display_name or role_id.title(),
-        "description": description,
-        "enabled": bool(model),
-        "runtime_id": runtime_id or role_id,
-        "model": model,
-        "profile": profile,
-        "execution": execution,
-        "capabilities": list(capabilities or []),
-        "aliases": list(aliases or []),
-    }
-    save_role_registry(data)
-    return get_role(role_id)
+        data["roles"][role_id] = {
+            "display_name": display_name or role_id.title(),
+            "description": description,
+            "enabled": bool(model),
+            "runtime_id": runtime_id or role_id,
+            "model": model,
+            "profile": profile,
+            "execution": execution,
+            "capabilities": list(capabilities or []),
+            "aliases": list(aliases or []),
+        }
+        save_role_registry(data)
+        return RoleRecord.from_dict(role_id, data["roles"][role_id])
 
 
 def remove_role(role_id):
-    role_id = resolve_role_id(role_id)
-    data = ensure_role_registry()
-    if role_id == data.get("default_role"):
-        raise ValueError(
-            f"cannot remove default role {role_id!r}; set another default first"
-        )
-    if len(data["roles"]) <= 1:
-        raise ValueError("at least one role is required")
-    del data["roles"][role_id]
-    save_role_registry(data)
+    with role_registry_transaction():
+        data = ensure_role_registry()
+        role_id = _resolve_role_id_from(data, role_id)
+        if role_id == data.get("default_role"):
+            raise ValueError(
+                f"cannot remove default role {role_id!r}; set another default first"
+            )
+        if len(data["roles"]) <= 1:
+            raise ValueError("at least one role is required")
+        del data["roles"][role_id]
+        save_role_registry(data)
 
 
 def set_role_enabled(role_id, enabled):
-    role_id = resolve_role_id(role_id)
-    data = ensure_role_registry()
-    if not enabled and role_id == data.get("default_role"):
-        raise ValueError("cannot disable the default role")
-    if enabled and not data["roles"][role_id].get("model"):
-        raise ValueError("cannot enable an unbound role")
-    data["roles"][role_id]["enabled"] = bool(enabled)
-    save_role_registry(data)
+    with role_registry_transaction():
+        data = ensure_role_registry()
+        role_id = _resolve_role_id_from(data, role_id)
+        if not enabled and role_id == data.get("default_role"):
+            raise ValueError("cannot disable the default role")
+        if enabled and not data["roles"][role_id].get("model"):
+            raise ValueError("cannot enable an unbound role")
+        data["roles"][role_id]["enabled"] = bool(enabled)
+        save_role_registry(data)
 
 
 def set_default_role(role_id):
-    role_id = resolve_role_id(role_id)
-    data = ensure_role_registry()
-    if not data["roles"][role_id].get("enabled", True):
-        raise ValueError("default role must be enabled")
-    data["default_role"] = role_id
-    save_role_registry(data)
+    with role_registry_transaction():
+        data = ensure_role_registry()
+        role_id = _resolve_role_id_from(data, role_id)
+        if not data["roles"][role_id].get("enabled", True):
+            raise ValueError("default role must be enabled")
+        data["default_role"] = role_id
+        save_role_registry(data)
 
 
 def bind_model(role_id, model_alias):
-    role_id = resolve_role_id(role_id)
-    models = ensure_registry().get("models", {})
-    if model_alias and model_alias not in models:
-        raise ValueError(f"unknown model alias: {model_alias}")
-    data = ensure_role_registry()
-    data["roles"][role_id]["model"] = model_alias
-    save_role_registry(data)
+    with role_registry_transaction():
+        models = ensure_registry().get("models", {})
+        if model_alias and model_alias not in models:
+            raise ValueError(f"unknown model alias: {model_alias}")
+        data = ensure_role_registry()
+        role_id = _resolve_role_id_from(data, role_id)
+        data["roles"][role_id]["model"] = model_alias
+        save_role_registry(data)
 
 
 def set_role_profile(role_id, profile):
-    role_id = resolve_role_id(role_id)
     if profile not in {"compact", "normal", "extended"}:
         raise ValueError("profile must be compact, normal or extended")
-    data = ensure_role_registry()
-    data["roles"][role_id]["profile"] = profile
-    save_role_registry(data)
+    with role_registry_transaction():
+        data = ensure_role_registry()
+        role_id = _resolve_role_id_from(data, role_id)
+        data["roles"][role_id]["profile"] = profile
+        save_role_registry(data)

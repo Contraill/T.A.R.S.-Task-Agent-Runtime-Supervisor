@@ -19,8 +19,8 @@ Implemented in the current reference build:
 - role-aware ContextManager with native tokenizer budgeting
 - streaming model output and backend-emitted reasoning visibility
 - durable task-run state with safe-boundary pause/cancel controls
-- generated, transactional llama-swap runtime configuration
-- transactional Role assignment, unassignment, model swap and profile changes
+- generated, cross-process transactional llama-swap runtime configuration
+- generation-fenced Role assignment, unassignment, model swap and profile changes
 - user-service start, stop and log controls
 - capability-based delegation, handoff and AUTO routing
 - resumable Hugging Face downloads and local GGUF import
