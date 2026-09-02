@@ -1,5 +1,7 @@
 from dataclasses import asdict
 import json
+import multiprocessing
+import os
 from pathlib import Path
 import hashlib
 import sqlite3
@@ -8,6 +10,42 @@ import zipfile
 import pytest
 
 from tars import backup, state_store
+
+
+def _restore_then_crash(bundle, paths, crash_point):
+    if crash_point in {
+            "after-old-rename", "after-new-rename", "after-several-new-renames"}:
+        original = backup._rename_restore_path
+        installed = 0
+
+        def crashing_rename(root, source, destination):
+            nonlocal installed
+            original(root, source, destination)
+            if (crash_point == "after-old-rename" and destination.endswith("-old")):
+                os._exit(91)
+            if (crash_point == "after-new-rename" and source.endswith("-new")):
+                os._exit(92)
+            if source.endswith("-new"):
+                installed += 1
+                if crash_point == "after-several-new-renames" and installed == 8:
+                    os._exit(94)
+
+        backup._rename_restore_path = crashing_rename
+    elif crash_point == "after-commit":
+        backup._finalize_committed_restore = lambda *args, **kwargs: os._exit(93)
+    backup.restore_bundle(bundle, paths=paths, replace=True)
+
+
+def _recover_then_crash(paths):
+    original = backup._rename_restore_path
+
+    def crashing_rename(root, source, destination):
+        original(root, source, destination)
+        if source.endswith("-old"):
+            os._exit(95)
+
+    backup._rename_restore_path = crashing_rename
+    backup.recover_interrupted_restore(paths=paths)
 
 
 def layout(root):
@@ -226,3 +264,152 @@ def test_post_apply_failure_restores_prior_local_state(monkeypatch, source, tmp_
         backup.restore_bundle(bundle, paths=destination, replace=True)
     assert destination.config_path.read_text() == "prior-config"
     assert not destination.state_db_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("crash_point", "exit_code"),
+    (("after-old-rename", 91), ("after-new-rename", 92),
+     ("after-several-new-renames", 94)),
+)
+def test_process_death_during_restore_rolls_back_from_durable_journal(
+        monkeypatch, source, tmp_path, crash_point, exit_code):
+    bundle = tmp_path / f"{crash_point}.tarsbundle"
+    backup.create_bundle(bundle, paths=source)
+    destination = layout(tmp_path / f"destination-{crash_point}")
+    destination.config_path.parent.mkdir(parents=True)
+    destination.config_path.write_text("prior-config")
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_restore_then_crash, args=(bundle, destination, crash_point))
+    process.start()
+    process.join(15)
+    assert not process.is_alive()
+    assert process.exitcode == exit_code
+
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", destination.state_db_path)
+    with pytest.raises(RuntimeError, match="backup recover"):
+        state_store.ensure_state_store_no_migration()
+    assert backup.recover_interrupted_restore(paths=destination) == 1
+    assert destination.config_path.read_text() == "prior-config"
+    assert not destination.state_db_path.exists()
+    assert not destination.ui_prefs_path.exists()
+    assert not (destination.data_root / "model-registry.toml").exists()
+    assert not (destination.data_root / "role-registry.toml").exists()
+    assert not destination.persona_root.exists()
+    assert not (destination.config_path.parent / "skills").exists()
+    assert not (destination.data_root / "memory").exists()
+    assert not list(destination.state_root.parent.glob(f"{backup.RESTORE_PREFIX}*"))
+
+
+def test_process_death_while_rolling_back_is_recoverable(source, tmp_path):
+    bundle = tmp_path / "rollback-crash.tarsbundle"
+    backup.create_bundle(bundle, paths=source)
+    destination = layout(tmp_path / "destination-rollback-crash")
+    destination.config_path.parent.mkdir(parents=True)
+    destination.config_path.write_text("prior-config")
+    context = multiprocessing.get_context("spawn")
+
+    restore = context.Process(
+        target=_restore_then_crash,
+        args=(bundle, destination, "after-new-rename"))
+    restore.start()
+    restore.join(15)
+    assert restore.exitcode == 92
+
+    recovery = context.Process(target=_recover_then_crash, args=(destination,))
+    recovery.start()
+    recovery.join(15)
+    assert recovery.exitcode == 95
+
+    assert backup.recover_interrupted_restore(paths=destination) == 1
+    assert destination.config_path.read_text() == "prior-config"
+    assert not destination.state_db_path.exists()
+
+
+def test_process_death_restores_prior_database_and_directory_generation(
+        source, tmp_path):
+    bundle = tmp_path / "prior-generation.tarsbundle"
+    backup.create_bundle(bundle, paths=source)
+    destination = layout(tmp_path / "destination-prior-generation")
+    destination.config_path.parent.mkdir(parents=True)
+    destination.config_path.write_text("prior-config")
+    destination.state_db_path.parent.mkdir(parents=True)
+    destination.state_db_path.write_bytes(b"prior-database")
+    prior_memory = destination.data_root / "memory" / "prior"
+    prior_memory.mkdir(parents=True)
+    (prior_memory / "entry.txt").write_text("prior-memory")
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_restore_then_crash,
+        args=(bundle, destination, "after-several-new-renames"))
+    process.start()
+    process.join(15)
+    assert process.exitcode == 94
+
+    assert backup.recover_interrupted_restore(paths=destination) == 1
+    assert destination.config_path.read_text() == "prior-config"
+    assert destination.state_db_path.read_bytes() == b"prior-database"
+    assert (destination.data_root / "memory/prior/entry.txt").read_text() == "prior-memory"
+    assert not (destination.data_root / "memory/profile").exists()
+
+
+def test_process_death_after_durable_commit_keeps_new_state(
+        monkeypatch, source, tmp_path):
+    bundle = tmp_path / "committed.tarsbundle"
+    backup.create_bundle(bundle, paths=source)
+    destination = layout(tmp_path / "destination-committed")
+    destination.config_path.parent.mkdir(parents=True)
+    destination.config_path.write_text("prior-config")
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_restore_then_crash, args=(bundle, destination, "after-commit"))
+    process.start()
+    process.join(15)
+    assert not process.is_alive()
+    assert process.exitcode == 93
+
+    assert destination.config_path.read_text().startswith("[runtime]")
+    monkeypatch.setattr(state_store, "STATE_DB_PATH", destination.state_db_path)
+    with pytest.raises(RuntimeError, match="backup recover"):
+        state_store.ensure_state_store_no_migration()
+    assert backup.recover_interrupted_restore(paths=destination) == 1
+    assert destination.config_path.read_text().startswith("[runtime]")
+    with sqlite3.connect(destination.state_db_path) as conn:
+        assert conn.execute(
+            "SELECT title FROM conversations WHERE id='conv-backup'"
+        ).fetchone()[0] == "Portable"
+    assert not list(destination.state_root.parent.glob(f"{backup.RESTORE_PREFIX}*"))
+
+
+def test_restore_recovery_rejects_journal_path_substitution(tmp_path):
+    destination = layout(tmp_path / "destination")
+    destination.config_path.parent.mkdir(parents=True)
+    transaction_id = "a" * 32
+    transaction = destination.state_root.parent / (
+        backup.RESTORE_PREFIX + transaction_id)
+    transaction.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("keep")
+    (transaction / backup.RESTORE_JOURNAL).write_text(json.dumps({
+        "version": backup.RESTORE_JOURNAL_VERSION,
+        "transaction_id": transaction_id,
+        "status": "applying",
+        "items": [{
+            "member": "config/config.toml",
+            "parent": str(outside),
+            "parent_identity": {"device": 0, "inode": 0, "kind": "directory"},
+            "destination": str(sentinel),
+            "name": "sentinel",
+            "incoming": ".sentinel.restore-substituted-new",
+            "saved": ".sentinel.restore-substituted-old",
+            "existed": True,
+            "original_identity": None,
+            "incoming_identity": None,
+        }],
+    }))
+
+    with pytest.raises(RuntimeError, match="path authority mismatch"):
+        backup.recover_interrupted_restore(paths=destination)
+    assert sentinel.read_text() == "keep"

@@ -7,6 +7,7 @@ CONFIG_PATH = Path.home() / ".config/tars/config.toml"
 DATA_ROOT = Path.home() / ".local/share/tars"
 STATE_ROOT = Path.home() / ".local/state/tars"
 CACHE_ROOT = Path.home() / ".cache/tars"
+RESTORE_RECOVERY_MARKER = ".restore-recovery-required"
 
 REGISTRY_PATH = DATA_ROOT / "model-registry.toml"
 ROLE_REGISTRY_PATH = DATA_ROOT / "role-registry.toml"

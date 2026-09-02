@@ -54,6 +54,50 @@ class AnchoredRoot:
             os.close(current)
             raise
 
+    @classmethod
+    def from_fd(cls, fd, *, display=None):
+        """Duplicate an already-open directory without resolving its pathname again."""
+        instance = cls.__new__(cls)
+        instance.fd = os.dup(fd)
+        value = os.fstat(instance.fd)
+        if not stat.S_ISDIR(value.st_mode):
+            os.close(instance.fd)
+            instance.fd = -1
+            raise NotADirectoryError("anchored root descriptor is not a directory")
+        shown = display if display is not None else f"/proc/self/fd/{fd}"
+        instance.path = Path(os.path.abspath(os.fspath(shown)))
+        return instance
+
+    @classmethod
+    def open_or_create(cls, root, *, mode=0o700):
+        """Open a directory path without symlinks, durably creating missing levels."""
+        absolute = Path(os.path.abspath(os.fspath(root)))
+        current = os.open(os.sep, _DIRECTORY_FLAGS)
+        try:
+            for component in absolute.parts[1:]:
+                try:
+                    child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+                except FileNotFoundError:
+                    created = False
+                    try:
+                        os.mkdir(component, mode, dir_fd=current)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+                    if created:
+                        os.fsync(current)
+                        os.fsync(child)
+                os.close(current)
+                current = child
+            instance = cls.__new__(cls)
+            instance.fd = current
+            instance.path = absolute
+            return instance
+        except Exception:
+            os.close(current)
+            raise
+
     def close(self):
         if self.fd >= 0:
             os.close(self.fd)

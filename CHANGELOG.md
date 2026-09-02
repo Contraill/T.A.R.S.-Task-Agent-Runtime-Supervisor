@@ -7,6 +7,8 @@
 - retained portable client metadata while revoking credentials and deleting pairing material
 - validated archive topology, checksums, database integrity and schema compatibility before restore
 - added staged local rollback, schema migration and truthful post-restore reconciliation results
+- made multi-file restore crash-recoverable with durable journals, fsynced commit/rollback,
+  startup fencing and explicit or automatic recovery
 
 ## 0.8.5 - SecretStore
 

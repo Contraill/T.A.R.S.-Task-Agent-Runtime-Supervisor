@@ -135,7 +135,8 @@ from .core_api import CoreAPI, CoreServerConfig, make_server
 from .runtime_routing import LocalRuntimeRouter
 from .extensions import ExtensionLoader
 from .secret_store import SecretStore
-from .backup import create_bundle, inspect_bundle, restore_bundle
+from .backup import (create_bundle, inspect_bundle, recover_interrupted_restore,
+                     restore_bundle, restore_recovery_required)
 
 console = Console()
 
@@ -1813,6 +1814,10 @@ def command_workspace(args):
 
 def command_backup(args):
     try:
+        if args.backup_command == "recover":
+            recovered = recover_interrupted_restore()
+            console.print_json(data={"recovered_transactions": recovered})
+            return 0
         if args.backup_command == "create":
             report = create_bundle(args.path)
         elif args.backup_command == "inspect":
@@ -1844,6 +1849,8 @@ def build_parser():
 
     backup = sub.add_parser("backup", help="create, inspect or restore portable state bundles")
     backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    backup_sub.add_parser(
+        "recover", help="resolve interrupted restore journals to old or committed state")
     for name in ("create", "inspect"):
         item = backup_sub.add_parser(name)
         item.add_argument("path")
@@ -2304,6 +2311,12 @@ def main():
     args = parser.parse_args()
     if args.command == "backup":
         return command_backup(args)
+
+    if restore_recovery_required():
+        console.print(
+            "[red]interrupted restore recovery is required; "
+            "run `tars backup recover`[/red]")
+        return 2
 
     ensure_registry()
     ensure_role_registry()

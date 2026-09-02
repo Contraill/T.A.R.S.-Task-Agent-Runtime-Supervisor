@@ -9,7 +9,8 @@ import os
 import sqlite3
 from pathlib import Path
 
-from .config import STATE_DB_PATH, TASK_INDEX_PATH, TASK_ROOT, TASK_EVENTS_ROOT
+from .config import (RESTORE_RECOVERY_MARKER, STATE_DB_PATH, TASK_EVENTS_ROOT,
+                     TASK_INDEX_PATH, TASK_ROOT)
 
 _STATE_DB_PATH_OVERRIDE = ContextVar("tars_state_db_path", default=None)
 
@@ -1667,6 +1668,10 @@ def set_meta(key: str, value) -> None:
 
 def ensure_state_store_no_migration() -> Path:
     database = current_state_db_path()
+    restore_marker = database.parent / RESTORE_RECOVERY_MARKER
+    if restore_marker.exists() or restore_marker.is_symlink():
+        raise RuntimeError(
+            "interrupted restore recovery is required; run `tars backup recover`")
     database.parent.mkdir(parents=True, exist_ok=True)
     conn = connect()
     try:

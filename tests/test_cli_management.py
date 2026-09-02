@@ -1,5 +1,8 @@
+import sys
+
 import pytest
 
+from tars import cli
 from tars.cli import build_parser
 
 
@@ -13,6 +16,16 @@ def test_management_cli_parsing():
     assert parser.parse_args(["start"]).command == "start"
     assert parser.parse_args(["stop"]).command == "stop"
     assert parser.parse_args(["logs", "--lines", "20"]).lines == 20
+
+
+def test_normal_cli_startup_fails_before_state_initialization_during_restore_recovery(
+        monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["tars", "status"])
+    monkeypatch.setattr(cli, "restore_recovery_required", lambda: True)
+    monkeypatch.setattr(
+        cli, "ensure_registry",
+        lambda: pytest.fail("registry initialization ran during restore recovery"))
+    assert cli.main() == 2
 
 
 def test_model_lifecycle_cli_parsing():
@@ -101,6 +114,7 @@ def test_core_client_cli_surface():
     assert parser.parse_args(["client", "revoke", "client-one"]).client_id == "client-one"
     assert parser.parse_args(["extension", "list"]).extension_command == "list"
     assert parser.parse_args(["backup", "create", "state.tarsbundle"]).backup_command == "create"
+    assert parser.parse_args(["backup", "recover"]).backup_command == "recover"
     restored = parser.parse_args(["backup", "restore", "state.tarsbundle", "--replace"])
     assert restored.backup_command == "restore" and restored.replace
 

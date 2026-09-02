@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
 import tomllib
 import uuid
@@ -28,6 +30,11 @@ BUNDLE_VERSION = 1
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024 * 1024
 MANIFEST = "manifest.json"
 DB_MEMBER = "state/tars-state.sqlite3"
+RESTORE_JOURNAL_VERSION = 1
+RESTORE_PREFIX = ".tars-restore-"
+RESTORE_JOURNAL = "journal.json"
+RESTORE_LOCK = ".tars-restore.lock"
+RESTORE_MARKER = config.RESTORE_RECOVERY_MARKER
 
 
 @dataclass(frozen=True)
@@ -167,8 +174,7 @@ def _snapshot_database(source, destination):
         incoming.close()
 
 
-def create_bundle(destination, *, paths=None):
-    paths = paths or BackupPaths()
+def _create_bundle(destination, *, paths):
     requested = Path(destination).expanduser().absolute()
     requested.parent.mkdir(parents=True, exist_ok=True)
     destination_root = AnchoredRoot(requested.parent.resolve(strict=True))
@@ -402,66 +408,520 @@ def _reconciliation(paths, manifest):
             "source_version": manifest["source_version"]}
 
 
+def _path_identity(value):
+    mode = value.st_mode
+    if stat.S_ISREG(mode):
+        kind = "file"
+    elif stat.S_ISDIR(mode):
+        kind = "directory"
+    else:
+        raise ValueError("restore paths must be regular files or directories")
+    return {"device": int(value.st_dev), "inode": int(value.st_ino), "kind": kind}
+
+
+def _same_identity(value, expected):
+    if value is None or expected is None:
+        return value is None and expected is None
+    try:
+        actual = _path_identity(value)
+    except ValueError:
+        return False
+    return actual == expected
+
+
+def _valid_serialized_identity(value, *, kind=None):
+    if not isinstance(value, dict) or set(value) != {"device", "inode", "kind"}:
+        return False
+    if (not isinstance(value["device"], int) or isinstance(value["device"], bool)
+            or not isinstance(value["inode"], int) or isinstance(value["inode"], bool)
+            or value["device"] < 0 or value["inode"] < 0
+            or value["kind"] not in {"file", "directory"}):
+        return False
+    return kind is None or value["kind"] == kind
+
+
+def _optional_lstat(root, name):
+    try:
+        return root.lstat((name,))
+    except FileNotFoundError:
+        return None
+
+
+def _fsync_tree_fd(fd):
+    value = os.fstat(fd)
+    if stat.S_ISREG(value.st_mode):
+        os.fsync(fd)
+        return
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError("restore staging contains a special filesystem object")
+    for name in os.listdir(fd):
+        child = os.open(
+            name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            _fsync_tree_fd(child)
+        finally:
+            os.close(child)
+    os.fsync(fd)
+
+
+def _fsync_tree(root, name):
+    fd = root.open((name,), os.O_RDONLY)
+    try:
+        _fsync_tree_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_restore_path(root, name):
+    fd = root.open((name,), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _remove_restore_path(root, name, *, expected=None):
+    current = _optional_lstat(root, name)
+    if current is None:
+        return False
+    if expected is not None and not _same_identity(current, expected):
+        raise RuntimeError(f"restore recovery identity changed: {name}")
+    identity = _path_identity(current)
+    root.delete((name,), recursive=identity["kind"] == "directory")
+    os.fsync(root.fd)
+    return True
+
+
+def _rename_restore_path(root, source, destination):
+    root.rename((source,), root, (destination,))
+    os.fsync(root.fd)
+
+
+def _write_restore_journal(root, transaction_name, journal):
+    payload = json.dumps(journal, sort_keys=True, separators=(",", ":")).encode()
+    root.atomic_write((transaction_name, RESTORE_JOURNAL), payload)
+
+
+def _restore_state_root(root, paths, *, create=False):
+    state_root = Path(paths.state_root).absolute()
+    expected_parent = Path(os.path.abspath(state_root.parent))
+    if expected_parent != root.path:
+        raise RuntimeError("restore state root is outside its locked parent")
+    if create:
+        root.makedirs((state_root.name,))
+        os.fsync(root.fd)
+    fd = root.open_directory((state_root.name,))
+    try:
+        return AnchoredRoot.from_fd(fd, display=root.path / state_root.name)
+    finally:
+        os.close(fd)
+
+
+def _write_restore_marker(root, paths, transaction_id):
+    with _restore_state_root(root, paths, create=True) as state_root:
+        state_root.atomic_write((RESTORE_MARKER,), (transaction_id + "\n").encode())
+
+
+def _read_restore_marker(root, paths):
+    try:
+        state_root = _restore_state_root(root, paths)
+    except FileNotFoundError:
+        return None
+    with state_root:
+        try:
+            payload = state_root.read_bytes((RESTORE_MARKER,), limit=128)
+        except FileNotFoundError:
+            return None
+    if len(payload) > 128:
+        raise RuntimeError("restore recovery marker exceeds its safety limit")
+    try:
+        transaction_id = payload.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("restore recovery marker is invalid") from exc
+    if not re.fullmatch(r"[0-9a-f]{32}", transaction_id):
+        raise RuntimeError("restore recovery marker is invalid")
+    return transaction_id
+
+
+def _clear_restore_marker(root, paths, transaction_id):
+    current = _read_restore_marker(root, paths)
+    if current is None:
+        return
+    if current != transaction_id:
+        raise RuntimeError("restore recovery marker belongs to another transaction")
+    with _restore_state_root(root, paths) as state_root:
+        _remove_restore_path(state_root, RESTORE_MARKER)
+
+
+def _read_restore_journal(root, transaction_name):
+    try:
+        payload = root.read_bytes((transaction_name, RESTORE_JOURNAL), limit=1024 * 1024)
+    except FileNotFoundError:
+        transaction_fd = root.open_directory((transaction_name,))
+        try:
+            names = os.listdir(transaction_fd)
+        finally:
+            os.close(transaction_fd)
+        if names and any(not name.startswith(f".{RESTORE_JOURNAL}.tars-") for name in names):
+            raise RuntimeError(
+                f"interrupted legacy restore lacks a durable journal: {transaction_name}")
+        root.delete((transaction_name,), recursive=True)
+        os.fsync(root.fd)
+        return None
+    if len(payload) > 1024 * 1024:
+        raise RuntimeError(f"restore journal exceeds its safety limit: {transaction_name}")
+    try:
+        journal = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid restore journal: {transaction_name}") from exc
+    if not isinstance(journal, dict):
+        raise RuntimeError(f"invalid restore journal: {transaction_name}")
+    return journal
+
+
+def _expected_restore_destination(paths, member):
+    try:
+        destination = Path(_destinations(paths)[member]).absolute()
+    except KeyError as exc:
+        raise RuntimeError(f"restore journal contains an unknown member: {member}") from exc
+    parent = Path(os.path.abspath(destination.parent))
+    return parent, destination.name, str(parent / destination.name)
+
+
+def _validate_restore_journal(root, transaction_name, journal, paths):
+    transaction_id = transaction_name.removeprefix(RESTORE_PREFIX)
+    if (not re.fullmatch(r"[0-9a-f]{32}", transaction_id)
+            or journal.get("version") != RESTORE_JOURNAL_VERSION
+            or journal.get("transaction_id") != transaction_id):
+        raise RuntimeError(f"unsupported or mismatched restore journal: {transaction_name}")
+    if journal.get("status") not in {
+            "validating", "preparing", "prepared", "applying", "rebuilding",
+            "rolling_back", "rolled_back", "committed"}:
+        raise RuntimeError(f"invalid restore journal state: {transaction_name}")
+    items = journal.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError(f"invalid restore journal items: {transaction_name}")
+    members = set()
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("member"), str):
+            raise RuntimeError(f"invalid restore journal item: {transaction_name}")
+        member = item["member"]
+        if member in members:
+            raise RuntimeError(f"duplicate restore journal member: {member}")
+        members.add(member)
+        parent, name, destination = _expected_restore_destination(paths, member)
+        incoming = f".{name}.restore-{transaction_id}-new"
+        saved = f".{name}.restore-{transaction_id}-old"
+        if (item.get("parent") != str(parent)
+                or item.get("destination") != destination
+                or item.get("name") != name
+                or item.get("incoming") != incoming
+                or item.get("saved") != saved):
+            raise RuntimeError(f"restore journal path authority mismatch: {member}")
+        expected_parent = item.get("parent_identity")
+        if not _valid_serialized_identity(expected_parent, kind="directory"):
+            raise RuntimeError(f"restore journal lacks parent identity: {member}")
+        with AnchoredRoot(parent) as parent_root:
+            if _path_identity(os.fstat(parent_root.fd)) != expected_parent:
+                raise RuntimeError(f"restore parent identity changed: {parent}")
+        if not isinstance(item.get("existed"), bool):
+            raise RuntimeError(f"restore journal existence state is invalid: {member}")
+        original = item.get("original_identity")
+        incoming_identity = item.get("incoming_identity")
+        if ((item["existed"] and not _valid_serialized_identity(original))
+                or (not item["existed"] and original is not None)
+                or (incoming_identity is not None
+                    and not _valid_serialized_identity(incoming_identity))):
+            raise RuntimeError(f"restore journal object identity is invalid: {member}")
+    return items
+
+
+@contextmanager
+def _restore_lock(paths):
+    lock_parent = Path(paths.state_root).parent
+    root = AnchoredRoot.open_or_create(lock_parent)
+    lock_fd = -1
+    try:
+        lock_fd = root.open((RESTORE_LOCK,), os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield root
+    finally:
+        if lock_fd >= 0:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        root.close()
+
+
+def _open_restore_parent(item):
+    root = AnchoredRoot(item["parent"])
+    if _path_identity(os.fstat(root.fd)) != item["parent_identity"]:
+        root.close()
+        raise RuntimeError(f"restore parent identity changed: {item['parent']}")
+    return root
+
+
+def _rollback_restore(root, transaction_name, journal, paths):
+    items = _validate_restore_journal(root, transaction_name, journal, paths)
+    journal["status"] = "rolling_back"
+    _write_restore_journal(root, transaction_name, journal)
+    for item in reversed(items):
+        with _open_restore_parent(item) as parent:
+            destination = _optional_lstat(parent, item["name"])
+            incoming = _optional_lstat(parent, item["incoming"])
+            saved = _optional_lstat(parent, item["saved"])
+            if saved is not None:
+                if not _same_identity(saved, item.get("original_identity")):
+                    raise RuntimeError(
+                        f"restore recovery backup identity changed: {item['member']}")
+                if destination is not None:
+                    if not _same_identity(destination, item.get("incoming_identity")):
+                        raise RuntimeError(
+                            f"restore recovery destination changed: {item['member']}")
+                    _remove_restore_path(
+                        parent, item["name"], expected=item.get("incoming_identity"))
+                _rename_restore_path(parent, item["saved"], item["name"])
+            elif incoming is not None:
+                expected = item.get("incoming_identity")
+                if expected is not None and not _same_identity(incoming, expected):
+                    raise RuntimeError(
+                        f"restore recovery staging identity changed: {item['member']}")
+                _remove_restore_path(parent, item["incoming"], expected=expected)
+            elif _same_identity(destination, item.get("incoming_identity")):
+                if item["existed"]:
+                    raise RuntimeError(
+                        f"restore recovery lost its prior destination: {item['member']}")
+                _remove_restore_path(
+                    parent, item["name"], expected=item.get("incoming_identity"))
+            elif item["existed"] and not _same_identity(
+                    destination, item.get("original_identity")):
+                raise RuntimeError(
+                    f"restore recovery cannot prove the prior destination: {item['member']}")
+            elif not item["existed"] and destination is not None:
+                raise RuntimeError(
+                    f"restore recovery found an unrelated destination: {item['member']}")
+    journal["status"] = "rolled_back"
+    _write_restore_journal(root, transaction_name, journal)
+    _clear_restore_marker(root, paths, journal["transaction_id"])
+    root.delete((transaction_name,), recursive=True)
+    os.fsync(root.fd)
+
+
+def _finalize_committed_restore(root, transaction_name, journal, paths):
+    items = _validate_restore_journal(root, transaction_name, journal, paths)
+    for item in items:
+        with _open_restore_parent(item) as parent:
+            destination = _optional_lstat(parent, item["name"])
+            if not _same_identity(destination, item.get("incoming_identity")):
+                raise RuntimeError(
+                    f"committed restore destination identity changed: {item['member']}")
+            _remove_restore_path(
+                parent, item["saved"], expected=item.get("original_identity"))
+            _remove_restore_path(
+                parent, item["incoming"], expected=item.get("incoming_identity"))
+    _clear_restore_marker(root, paths, journal["transaction_id"])
+    root.delete((transaction_name,), recursive=True)
+    os.fsync(root.fd)
+
+
+def _recover_interrupted_restores(root, paths):
+    recovered = 0
+    transaction_ids = set()
+    for name, value in root.list():
+        if not name.startswith(RESTORE_PREFIX):
+            continue
+        if not stat.S_ISDIR(value.st_mode):
+            raise RuntimeError(f"restore transaction path is not a directory: {name}")
+        journal = _read_restore_journal(root, name)
+        if journal is None:
+            continue
+        transaction_ids.add(journal.get("transaction_id"))
+        if journal.get("status") == "committed":
+            _finalize_committed_restore(root, name, journal, paths)
+        elif journal.get("status") == "validating":
+            _validate_restore_journal(root, name, journal, paths)
+            _clear_restore_marker(root, paths, journal["transaction_id"])
+            root.delete((name,), recursive=True)
+            os.fsync(root.fd)
+        else:
+            _rollback_restore(root, name, journal, paths)
+        recovered += 1
+    marker = _read_restore_marker(root, paths)
+    if marker is not None and marker not in transaction_ids:
+        raise RuntimeError(
+            "restore recovery marker has no matching durable journal")
+    return recovered
+
+
+def recover_interrupted_restore(*, paths=None):
+    """Resolve every durable restore journal to its old or committed state."""
+    paths = paths or BackupPaths()
+    with _restore_lock(paths) as root:
+        return _recover_interrupted_restores(root, paths)
+
+
+def restore_recovery_required(*, paths=None):
+    paths = paths or BackupPaths()
+    try:
+        (Path(paths.state_root) / RESTORE_MARKER).lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def create_bundle(destination, *, paths=None):
+    """Create a bundle only after resolving any interrupted local restore."""
+    paths = paths or BackupPaths()
+    with _restore_lock(paths) as root:
+        _recover_interrupted_restores(root, paths)
+        return _create_bundle(destination, paths=paths)
+
+
+def _build_restore_items(staging, paths, transaction_id):
+    items = []
+    anchors = {}
+    try:
+        for member, requested_destination in _destinations(paths).items():
+            source = staging / member
+            if not (source.is_file() or source.is_dir()):
+                continue
+            destination = Path(requested_destination).absolute()
+            parent_path = Path(os.path.abspath(destination.parent))
+            key = str(parent_path)
+            parent = anchors.get(key)
+            if parent is None:
+                parent = AnchoredRoot.open_or_create(parent_path)
+                anchors[key] = parent
+            name = destination.name
+            incoming = f".{name}.restore-{transaction_id}-new"
+            saved = f".{name}.restore-{transaction_id}-old"
+            if (_optional_lstat(parent, incoming) is not None
+                    or _optional_lstat(parent, saved) is not None):
+                raise RuntimeError(f"restore transaction path collision: {member}")
+            current = _optional_lstat(parent, name)
+            original = _path_identity(current) if current is not None else None
+            items.append({
+                "member": member,
+                "parent": key,
+                "parent_identity": _path_identity(os.fstat(parent.fd)),
+                "destination": str(parent_path / name),
+                "name": name,
+                "incoming": incoming,
+                "saved": saved,
+                "existed": current is not None,
+                "original_identity": original,
+                "incoming_identity": None,
+            })
+    except Exception:
+        for anchor in anchors.values():
+            anchor.close()
+        raise
+    return items, anchors
+
+
+def _prepare_restore_items(source_root, items, anchors, journal, root, transaction_name):
+    for item in items:
+        parent = anchors[item["parent"]]
+        source_parts = PurePosixPath(item["member"]).parts
+        source_root.copy_to(source_parts, parent, (item["incoming"],))
+        _fsync_tree(parent, item["incoming"])
+        item["incoming_identity"] = _path_identity(
+            parent.lstat((item["incoming"],)))
+        _write_restore_journal(root, transaction_name, journal)
+
+
+def _apply_restore_items(items, anchors, journal, root, transaction_name):
+    journal["status"] = "applying"
+    journal["applied_count"] = 0
+    journal["applying_index"] = None
+    _write_restore_journal(root, transaction_name, journal)
+    for index, item in enumerate(items):
+        parent = anchors[item["parent"]]
+        journal["applying_index"] = index
+        _write_restore_journal(root, transaction_name, journal)
+        current = _optional_lstat(parent, item["name"])
+        if item["existed"]:
+            if not _same_identity(current, item["original_identity"]):
+                raise RuntimeError(
+                    f"restore destination changed before commit: {item['member']}")
+            _fsync_restore_path(parent, item["name"])
+            _rename_restore_path(parent, item["name"], item["saved"])
+        elif current is not None:
+            raise RuntimeError(
+                f"restore destination appeared before commit: {item['member']}")
+        _rename_restore_path(parent, item["incoming"], item["name"])
+        journal["applied_count"] = index + 1
+        _write_restore_journal(root, transaction_name, journal)
+    journal["applying_index"] = None
+
+
 def restore_bundle(bundle, *, paths=None, replace=False):
     if not replace:
         raise PermissionError("restore requires explicit replace=True")
     paths = paths or BackupPaths()
-    paths.state_root.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-            prefix=".tars-restore-", dir=paths.state_root.parent) as temporary:
-        staging = Path(temporary) / "staging"
-        staging.mkdir()
-        manifest = _read_and_validate(bundle, staging)
-        recovery = Path(temporary) / "recovery"
-        recovery.mkdir()
-        applied = []
-        rebuilt_memory_entries = 0
+    with _restore_lock(paths) as restore_root:
+        _recover_interrupted_restores(restore_root, paths)
+        transaction_id = uuid.uuid4().hex
+        transaction_name = RESTORE_PREFIX + transaction_id
+        restore_root.mkdir((transaction_name,))
+        os.fsync(restore_root.fd)
+        journal = {
+            "version": RESTORE_JOURNAL_VERSION,
+            "transaction_id": transaction_id,
+            "status": "validating",
+            "items": [],
+        }
+        _write_restore_journal(restore_root, transaction_name, journal)
+        _write_restore_marker(restore_root, paths, transaction_id)
+        transaction_path = Path(f"/proc/self/fd/{restore_root.fd}") / transaction_name
+        staging = transaction_path / "staging"
+        restore_root.mkdir((transaction_name, "staging"))
+        staging_fd = restore_root.open_directory((transaction_name, "staging"))
+        source_root = AnchoredRoot.from_fd(staging_fd, display=staging)
+        os.close(staging_fd)
+        manifest = None
+        anchors = {}
+        committed = False
         try:
-            for member, destination in _destinations(paths).items():
-                source = staging / member
-                matching = source.is_file() or source.is_dir()
-                if not matching:
-                    continue
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                saved = recovery / str(len(applied))
-                existed = destination.exists()
-                incoming = destination.with_name(
-                    f".{destination.name}.restore-{uuid.uuid4().hex}")
-                try:
-                    if source.is_dir():
-                        shutil.copytree(source, incoming)
-                        for directory in (incoming, *(
-                                item for item in incoming.rglob("*") if item.is_dir())):
-                            directory.chmod(0o700)
-                        for file in (item for item in incoming.rglob("*") if item.is_file()):
-                            file.chmod(0o600)
-                    else:
-                        shutil.copy2(source, incoming)
-                        incoming.chmod(0o600)
-                    if existed:
-                        destination.replace(saved)
-                    applied.append((destination, saved, existed))
-                    incoming.replace(destination)
-                except Exception:
-                    if incoming.is_dir():
-                        shutil.rmtree(incoming)
-                    else:
-                        incoming.unlink(missing_ok=True)
-                    raise
+            manifest = _read_and_validate(bundle, staging)
+            items, anchors = _build_restore_items(staging, paths, transaction_id)
+            journal["items"] = items
+            journal["status"] = "preparing"
+            _write_restore_journal(restore_root, transaction_name, journal)
+            _prepare_restore_items(
+                source_root, items, anchors, journal, restore_root, transaction_name)
+            journal["status"] = "prepared"
+            _write_restore_journal(restore_root, transaction_name, journal)
+            _apply_restore_items(
+                items, anchors, journal, restore_root, transaction_name)
+            journal["status"] = "rebuilding"
+            _write_restore_journal(restore_root, transaction_name, journal)
             rebuilt_memory_entries = memory.rebuild_index(
                 memory_root=paths.data_root / "memory",
                 state_db_path=paths.state_db_path)
+            reconciliation = _reconciliation(paths, manifest)
+            reconciliation["memory_index_entries_rebuilt"] = rebuilt_memory_entries
+            journal["status"] = "committed"
+            _write_restore_journal(restore_root, transaction_name, journal)
+            committed = True
+            _finalize_committed_restore(
+                restore_root, transaction_name, journal, paths)
         except Exception:
-            for destination, saved, existed in reversed(applied):
-                if destination.is_dir():
-                    shutil.rmtree(destination)
+            if not committed:
+                durable_journal = _read_restore_journal(
+                    restore_root, transaction_name)
+                if durable_journal is not None and durable_journal.get(
+                        "status") == "committed":
+                    committed = True
                 else:
-                    destination.unlink(missing_ok=True)
-                if existed:
-                    saved.replace(destination)
+                    _rollback_restore(
+                        restore_root, transaction_name,
+                        durable_journal or journal, paths)
             raise
-    reconciliation = _reconciliation(paths, manifest)
-    reconciliation["memory_index_entries_rebuilt"] = rebuilt_memory_entries
+        finally:
+            source_root.close()
+            for anchor in anchors.values():
+                anchor.close()
     return _report(bundle, manifest, reconciliation=reconciliation)
 
 
