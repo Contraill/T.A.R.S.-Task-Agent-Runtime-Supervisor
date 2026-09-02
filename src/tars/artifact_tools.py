@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import stat
 import subprocess
 import tarfile
+import tempfile
 import zipfile
 
 from .policy import ScopeRequest, canonical_path
@@ -49,9 +52,52 @@ class ArtifactRuntime:
                 session_id=session_id, allowed_paths=self.roots, destructive=destructive,
             )))
         actions = self.runtime.authorize(tuple(requests), approval_ids)
-        return actions, [Path(canonical_path(path)) for path in reads], [
-            Path(canonical_path(path)) for path in writes
+        return actions, [Path(os.path.abspath(os.fspath(path))) for path in reads], [
+            Path(os.path.abspath(os.fspath(path))) for path in writes
         ]
+
+    def anchored(self, path):
+        return select_anchor(self.anchors, path)
+
+    def reader(self, path, *, text=False, encoding="utf-8", errors="strict"):
+        anchor, parts, _ = self.anchored(path)
+        return anchor.reader(parts, text=text, encoding=encoding, errors=errors)
+
+    def writer(self, path, *, text=False, encoding="utf-8", newline=None,
+               require_existing=False, expected_identity=None):
+        anchor, parts, _ = self.anchored(path)
+        return anchor.atomic_writer(
+            parts, text=text, encoding=encoding, newline=newline,
+            require_existing=require_existing, expected_identity=expected_identity,
+        )
+
+    def read_bytes(self, path, *, limit=None):
+        anchor, parts, _ = self.anchored(path)
+        return anchor.read_bytes(parts, limit=limit)
+
+    def hash(self, path, *, algorithm="sha256"):
+        anchor, parts, _ = self.anchored(path)
+        return anchor.hash(parts, algorithm=algorithm)
+
+    def stat(self, path):
+        anchor, parts, _ = self.anchored(path)
+        return anchor.stat(parts)
+
+    def makedirs(self, path):
+        anchor, parts, _ = self.anchored(path)
+        anchor.makedirs(parts)
+
+    def atomic_write(self, path, payload, *, require_existing=False,
+                     expected_identity=None):
+        anchor, parts, _ = self.anchored(path)
+        anchor.atomic_write(
+            parts, payload, require_existing=require_existing,
+            expected_identity=expected_identity,
+        )
+
+    def copy_fd(self, path, source_fd):
+        anchor, parts, _ = self.anchored(path)
+        return anchor.copy_fd_to(source_fd, parts)
 
     def result(self, tool, actions, data, *, task_id=None, evidence_source=None,
                evidence_type="artifact", state="succeeded", error=""):
@@ -83,14 +129,8 @@ class IntegrityTools:
             arguments={"algorithm": algorithm},
         )
         target = reads[0]
-        digest = hashlib.new(algorithm)
-        size = 0
         try:
-            with target.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                    size += len(chunk)
-            value = digest.hexdigest()
+            value, size = self.artifacts.hash(target, algorithm=algorithm)
             verified = expected is None or value.casefold() == expected.casefold()
             data = {"path": str(target), "algorithm": algorithm, "digest": value,
                     "bytes": size, "expected": expected, "verified": verified}
@@ -111,8 +151,10 @@ class IntegrityTools:
         )
         target = reads[0]
         try:
+            with self.artifacts.reader(target, text=True, errors="replace") as handle:
+                content = handle.read()
             data = verify_artifact(target, claims, task_id=task_id,
-                                   event_uuid=actions[0].event_uuid)
+                                   event_uuid=actions[0].event_uuid, content=content)
         except Exception as exc:
             self.artifacts.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
@@ -131,12 +173,20 @@ class ArchiveTools:
         self.artifacts = ArtifactRuntime(roots, runtime=runtime)
 
     @staticmethod
-    def _kind(path: Path) -> str:
-        if zipfile.is_zipfile(path):
+    def _kind(handle) -> str:
+        if zipfile.is_zipfile(handle):
+            handle.seek(0)
             return "zip"
-        if tarfile.is_tarfile(path):
+        handle.seek(0)
+        try:
+            with tarfile.open(fileobj=handle, mode="r:*"):
+                pass
+        except tarfile.TarError:
+            handle.seek(0)
+        else:
+            handle.seek(0)
             return "tar"
-        raise ValueError(f"unsupported archive format: {path}")
+        raise ValueError("unsupported archive format")
 
     def list(self, path, *, task_id=None, session_id=None):
         actions, reads, _ = self.artifacts.authorize(
@@ -144,17 +194,19 @@ class ArchiveTools:
         )
         target = reads[0]
         try:
-            kind = self._kind(target)
-            if kind == "zip":
-                with zipfile.ZipFile(target) as archive:
-                    members = [{"name": item.filename, "size": item.file_size,
-                                "compressed_size": item.compress_size,
-                                "directory": item.is_dir()} for item in archive.infolist()]
-            else:
-                with tarfile.open(target) as archive:
-                    members = [{"name": item.name, "size": item.size,
-                                "directory": item.isdir(), "symlink": item.issym() or item.islnk()}
-                               for item in archive.getmembers()]
+            with self.artifacts.reader(target) as handle:
+                kind = self._kind(handle)
+                if kind == "zip":
+                    with zipfile.ZipFile(handle) as archive:
+                        members = [{"name": item.filename, "size": item.file_size,
+                                    "compressed_size": item.compress_size,
+                                    "directory": item.is_dir()} for item in archive.infolist()]
+                else:
+                    with tarfile.open(fileobj=handle, mode="r:*") as archive:
+                        members = [{"name": item.name, "size": item.size,
+                                    "directory": item.isdir(),
+                                    "symlink": item.issym() or item.islnk()}
+                                   for item in archive.getmembers()]
             data = {"path": str(target), "format": kind, "members": members}
         except Exception as exc:
             self.artifacts.runtime.finish(actions, state="failed", result={"error": str(exc)})
@@ -178,7 +230,7 @@ class ArchiveTools:
             extracted = []
             source_fd = source_anchor.open(source_parts, os.O_RDONLY)
             source_handle = os.fdopen(source_fd, "rb")
-            kind = "zip" if zipfile.is_zipfile(source_handle) else "tar"
+            kind = self._kind(source_handle)
             source_handle.seek(0)
             if kind == "zip":
                 with source_handle, zipfile.ZipFile(source_handle) as archive:
@@ -248,31 +300,59 @@ class ArchiveTools:
                                           result={"error": "unsupported archive format"})
             raise ValueError(f"unsupported archive format: {kind}")
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            for source in reads:
-                if source.is_symlink() or (source.is_dir() and any(
-                    item.is_symlink() for item in source.rglob("*")
-                )):
-                    raise ValueError("archive creation does not include symbolic links")
-            if kind == "zip":
-                with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
-                    for source in reads:
-                        if source.is_dir():
-                            for item in sorted(source.rglob("*")):
-                                if item.is_file() and not item.is_symlink():
-                                    archive.write(item, Path(source.name) / item.relative_to(source))
-                        else:
-                            archive.write(source, source.name)
-            else:
-                modes = {"tar": "w", "tar.gz": "w:gz", "tgz": "w:gz",
-                         "tar.bz2": "w:bz2", "tar.xz": "w:xz"}
-                with tarfile.open(destination, modes[kind]) as archive:
-                    for source in reads:
-                        archive.add(source, arcname=source.name, recursive=True)
-            digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+            with tempfile.NamedTemporaryFile(suffix="." + kind.replace(".", "-")) as staged:
+                if kind == "zip":
+                    with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as archive:
+                        for source in reads:
+                            anchor, parts, display = self.artifacts.anchored(source)
+                            mode = anchor.lstat(parts).st_mode
+                            if stat.S_ISREG(mode):
+                                source_entries = ((display.name, anchor.open(parts, os.O_RDONLY)),)
+                            elif stat.S_ISDIR(mode):
+                                source_entries = ((str(Path(display.name).joinpath(
+                                    *relative[len(parts):])), fd)
+                                                  for relative, fd in anchor.walk_files(
+                                                      parts, reject_symlinks=True))
+                            else:
+                                raise ValueError("archive sources must be regular files or directories")
+                            for archive_name, fd in source_entries:
+                                with os.fdopen(os.dup(fd), "rb") as src, archive.open(
+                                        archive_name, "w") as dst:
+                                    shutil.copyfileobj(src, dst)
+                                if stat.S_ISREG(mode):
+                                    os.close(fd)
+                else:
+                    modes = {"tar": "w", "tar.gz": "w:gz", "tgz": "w:gz",
+                             "tar.bz2": "w:bz2", "tar.xz": "w:xz"}
+                    with tarfile.open(fileobj=staged, mode=modes[kind]) as archive:
+                        for source in reads:
+                            anchor, parts, display = self.artifacts.anchored(source)
+                            mode = anchor.lstat(parts).st_mode
+                            if stat.S_ISREG(mode):
+                                source_entries = ((display.name, anchor.open(parts, os.O_RDONLY)),)
+                            elif stat.S_ISDIR(mode):
+                                source_entries = ((str(Path(display.name).joinpath(
+                                    *relative[len(parts):])), fd)
+                                                  for relative, fd in anchor.walk_files(
+                                                      parts, reject_symlinks=True))
+                            else:
+                                raise ValueError("archive sources must be regular files or directories")
+                            for archive_name, fd in source_entries:
+                                value = os.fstat(fd)
+                                member = tarfile.TarInfo(archive_name)
+                                member.size = value.st_size
+                                member.mode = value.st_mode & 0o777
+                                member.mtime = int(value.st_mtime)
+                                with os.fdopen(os.dup(fd), "rb") as src:
+                                    archive.addfile(member, src)
+                                if stat.S_ISREG(mode):
+                                    os.close(fd)
+                staged.flush()
+                os.fsync(staged.fileno())
+                digest, written = self.artifacts.copy_fd(destination, staged.fileno())
             data = {"path": str(destination), "format": kind,
                     "sources": [str(path) for path in reads], "sha256": digest,
-                    "bytes": destination.stat().st_size}
+                    "bytes": written}
         except Exception as exc:
             self.artifacts.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
@@ -316,7 +396,11 @@ class PDFTools:
             return self.artifacts.result("pdf.info", actions, data, task_id=task_id,
                                          evidence_source=target, state="unavailable",
                                          error=data["reason"])
-        proc = self.runner([binary, str(target)], capture_output=True, text=True, check=False)
+        with self.artifacts.reader(target) as handle:
+            proc = self.runner(
+                [binary, f"/proc/self/fd/{handle.fileno()}"], capture_output=True,
+                text=True, check=False, pass_fds=(handle.fileno(),),
+            )
         values = dict(line.split(":", 1) for line in proc.stdout.splitlines() if ":" in line)
         data = {"path": str(target), "exit_code": proc.returncode,
                 "metadata": {key.strip(): value.strip() for key, value in values.items()},
@@ -337,8 +421,10 @@ class PDFTools:
         argv = [binary]
         if pages:
             argv.extend(["-f", str(min(pages)), "-l", str(max(pages))])
-        argv.extend([str(target), "-"])
-        proc = self.runner(argv, capture_output=True, text=True, check=False)
+        with self.artifacts.reader(target) as handle:
+            argv.extend([f"/proc/self/fd/{handle.fileno()}", "-"])
+            proc = self.runner(argv, capture_output=True, text=True, check=False,
+                               pass_fds=(handle.fileno(),))
         data = {"path": str(target), "text": proc.stdout, "exit_code": proc.returncode,
                 "pages": list(pages) if pages else None, "stderr": proc.stderr}
         state = "succeeded" if proc.returncode == 0 else "failed"
@@ -371,14 +457,25 @@ class PDFTools:
             data = {"available": False, "reason": "pdftoppm unavailable"}
             return self.artifacts.result("pdf.render", actions, data, state="unavailable",
                                          error=data["reason"])
-        destination.mkdir(parents=True, exist_ok=True)
-        prefix = destination / "page"
-        argv = [binary, "-png", "-r", str(int(dpi))]
-        if pages:
-            argv.extend(["-f", str(min(pages)), "-l", str(max(pages))])
-        argv.extend([str(target), str(prefix)])
-        proc = self.runner(argv, capture_output=True, text=True, check=False)
-        outputs = sorted(str(path) for path in destination.glob("page-*.png"))
+        self.artifacts.makedirs(destination)
+        with tempfile.TemporaryDirectory(prefix="tars-pdf-render-") as stage:
+            prefix = Path(stage) / "page"
+            argv = [binary, "-png", "-r", str(int(dpi))]
+            if pages:
+                argv.extend(["-f", str(min(pages)), "-l", str(max(pages))])
+            with self.artifacts.reader(target) as handle:
+                argv.extend([f"/proc/self/fd/{handle.fileno()}", str(prefix)])
+                proc = self.runner(argv, capture_output=True, text=True, check=False,
+                                   pass_fds=(handle.fileno(),))
+            outputs = []
+            for staged in sorted(Path(stage).glob("page-*.png")):
+                output = destination / staged.name
+                fd = os.open(staged, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                try:
+                    self.artifacts.copy_fd(output, fd)
+                finally:
+                    os.close(fd)
+                outputs.append(str(output))
         data = {"source": str(target), "output_dir": str(destination), "files": outputs,
                 "exit_code": proc.returncode, "stderr": proc.stderr, "dpi": int(dpi)}
         verified = proc.returncode == 0 and bool(outputs)
@@ -413,32 +510,40 @@ class PDFTools:
         destination = writes[0]
         try:
             PdfReader, PdfWriter = self._pypdf()
-            readers = [PdfReader(str(path)) for path in reads]
-            writer = PdfWriter()
-            source_pages = [page for reader in readers for page in reader.pages]
-            indexes = list(range(len(source_pages))) if pages is None else [int(i) for i in pages]
-            if operation == "delete_pages":
-                removed = set(indexes)
-                indexes = [i for i in range(len(source_pages)) if i not in removed]
-            for index in indexes:
-                page = source_pages[index]
-                if operation == "rotate":
-                    angle = int((rotations or {}).get(index, (rotations or {}).get(str(index), 0)))
-                    if angle % 90:
-                        raise ValueError("PDF rotation must be a multiple of 90 degrees")
-                    page.rotate(angle)
-                writer.add_page(page)
-            if operation == "form_fill":
-                for page in writer.pages:
-                    writer.update_page_form_field_values(page, form_values or {}, auto_regenerate=False)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("wb") as handle:
-                writer.write(handle)
-            verified_pages = len(PdfReader(str(destination)).pages)
+            with ExitStack() as stack:
+                source_handles = [stack.enter_context(self.artifacts.reader(path))
+                                  for path in reads]
+                readers = [PdfReader(handle) for handle in source_handles]
+                writer = PdfWriter()
+                source_pages = [page for reader in readers for page in reader.pages]
+                indexes = (list(range(len(source_pages))) if pages is None
+                           else [int(i) for i in pages])
+                if operation == "delete_pages":
+                    removed = set(indexes)
+                    indexes = [i for i in range(len(source_pages)) if i not in removed]
+                for index in indexes:
+                    page = source_pages[index]
+                    if operation == "rotate":
+                        angle = int((rotations or {}).get(
+                            index, (rotations or {}).get(str(index), 0)
+                        ))
+                        if angle % 90:
+                            raise ValueError("PDF rotation must be a multiple of 90 degrees")
+                        page.rotate(angle)
+                    writer.add_page(page)
+                if operation == "form_fill":
+                    for page in writer.pages:
+                        writer.update_page_form_field_values(
+                            page, form_values or {}, auto_regenerate=False
+                        )
+                with self.artifacts.writer(destination) as handle:
+                    writer.write(handle)
+            with self.artifacts.reader(destination) as handle:
+                verified_pages = len(PdfReader(handle).pages)
+            digest, _ = self.artifacts.hash(destination)
             data = {"operation": operation, "inputs": [str(path) for path in reads],
                     "output": str(destination), "pages": verified_pages,
-                    "regenerated": True,
-                    "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()}
+                    "regenerated": True, "sha256": digest}
         except Exception as exc:
             self.artifacts.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
@@ -481,19 +586,22 @@ class PDFTools:
         source, output_root = reads[0], writes[0]
         try:
             PdfReader, PdfWriter = self._pypdf()
-            reader = PdfReader(str(source))
-            output_root.mkdir(parents=True, exist_ok=True)
+            self.artifacts.makedirs(output_root)
             outputs = []
-            for number, pages in enumerate(page_groups, 1):
-                writer = PdfWriter()
-                for page in pages:
-                    writer.add_page(reader.pages[int(page)])
-                output = output_root / f"part-{number}.pdf"
-                with output.open("wb") as handle:
-                    writer.write(handle)
-                verified_pages = len(PdfReader(str(output)).pages)
-                outputs.append({"path": str(output), "pages": verified_pages,
-                                "sha256": hashlib.sha256(output.read_bytes()).hexdigest()})
+            with self.artifacts.reader(source) as source_handle:
+                reader = PdfReader(source_handle)
+                for number, pages in enumerate(page_groups, 1):
+                    writer = PdfWriter()
+                    for page in pages:
+                        writer.add_page(reader.pages[int(page)])
+                    output = output_root / f"part-{number}.pdf"
+                    with self.artifacts.writer(output) as handle:
+                        writer.write(handle)
+                    with self.artifacts.reader(output) as handle:
+                        verified_pages = len(PdfReader(handle).pages)
+                    digest, _ = self.artifacts.hash(output)
+                    outputs.append({"path": str(output), "pages": verified_pages,
+                                    "sha256": digest})
             data = {"source": str(source), "output_dir": str(output_root),
                     "parts": outputs, "regenerated": True}
         except Exception as exc:

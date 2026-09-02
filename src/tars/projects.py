@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import uuid
 
+from .secure_paths import AnchoredRoot
 from .state_store import connect, ensure_state_store, json_dumps, json_loads, now_utc, transaction
 
 NATIVE_CONTEXT = ("TARS.md", ".tars.md")
@@ -18,18 +19,27 @@ class ProjectContext:
 
 
 def discover_project_context(path: str | Path, *, max_bytes=131072) -> ProjectContext:
-    root = Path(path).expanduser().resolve()
+    root = Path(path).expanduser().resolve(strict=True)
+    anchor = AnchoredRoot(root)
     files = []
     remaining = max(0, int(max_bytes))
     sections = []
-    for name in (*NATIVE_CONTEXT, *COMPAT_CONTEXT):
-        candidate = root / name
-        if not candidate.is_file() or candidate in files or remaining <= 0:
-            continue
-        text = candidate.read_text(encoding="utf-8", errors="replace")[:remaining]
-        remaining -= len(text.encode("utf-8"))
-        files.append(candidate)
-        sections.append(f"## {name}\n\n{text.strip()}")
+    try:
+        for name in (*NATIVE_CONTEXT, *COMPAT_CONTEXT):
+            candidate = root / name
+            if candidate in files or remaining <= 0:
+                continue
+            try:
+                with anchor.reader((name,)) as handle:
+                    payload = handle.read(remaining)
+            except (FileNotFoundError, IsADirectoryError, OSError, ValueError):
+                continue
+            text = payload.decode("utf-8", errors="replace")
+            remaining -= len(payload)
+            files.append(candidate)
+            sections.append(f"## {name}\n\n{text.strip()}")
+    finally:
+        anchor.close()
     return ProjectContext(root, tuple(files), "\n\n".join(sections))
 
 

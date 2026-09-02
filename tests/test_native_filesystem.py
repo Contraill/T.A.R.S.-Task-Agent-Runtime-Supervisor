@@ -1,6 +1,7 @@
 import pytest
 
 from tars import approvals, fs_tools, policy, state_store
+from tars.secure_paths import AnchoredRoot
 
 
 @pytest.fixture
@@ -122,3 +123,50 @@ def test_filesystem_symlink_swap_after_authorization_cannot_escape(filesystem, t
     with pytest.raises(OSError):
         tools.write(target, "secret", approval_id=approval)
     assert not (outside / "payload.txt").exists()
+
+
+@pytest.mark.parametrize("operation", ("read", "stat", "list", "search"))
+def test_filesystem_reads_do_not_follow_post_authorization_parent_swap(
+        filesystem, tmp_path, monkeypatch, operation):
+    tools, root = filesystem
+    inside = root / "inside"
+    inside.mkdir()
+    (inside / "payload.txt").write_text("inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "payload.txt").write_text("outside secret")
+    authorize = tools.runtime.authorize
+
+    def swap_after_authorization(*args, **kwargs):
+        actions = authorize(*args, **kwargs)
+        inside.rename(root / "displaced")
+        inside.symlink_to(outside, target_is_directory=True)
+        return actions
+
+    monkeypatch.setattr(tools.runtime, "authorize", swap_after_authorization)
+    target = inside if operation in {"list", "search"} else inside / "payload.txt"
+    with pytest.raises(OSError):
+        getattr(tools, operation)(target, *(('outside secret',) if operation == "search" else ()))
+
+
+def test_atomic_write_does_not_mutate_an_outside_hard_link(filesystem, tmp_path):
+    tools, root = filesystem
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside original")
+    inside = root / "inside.txt"
+    inside.hardlink_to(outside)
+    approval = _approval("fs.write", "write", inside, (root,))
+    result = tools.write(inside, "inside replacement", approval_id=approval)
+    assert result.succeeded
+    assert inside.read_text() == "inside replacement"
+    assert outside.read_text() == "outside original"
+
+
+def test_anchored_root_rejects_untrusted_relative_components(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    with AnchoredRoot(root) as anchor:
+        with pytest.raises(PermissionError, match="unsafe path component"):
+            anchor.atomic_write(("..", outside.name), b"escape")
+    assert not outside.exists()

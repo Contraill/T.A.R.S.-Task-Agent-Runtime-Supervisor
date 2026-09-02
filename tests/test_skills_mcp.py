@@ -72,6 +72,30 @@ def test_skill_doctor_rejects_invalid_and_symlink_escape(isolated):
     assert not report["ok"] and {item["name"] for item in report["invalid"]} == {"broken", "escape"}
 
 
+def test_project_skill_root_symlink_does_not_escape_project(isolated):
+    project = isolated / "project"
+    (project / ".tars").mkdir(parents=True)
+    outside = isolated / "outside-skills"
+    write_skill(outside, "escape", body="outside instructions")
+    (project / ".tars" / "skills").symlink_to(outside, target_is_directory=True)
+    registry = skills.SkillRegistry(global_root=isolated / "global")
+    assert registry.discover(project_path=project) == []
+
+
+def test_skill_load_rejects_content_changed_after_discovery(isolated, monkeypatch):
+    root = isolated / "skills"
+    folder = write_skill(root, "review", body="approved instructions")
+    registry = skills.SkillRegistry(global_root=root)
+    descriptor = registry.discover()[0]
+    (folder / "SKILL.md").write_text(
+        "---\nname: review\ndescription: A useful skill\nversion: 1.0.0\n"
+        "---\nreplaced instructions\n"
+    )
+    monkeypatch.setattr(registry, "discover", lambda **kwargs: [descriptor])
+    with pytest.raises(RuntimeError, match="changed between discovery"):
+        registry.load("review")
+
+
 class FakeTransport:
     def __init__(self, *, secret_values=(), tools=None):
         self.calls = []

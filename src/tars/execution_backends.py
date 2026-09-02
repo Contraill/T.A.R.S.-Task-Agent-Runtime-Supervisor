@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import os
@@ -19,6 +19,7 @@ from .ownership import (Heartbeat, Owner, claim_workspace, current_owner, held_b
                         release as release_lease)
 from .policy import ScopeGuard, ScopeRequest, canonical_path, normalize_network_target, redact
 from .secret_store import SecretStore, parse_reference
+from .secure_paths import AnchoredRoot, select_anchor
 
 
 @dataclass(frozen=True)
@@ -134,15 +135,40 @@ class ExecutionBackend(Protocol):
 
 
 class _ExecutionAuthorization:
-    def __init__(self, action_ids, *, network_destination=None, ssh_target=None):
+    def __init__(self, action_ids, *, network_destination=None, ssh_target=None,
+                 path_bindings=None):
         self.action_ids = tuple(action_ids)
         self.network_destination = network_destination
         self.ssh_target = ssh_target
+        self.path_bindings = dict(path_bindings or {})
 
 
 def _require_authorization(value):
     if not isinstance(value, _ExecutionAuthorization) or not value.action_ids:
         raise PermissionError("execution backends require guarded authorization")
+
+
+@contextmanager
+def _bound_container_paths(request):
+    needed = []
+    if request.workspace and request.workspace_mode != "ephemeral":
+        needed.append(("workspace", request.workspace, True))
+    needed.extend((f"mount:{index}", mount.source, None)
+                  for index, mount in enumerate(request.mounts))
+    if not needed:
+        yield {}
+        return
+    with ExitStack() as stack:
+        anchors = [stack.enter_context(AnchoredRoot(canonical_path(root)))
+                   for root in request.allowed_paths]
+        bindings = {}
+        for key, target, require_directory in needed:
+            anchor, parts, _ = select_anchor(anchors, target)
+            binding = stack.enter_context(anchor.bind(parts))
+            if require_directory and not binding.is_directory:
+                raise ValueError("container workspace must be a directory")
+            bindings[key] = binding
+        yield bindings
 
 
 def _stamp():
@@ -250,28 +276,44 @@ class ContainerBackend:
             return False
         if not request.workspace:
             return bool(request.mounts)
-        workspace = Path(canonical_path(request.workspace))
+        workspace = Path(os.path.abspath(os.fspath(request.workspace)))
         for mount in request.mounts:
             try:
-                Path(canonical_path(mount.source)).relative_to(workspace)
+                Path(os.path.abspath(os.fspath(mount.source))).relative_to(workspace)
             except ValueError:
                 return True
         return False
 
-    def _command(self, request, *, allow_host_mounts=False):
+    def _command(self, request, *, authorization=None, allow_host_mounts=False):
         if not self.runtime:
             raise RuntimeError("container backend unavailable: podman or docker is required")
         if not self.rootless_verified:
             raise RuntimeError("container backend requires verified rootless execution")
         if not request.image:
             raise ValueError("container image is required")
-        workspace = Path(canonical_path(request.workspace)) if request.workspace else None
-        if request.workspace_mode != "ephemeral" and workspace is None:
-            raise ValueError("host-backed container workspace is required")
-        if workspace is not None and not workspace.is_dir():
-            raise ValueError(f"container workspace is not a directory: {workspace}")
         if request.persistent and not request.container_name:
             raise ValueError("persistent containers require an explicit name")
+        path_bindings = (authorization.path_bindings if authorization is not None else {})
+        workspace_binding = path_bindings.get("workspace")
+        workspace = Path(request.workspace).absolute() if request.workspace else None
+        if request.workspace_mode != "ephemeral" and workspace is None:
+            raise ValueError("host-backed container workspace is required")
+        for mount in request.mounts:
+            source = Path(os.path.abspath(os.fspath(mount.source)))
+            destination = PurePosixPath(mount.destination)
+            if not destination.is_absolute() or ".." in destination.parts:
+                raise ValueError(f"invalid container mount destination: {destination}")
+            try:
+                if workspace is None:
+                    raise ValueError
+                source.relative_to(workspace)
+            except ValueError:
+                if not allow_host_mounts:
+                    raise PermissionError(
+                        "mount outside workspace requires sandbox-escape approval"
+                    )
+        if request.workspace_mode != "ephemeral" and workspace_binding is None:
+            raise PermissionError("container workspace lacks an immutable path binding")
         runtime_name = request.container_name or "tars-" + uuid.uuid4().hex[:12]
         command = [self.runtime, "run", "--name", runtime_name]
         if not request.persistent:
@@ -287,24 +329,15 @@ class ContainerBackend:
             command += ["--tmpfs", "/workspace:rw", "--workdir", "/workspace"]
         else:
             mode = "ro" if request.workspace_mode == "read_only" else "rw"
-            command += ["--volume", f"{workspace}:/workspace:{mode}",
+            command += ["--volume", f"{workspace_binding.proc_path}:/workspace:{mode}",
                         "--workdir", "/workspace"]
-        for mount in request.mounts:
-            source = Path(canonical_path(mount.source))
+        for index, mount in enumerate(request.mounts):
+            binding = path_bindings.get(f"mount:{index}")
+            if binding is None:
+                raise PermissionError("container mount lacks an immutable path binding")
             destination = PurePosixPath(mount.destination)
-            if not source.exists():
-                raise ValueError(f"container mount source does not exist: {source}")
-            if not destination.is_absolute() or ".." in destination.parts:
-                raise ValueError(f"invalid container mount destination: {destination}")
-            try:
-                if workspace is None:
-                    raise ValueError
-                source.relative_to(workspace)
-            except ValueError:
-                if not allow_host_mounts:
-                    raise PermissionError("mount outside workspace requires sandbox-escape approval")
             mode = "ro" if mount.read_only else "rw"
-            command += ["--volume", f"{source}:{destination}:{mode}"]
+            command += ["--volume", f"{binding.proc_path}:{destination}:{mode}"]
         runtime_env = _environment(request.environment_refs, secret_store=self.secret_store,
                                    consumer="execution:container")
         for name in request.environment_refs:
@@ -315,7 +348,9 @@ class ContainerBackend:
 
     def execute(self, request, *, authorization=None, allow_host_mounts=False):
         _require_authorization(authorization)
-        command, environment = self._command(request, allow_host_mounts=allow_host_mounts)
+        command, environment = self._command(
+            request, authorization=authorization, allow_host_mounts=allow_host_mounts
+        )
         started = _stamp()
         try:
             proc = self.runner(
@@ -418,6 +453,17 @@ class GuardedExecutor:
         self.broker = broker or ApprovalBroker()
 
     def execute(self, backend_name, request, *, approval_id=None, task_id=None, session_id=None):
+        binding_context = (_bound_container_paths(request)
+                           if backend_name == "container" else nullcontext({}))
+        with binding_context as path_bindings:
+            return self._execute(
+                backend_name, request, approval_id=approval_id,
+                task_id=task_id, session_id=session_id,
+                path_bindings=path_bindings,
+            )
+
+    def _execute(self, backend_name, request, *, approval_id=None, task_id=None,
+                 session_id=None, path_bindings=None):
         try:
             backend = self.backends[backend_name]
         except KeyError as exc:
@@ -590,6 +636,7 @@ class GuardedExecutor:
                     (action.id for action in actions),
                     network_destination=ssh_destination,
                     ssh_target=configured if backend_name == "ssh" else None,
+                    path_bindings=path_bindings,
                 )
                 result = backend.execute(
                     request, authorization=authorization, allow_host_mounts=escape,

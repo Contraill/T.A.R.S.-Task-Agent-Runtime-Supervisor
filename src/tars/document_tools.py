@@ -4,9 +4,11 @@ import csv
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 
 from .artifact_tools import ArtifactRuntime
 from .tool_core import ToolResult
@@ -32,9 +34,9 @@ class DocumentTools:
         target = reads[0]
         suffix = target.suffix.casefold()
         supported = suffix in self.capabilities()["inspect"]
+        digest, size = self.artifacts.hash(target)
         data = {"path": str(target), "format": suffix.removeprefix("."),
-                "bytes": target.stat().st_size, "supported": supported,
-                "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}
+                "bytes": size, "supported": supported, "sha256": digest}
         return self.artifacts.result("document.inspect", actions, data, task_id=task_id,
                                      evidence_source=target,
                                      state="succeeded" if supported else "unavailable",
@@ -46,11 +48,13 @@ class DocumentTools:
         target = reads[0]
         try:
             if target.suffix.casefold() in self.TEXT_FORMATS:
-                text = target.read_text(errors="replace")
+                with self.artifacts.reader(target, text=True, errors="replace") as handle:
+                    text = handle.read()
             elif target.suffix.casefold() == ".docx" and importlib.util.find_spec("docx"):
                 from docx import Document
-                document = Document(str(target))
-                text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+                with self.artifacts.reader(target) as handle:
+                    document = Document(handle)
+                    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
             else:
                 data = {"path": str(target), "available": False,
                         "reason": "document extraction backend unavailable"}
@@ -79,15 +83,21 @@ class DocumentTools:
             return ToolResult("document.edit", "unavailable", {"path": str(target)},
                               "format is not safely editable",
                               action_ids=tuple(action.id for action in actions))
-        original = target.read_text()
-        updated = original
         try:
+            with self.artifacts.reader(target, text=True) as handle:
+                value = os.fstat(handle.fileno())
+                identity = (value.st_dev, value.st_ino)
+                original = handle.read()
+            updated = original
             for old, new in replacements:
                 count = updated.count(old)
                 if count != 1:
                     raise ValueError(f"edit context must match exactly once; matched {count}")
                 updated = updated.replace(old, new, 1)
-            target.write_text(updated)
+            with self.artifacts.writer(
+                    target, text=True, require_existing=True,
+                    expected_identity=identity) as handle:
+                handle.write(updated)
             data = {"path": str(target), "replacements": len(replacements),
                     "before_sha256": hashlib.sha256(original.encode()).hexdigest(),
                     "after_sha256": hashlib.sha256(updated.encode()).hexdigest()}
@@ -109,13 +119,32 @@ class DocumentTools:
             return self.artifacts.result("document.convert", actions, data,
                                          state="unavailable", error=data["reason"])
         destination = writes[0]
-        destination.mkdir(parents=True, exist_ok=True)
-        proc = self.runner([binary, "--headless", "--convert-to", output_format,
-                            "--outdir", str(destination), str(reads[0])],
-                           capture_output=True, text=True, check=False)
+        self.artifacts.makedirs(destination)
         primary_format = output_format.split(":", 1)[0]
-        expected = destination / f"{reads[0].stem}.{primary_format}"
-        outputs = [str(expected)] if expected.is_file() else []
+        with tempfile.TemporaryDirectory(prefix="tars-document-convert-") as stage:
+            staged_input = Path(stage) / "input"
+            staged_output = Path(stage) / "output"
+            staged_input.mkdir()
+            staged_output.mkdir()
+            staged_source = staged_input / f"source{reads[0].suffix}"
+            with self.artifacts.reader(reads[0]) as source:
+                with staged_source.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+            proc = self.runner(
+                [binary, "--headless", "--convert-to", output_format,
+                 "--outdir", str(staged_output), str(staged_source)],
+                capture_output=True, text=True, check=False,
+            )
+            staged = list(staged_output.glob(f"*.{primary_format}"))
+            outputs = []
+            for item in staged:
+                output = destination / f"{reads[0].stem}.{primary_format}"
+                fd = os.open(item, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                try:
+                    self.artifacts.copy_fd(output, fd)
+                finally:
+                    os.close(fd)
+                outputs.append(str(output))
         data = {"source": str(reads[0]), "output_dir": str(destination), "files": outputs,
                 "exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr,
                 "regenerated": True}
@@ -163,17 +192,18 @@ class SpreadsheetTools:
                                                      task_id=task_id, session_id=session_id)
         target = reads[0]
         if target.suffix.casefold() == ".csv":
-            with target.open(newline="") as handle:
+            with self.artifacts.reader(target, text=True) as handle:
                 rows = list(csv.reader(handle))
             data = {"path": str(target), "format": "csv", "sheets": ["Sheet1"],
                     "rows": len(rows), "columns": max((len(row) for row in rows), default=0)}
         elif target.suffix.casefold() == ".xlsx" and importlib.util.find_spec("openpyxl"):
             from openpyxl import load_workbook
-            workbook = load_workbook(target, read_only=True, data_only=False)
-            data = {"path": str(target), "format": "xlsx", "sheets": workbook.sheetnames,
-                    "dimensions": {sheet.title: sheet.calculate_dimension()
-                                   for sheet in workbook.worksheets}}
-            workbook.close()
+            with self.artifacts.reader(target) as handle:
+                workbook = load_workbook(handle, read_only=True, data_only=False)
+                data = {"path": str(target), "format": "xlsx", "sheets": workbook.sheetnames,
+                        "dimensions": {sheet.title: sheet.calculate_dimension()
+                                       for sheet in workbook.worksheets}}
+                workbook.close()
         else:
             data = {"path": str(target), "available": False,
                     "reason": "spreadsheet format/backend unavailable"}
@@ -189,17 +219,19 @@ class SpreadsheetTools:
         target = reads[0]
         row1, col1, row2, col2 = self._range(cell_range)
         if target.suffix.casefold() == ".csv":
-            with target.open(newline="") as handle:
+            with self.artifacts.reader(target, text=True) as handle:
                 rows = list(csv.reader(handle))
             values = [[rows[r][c] if r < len(rows) and c < len(rows[r]) else ""
                        for c in range(col1, col2 + 1)] for r in range(row1, row2 + 1)]
         elif target.suffix.casefold() == ".xlsx" and importlib.util.find_spec("openpyxl"):
             from openpyxl import load_workbook
-            workbook = load_workbook(target, read_only=True, data_only=not formulas)
-            worksheet = workbook[sheet] if sheet else workbook.active
-            values = [[worksheet.cell(r + 1, c + 1).value for c in range(col1, col2 + 1)]
-                      for r in range(row1, row2 + 1)]
-            workbook.close()
+            with self.artifacts.reader(target) as handle:
+                workbook = load_workbook(handle, read_only=True, data_only=not formulas)
+                worksheet = workbook[sheet] if sheet else workbook.active
+                values = [[worksheet.cell(r + 1, c + 1).value
+                           for c in range(col1, col2 + 1)]
+                          for r in range(row1, row2 + 1)]
+                workbook.close()
         else:
             data = {"available": False, "reason": "spreadsheet backend unavailable"}
             return self.artifacts.result("spreadsheet.read_range", actions, data,
@@ -226,7 +258,9 @@ class SpreadsheetTools:
                                           result={"error": "values do not match range"})
             raise ValueError("values do not match spreadsheet range")
         if target.suffix.casefold() == ".csv":
-            with target.open(newline="") as handle:
+            with self.artifacts.reader(target, text=True) as handle:
+                value = os.fstat(handle.fileno())
+                identity = (value.st_dev, value.st_ino)
                 rows = list(csv.reader(handle))
             while len(rows) <= row2:
                 rows.append([])
@@ -234,25 +268,34 @@ class SpreadsheetTools:
                 while len(rows[r]) <= col2:
                     rows[r].append("")
                 rows[r][col1:col2 + 1] = [str(value) for value in values_row]
-            with target.open("w", newline="") as handle:
+            with self.artifacts.writer(
+                    target, text=True, newline="", require_existing=True,
+                    expected_identity=identity) as handle:
                 csv.writer(handle).writerows(rows)
         elif target.suffix.casefold() == ".xlsx" and importlib.util.find_spec("openpyxl"):
             from openpyxl import load_workbook
-            workbook = load_workbook(target)
-            worksheet = workbook[sheet] if sheet else workbook.active
-            for r, values_row in enumerate(values, row1 + 1):
-                for c, value in enumerate(values_row, col1 + 1):
-                    worksheet.cell(r, c, value)
-            workbook.save(target)
-            workbook.close()
+            with self.artifacts.reader(target) as source:
+                value = os.fstat(source.fileno())
+                identity = (value.st_dev, value.st_ino)
+                workbook = load_workbook(source)
+                worksheet = workbook[sheet] if sheet else workbook.active
+                for r, values_row in enumerate(values, row1 + 1):
+                    for c, value in enumerate(values_row, col1 + 1):
+                        worksheet.cell(r, c, value)
+                with self.artifacts.writer(
+                        target, require_existing=True,
+                        expected_identity=identity) as output:
+                    workbook.save(output)
+                workbook.close()
         else:
             self.artifacts.runtime.finish(actions, state="failed",
                                           result={"error": "spreadsheet backend unavailable"})
             return ToolResult("spreadsheet.write_range", "unavailable", {},
                               "spreadsheet backend unavailable",
                               action_ids=tuple(action.id for action in actions))
+        digest, _ = self.artifacts.hash(target)
         data = {"path": str(target), "sheet": sheet or "Sheet1", "range": cell_range,
-                "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}
+                "sha256": digest}
         return self.artifacts.result("spreadsheet.write_range", actions, data, task_id=task_id,
                                      evidence_source=target)
 
@@ -268,10 +311,16 @@ class SpreadsheetTools:
             return ToolResult("spreadsheet.add_sheet", "unavailable", {},
                               "xlsx backend unavailable", action_ids=tuple(a.id for a in actions))
         from openpyxl import load_workbook
-        workbook = load_workbook(target)
-        workbook.create_sheet(name)
-        workbook.save(target)
-        workbook.close()
+        with self.artifacts.reader(target) as source:
+            value = os.fstat(source.fileno())
+            identity = (value.st_dev, value.st_ino)
+            workbook = load_workbook(source)
+            workbook.create_sheet(name)
+            with self.artifacts.writer(
+                    target, require_existing=True,
+                    expected_identity=identity) as output:
+                workbook.save(output)
+            workbook.close()
         data = {"path": str(target), "sheet": name, "created": True}
         return self.artifacts.result("spreadsheet.add_sheet", actions, data, task_id=task_id,
                                      evidence_source=target)
@@ -289,21 +338,26 @@ class SpreadsheetTools:
             return ToolResult("spreadsheet.export", "unavailable", {},
                               "only CSV export is supported", action_ids=tuple(a.id for a in actions))
         if source.suffix.casefold() == ".csv":
-            shutil.copy2(source, destination)
+            with self.artifacts.reader(source) as handle:
+                self.artifacts.atomic_write(destination, handle.read())
         elif source.suffix.casefold() == ".xlsx" and importlib.util.find_spec("openpyxl"):
             from openpyxl import load_workbook
-            workbook = load_workbook(source, read_only=True, data_only=False)
-            worksheet = workbook[sheet] if sheet else workbook.active
-            with destination.open("w", newline="") as handle:
-                csv.writer(handle).writerows(row for row in worksheet.iter_rows(values_only=True))
-            workbook.close()
+            with self.artifacts.reader(source) as source_handle:
+                workbook = load_workbook(source_handle, read_only=True, data_only=False)
+                worksheet = workbook[sheet] if sheet else workbook.active
+                with self.artifacts.writer(destination, text=True, newline="") as output:
+                    csv.writer(output).writerows(
+                        row for row in worksheet.iter_rows(values_only=True)
+                    )
+                workbook.close()
         else:
             self.artifacts.runtime.finish(actions, state="failed",
                                           result={"error": "spreadsheet backend unavailable"})
             return ToolResult("spreadsheet.export", "unavailable", {},
                               "spreadsheet backend unavailable", action_ids=tuple(a.id for a in actions))
+        digest, _ = self.artifacts.hash(destination)
         data = {"source": str(source), "output": str(destination), "format": "csv",
-                "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()}
+                "sha256": digest}
         return self.artifacts.result("spreadsheet.export", actions, data, task_id=task_id,
                                      evidence_source=destination)
 
@@ -324,18 +378,25 @@ class SpreadsheetTools:
         )
         from openpyxl import load_workbook
         target = writes[0]
-        workbook = load_workbook(target)
-        worksheet = workbook[sheet] if sheet else workbook.active
-        for cell, formula in formulas.items():
-            if not isinstance(formula, str) or not formula.startswith("="):
-                self.artifacts.runtime.finish(actions, state="failed",
-                                              result={"error": "formula must start with ="})
-                raise ValueError("formula must start with =")
-            worksheet[cell] = formula
-        workbook.save(target)
-        workbook.close()
+        with self.artifacts.reader(target) as source:
+            value = os.fstat(source.fileno())
+            identity = (value.st_dev, value.st_ino)
+            workbook = load_workbook(source)
+            worksheet = workbook[sheet] if sheet else workbook.active
+            for cell, formula in formulas.items():
+                if not isinstance(formula, str) or not formula.startswith("="):
+                    self.artifacts.runtime.finish(actions, state="failed",
+                                                  result={"error": "formula must start with ="})
+                    raise ValueError("formula must start with =")
+                worksheet[cell] = formula
+            with self.artifacts.writer(
+                    target, require_existing=True,
+                    expected_identity=identity) as output:
+                workbook.save(output)
+            workbook.close()
+        digest, _ = self.artifacts.hash(target)
         data = {"path": str(target), "sheet": sheet or "Sheet1",
                 "cells": sorted(formulas), "calculated": False,
-                "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}
+                "sha256": digest}
         return self.artifacts.result("spreadsheet.formulas", actions, data, task_id=task_id,
                                      evidence_source=target)

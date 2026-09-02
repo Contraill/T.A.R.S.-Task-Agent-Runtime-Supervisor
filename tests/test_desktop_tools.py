@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -38,7 +39,7 @@ def test_screen_capture_requires_real_output(monkeypatch, desktop):
     monkeypatch.setattr(desktop_tools.shutil, "which",
                         lambda name: "/usr/bin/spectacle" if name == "spectacle" else None)
     def runner(argv, **kwargs):
-        output.write_bytes(b"png")
+        Path(argv[-1]).write_bytes(b"png")
         return subprocess.CompletedProcess(argv, 0, "", "")
     result = desktop_tools.ScreenCaptureTools((desktop,), runner=runner).capture(
         output, approval_id=approve("screen.capture", output, roots=(desktop,)),

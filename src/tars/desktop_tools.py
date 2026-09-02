@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 
 from .artifact_tools import ArtifactRuntime
 from .policy import ScopeRequest
@@ -68,20 +69,29 @@ class ScreenCaptureTools:
             data = status | {"reason": "screen capture backend unavailable"}
             return self.artifacts.result("screen.capture", actions, data,
                                          state="unavailable", error=data["reason"])
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        commands = {
-            "spectacle": ["spectacle", "--background", "--nonotify", "--fullscreen",
-                          "--output", str(destination)],
-            "grim": ["grim", str(destination)],
-            "gnome-screenshot": ["gnome-screenshot", "--file", str(destination)],
-        }
-        proc = self.runner(commands[status["backend"]], capture_output=True, text=True, check=False)
-        verified = proc.returncode == 0 and destination.is_file() and destination.stat().st_size > 0
+        with tempfile.TemporaryDirectory(prefix="tars-screen-capture-") as stage:
+            staged = Path(stage) / (destination.name or "capture.png")
+            commands = {
+                "spectacle": ["spectacle", "--background", "--nonotify", "--fullscreen",
+                              "--output", str(staged)],
+                "grim": ["grim", str(staged)],
+                "gnome-screenshot": ["gnome-screenshot", "--file", str(staged)],
+            }
+            proc = self.runner(
+                commands[status["backend"]], capture_output=True, text=True, check=False
+            )
+            verified = proc.returncode == 0 and staged.is_file() and staged.stat().st_size > 0
+            if verified:
+                fd = os.open(staged, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                try:
+                    self.artifacts.copy_fd(destination, fd)
+                finally:
+                    os.close(fd)
         data = status | {"path": str(destination), "exit_code": proc.returncode,
                          "verified": verified, "stderr": proc.stderr}
         if verified:
-            data.update({"bytes": destination.stat().st_size,
-                         "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()})
+            digest, size = self.artifacts.hash(destination)
+            data.update({"bytes": size, "sha256": digest})
         return self.artifacts.result("screen.capture", actions, data, task_id=task_id,
                                      evidence_source=destination if verified else None,
                                      state="succeeded" if verified else "failed",

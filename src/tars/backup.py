@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -18,6 +19,7 @@ from . import __version__
 from . import config, state_store
 from .secret_store import parse_reference
 from .policy import redact
+from .secure_paths import AnchoredRoot, select_anchor
 from . import memory
 
 
@@ -85,6 +87,14 @@ def _portable_files(paths):
                 if source.is_symlink():
                     continue
                 yield source, str(PurePosixPath(prefix) / source.relative_to(root).as_posix())
+
+
+def _portable_roots(paths):
+    return tuple(dict.fromkeys((
+        paths.config_path.parent,
+        paths.data_root,
+        paths.state_root,
+    )))
 
 
 def _validate_config_secrets(path):
@@ -159,49 +169,80 @@ def _snapshot_database(source, destination):
 
 def create_bundle(destination, *, paths=None):
     paths = paths or BackupPaths()
-    destination = Path(destination).expanduser().resolve()
-    if destination.exists():
+    requested = Path(destination).expanduser().absolute()
+    requested.parent.mkdir(parents=True, exist_ok=True)
+    destination_root = AnchoredRoot(requested.parent.resolve(strict=True))
+    destination = destination_root.path / requested.name
+    try:
+        destination_root.lstat((requested.name,))
+    except FileNotFoundError:
+        pass
+    else:
+        destination_root.close()
         raise FileExistsError(f"backup destination already exists: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    _validate_config_secrets(paths.config_path)
-    with tempfile.TemporaryDirectory(prefix="tars-backup-") as temporary:
-        temporary = Path(temporary)
-        db = temporary / "state.sqlite3"
-        schema = _snapshot_database(paths.state_db_path, db)
-        sources = [(db, DB_MEMBER), *_portable_files(paths)]
-        names = [name for _, name in sources]
-        if len(names) != len(set(names)):
-            raise RuntimeError("backup member collision")
-        files = {name: {"sha256": _sha256(source), "size": source.stat().st_size}
-                 for source, name in sources}
-        manifest = {
-            "format": BUNDLE_FORMAT, "bundle_version": BUNDLE_VERSION,
-            "source_version": __version__, "schema_version": schema,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "files": files,
-            "excluded": ["model weights/artifacts", "secret values", "browser profiles/cookies",
-                         "cache/downloads", "process logs", "workspace checkpoint payloads",
-                         "pairing credentials",
-                         "client bearer verifiers"],
-        }
-        partial = destination.with_name(destination.name + ".partial")
-        try:
-            with zipfile.ZipFile(partial, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+    try:
+        with tempfile.TemporaryDirectory(prefix="tars-backup-") as temporary:
+            temporary = Path(temporary)
+            db = temporary / "state.sqlite3"
+            schema = _snapshot_database(paths.state_db_path, db)
+            portable = []
+            with ExitStack() as stack:
+                anchors = [stack.enter_context(AnchoredRoot(root.resolve(strict=True)))
+                           for root in _portable_roots(paths) if root.is_dir()]
+                for source, member in _portable_files(paths):
+                    anchor, parts, _ = select_anchor(anchors, source)
+                    staged_source = temporary / "portable" / member
+                    staged_source.parent.mkdir(parents=True, exist_ok=True)
+                    with anchor.reader(parts) as input_handle, staged_source.open("wb") as output:
+                        shutil.copyfileobj(input_handle, output)
+                    staged_source.chmod(0o600)
+                    portable.append((staged_source, member))
+            staged_config = temporary / "portable" / "config/config.toml"
+            _validate_config_secrets(staged_config)
+            sources = [(db, DB_MEMBER), *portable]
+            names = [name for _, name in sources]
+            if len(names) != len(set(names)):
+                raise RuntimeError("backup member collision")
+            files = {name: {"sha256": _sha256(source), "size": source.stat().st_size}
+                     for source, name in sources}
+            manifest = {
+                "format": BUNDLE_FORMAT, "bundle_version": BUNDLE_VERSION,
+                "source_version": __version__, "schema_version": schema,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "files": files,
+                "excluded": ["model weights/artifacts", "secret values",
+                             "browser profiles/cookies", "cache/downloads", "process logs",
+                             "workspace checkpoint payloads", "pairing credentials",
+                             "client bearer verifiers"],
+            }
+            staged = temporary / "bundle.tars-backup"
+            with zipfile.ZipFile(staged, "x", compression=zipfile.ZIP_DEFLATED) as archive:
                 for source, name in sources:
                     archive.write(source, name)
                 archive.writestr(MANIFEST, json.dumps(
                     manifest, sort_keys=True, separators=(",", ":")))
-            partial.replace(destination)
-            destination.chmod(0o600)
-        except Exception:
-            partial.unlink(missing_ok=True)
-            raise
+            source_fd = os.open(staged, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                destination_root.copy_fd_to(source_fd, (requested.name,))
+            finally:
+                os.close(source_fd)
+    finally:
+        destination_root.close()
     return _report(destination, manifest, reconciliation={})
 
 
 def _read_and_validate(bundle, staging):
-    bundle = Path(bundle).expanduser().resolve()
-    with zipfile.ZipFile(bundle) as archive:
+    requested = Path(bundle).expanduser().absolute()
+    bundle_root = AnchoredRoot(requested.parent.resolve(strict=True))
+    try:
+        bundle_handle = bundle_root.reader((requested.name,))
+        source = bundle_handle.__enter__()
+    except Exception:
+        bundle_root.close()
+        raise
+    archive = None
+    try:
+        archive = zipfile.ZipFile(source)
         names = archive.namelist()
         if names.count(MANIFEST) != 1 or len(names) != len(set(names)):
             raise ValueError("bundle has a missing or duplicate manifest/member")
@@ -237,6 +278,11 @@ def _read_and_validate(bundle, staging):
             target.chmod(0o600)
             if target.stat().st_size != int(expected["size"]) or _sha256(target) != expected["sha256"]:
                 raise ValueError(f"backup checksum mismatch: {name}")
+    finally:
+        if archive is not None:
+            archive.close()
+        bundle_handle.__exit__(None, None, None)
+        bundle_root.close()
     db = staging / DB_MEMBER
     conn = sqlite3.connect(db)
     try:
@@ -422,7 +468,7 @@ def restore_bundle(bundle, *, paths=None, replace=False):
 def _report(bundle, manifest, *, reconciliation):
     files = manifest["files"]
     return BundleReport(
-        str(Path(bundle).expanduser().resolve()), len(files),
+        str(Path(bundle).expanduser().absolute()), len(files),
         sum(int(item["size"]) for item in files.values()),
         int(manifest["bundle_version"]), int(manifest["schema_version"]),
         str(manifest["source_version"]), tuple(manifest["excluded"]), reconciliation)

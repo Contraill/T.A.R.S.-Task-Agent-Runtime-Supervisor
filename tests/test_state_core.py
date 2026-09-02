@@ -62,6 +62,19 @@ def test_schema_session_event_role_and_project_state(monkeypatch, isolated_state
     assert health["counts"]["sessions"] == 1 and health["counts"]["state_events"] == 4
 
 
+def test_project_context_does_not_follow_context_file_symlinks(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside private context")
+    (project / "TARS.md").symlink_to(outside)
+    (project / "README.md").write_text("inside context")
+    context = projects.discover_project_context(project)
+    assert "outside private context" not in context.content
+    assert "inside context" in context.content
+    assert [path.name for path in context.files] == ["README.md"]
+
+
 def test_state_database_and_directory_permissions_are_repaired(isolated_state):
     isolated_state.parent.chmod(0o755)
     state_store.ensure_state_store()

@@ -170,6 +170,43 @@ def test_http_download_writes_bounded_verified_artifact(http_environment, tmp_pa
     assert result.data["verified_bytes"] == 7 and len(result.data["sha256"]) == 64
 
 
+def test_http_download_parent_swap_cannot_escape_allowed_root(
+        http_environment, tmp_path, monkeypatch):
+    inside = tmp_path / "inside"
+    inside.mkdir()
+    output = inside / "download.bin"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    transport = FakeHTTP((http_tools.HTTPResponse(
+        "https://example.com/file", 200,
+        {"Content-Type": "application/octet-stream"}, b"payload", False,
+    ),))
+    request = policy.ScopeRequest(
+        "http.download", "write", str(output), {"url": "https://example.com/file"},
+        allowed_paths=(str(tmp_path),),
+    )
+    decision = policy.ScopeGuard().evaluate(request)
+    broker = approvals.ApprovalBroker()
+    pending = broker.request(request, decision, scope="target")
+    broker.decide(pending.id, approve=True)
+    tools = http_tools.HTTPTools(transport=transport)
+    authorize = tools.runtime.authorize
+
+    def swap_after_authorization(*args, **kwargs):
+        actions = authorize(*args, **kwargs)
+        inside.rename(tmp_path / "displaced")
+        inside.symlink_to(outside, target_is_directory=True)
+        return actions
+
+    monkeypatch.setattr(tools.runtime, "authorize", swap_after_authorization)
+    with pytest.raises(OSError):
+        tools.download(
+            "https://example.com/file", output, allowed_paths=(str(tmp_path),),
+            approval_ids={"output": pending.id},
+        )
+    assert not (outside / "download.bin").exists()
+
+
 def test_artifact_claim_verification_uses_retained_source_chunk(http_environment, tmp_path):
     transport = FakeHTTP((http_tools.HTTPResponse(
         "https://example.com/doc", 200, {"Content-Type": "text/plain"},

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 import importlib.util
+import os
+import stat
+import tempfile
 
 from .config import DATA_ROOT
 from .network import network_destination, open_bound
 from .policy import ScopeRequest
+from .secure_paths import AnchoredRoot
 from .tool_core import ToolResult, ToolRuntime
 
 
@@ -117,7 +121,8 @@ class PlaywrightDriver:
 
 class BrowserTools:
     def __init__(self, *, profile=None, downloads=None, driver=None, runtime=None,
-                 personal_profile=False, personal_opt_in=False):
+                 personal_profile=False, personal_opt_in=False,
+                 max_output_bytes=16_000_000):
         if personal_profile and not personal_opt_in:
             raise PermissionError("personal browser profiles require explicit opt-in")
         self.profile = Path(profile or (DATA_ROOT / "browser" / "profile")).expanduser().resolve()
@@ -126,11 +131,13 @@ class BrowserTools:
         self.downloads.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.profile.chmod(0o700)
         self.downloads.chmod(0o700)
+        self._downloads_anchor = AnchoredRoot(self.downloads)
         self.runtime = runtime or ToolRuntime()
         self.driver = driver
         self._injected_driver = driver is not None
         self._live_driver_started = False
         self.personal_profile = personal_profile
+        self.max_output_bytes = int(max_output_bytes)
 
     def status(self):
         available = self.driver is not None or importlib.util.find_spec("playwright") is not None
@@ -203,18 +210,63 @@ class BrowserTools:
             effect, elevated = "elevated", True
         else:
             effect, elevated = ("read", False) if operation in read_operations else ("write", False)
+        requested_path = None
         if operation == "download":
             kwargs = dict(kwargs) | {"directory": str(self.downloads)}
         if operation == "screenshot" and "path" in kwargs:
-            requested = (self.downloads / Path(kwargs["path"]).name).resolve()
-            kwargs = dict(kwargs) | {"path": str(requested)}
+            requested_path = self.downloads / Path(kwargs["path"]).name
+            kwargs = dict(kwargs) | {"path": str(requested_path)}
         request = ScopeRequest(
             f"browser.{operation}", effect, "browser-session", kwargs,
             task_id=task_id, session_id=session_id, elevated=elevated,
         )
         actions = self.runtime.authorize((("action", request),), {"action": approval_id})
         try:
-            data = self._driver().call(operation, **kwargs)
+            if operation in {"download", "screenshot"}:
+                with tempfile.TemporaryDirectory(prefix="tars-browser-output-") as stage:
+                    execution = dict(kwargs)
+                    if operation == "download":
+                        execution["directory"] = stage
+                    else:
+                        execution["path"] = str(Path(stage) / requested_path.name)
+                    data = self._driver().call(operation, **execution)
+                    staged_value = data.get("path", "")
+                    staged = Path(staged_value) if staged_value else None
+                    if (staged is not None and staged.parent == Path(stage)
+                            and staged.exists()):
+                        fd = os.open(staged, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                        try:
+                            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                                raise ValueError("browser output must be a regular file")
+                            payload = bytearray()
+                            while True:
+                                chunk = os.read(
+                                    fd, min(1024 * 1024,
+                                            self.max_output_bytes + 1 - len(payload))
+                                )
+                                if not chunk:
+                                    break
+                                payload.extend(chunk)
+                                if len(payload) > self.max_output_bytes:
+                                    raise RuntimeError("browser output exceeded size limit")
+                        finally:
+                            os.close(fd)
+                        name = requested_path.name if requested_path is not None else staged.name
+                        if not name or name in {".", ".."}:
+                            raise ValueError("browser output filename is invalid")
+                        output = self.downloads / name
+                        self._downloads_anchor.atomic_write((name,), bytes(payload))
+                        data = dict(data) | {"path": str(output)}
+                    elif requested_path is not None:
+                        if not self._injected_driver:
+                            raise RuntimeError(
+                                "browser screenshot did not create an output file"
+                            )
+                        data = dict(data) | {"path": str(requested_path)}
+                    elif not self._injected_driver:
+                        raise RuntimeError("browser download did not create an output file")
+            else:
+                data = self._driver().call(operation, **kwargs)
         except Exception as exc:
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
@@ -234,3 +286,4 @@ class BrowserTools:
         if self.driver:
             self.driver.close()
             self.driver = None
+        self._downloads_anchor.close()

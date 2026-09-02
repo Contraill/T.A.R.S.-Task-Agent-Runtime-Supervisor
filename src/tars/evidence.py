@@ -80,14 +80,15 @@ def list_records(*, task_id=None, evidence_type=None, limit=50):
         conn.close()
 
 
-def verify_artifact(path, claims, *, task_id=None, event_uuid=None):
+def verify_artifact(path, claims, *, task_id=None, event_uuid=None, content=None):
     """Verify explicit artifact claims against retained evidence chunks.
 
     Each claim supplies ``text``, ``evidence_id`` and ``supporting_text``. This
     deliberately verifies provenance links and exact support, not semantic truth.
     """
     artifact = str(path)
-    content = Path(artifact).read_text(encoding="utf-8", errors="replace")
+    if content is None:
+        content = Path(artifact).read_text(encoding="utf-8", errors="replace")
     results = []
     for claim in claims:
         text = str(claim["text"])

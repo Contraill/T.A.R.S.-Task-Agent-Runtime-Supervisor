@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import stat as stat_module
 
 from .policy import ScopeRequest, canonical_path
 from .secure_paths import AnchoredRoot, select_anchor
@@ -27,14 +28,19 @@ class FilesystemTools:
     def _read_path(self, tool, path, *, task_id=None, session_id=None):
         request = self._request(tool, "read", path, task_id=task_id, session_id=session_id)
         actions = self.runtime.authorize((("read", request),))
-        return Path(canonical_path(path)), actions
+        anchor, parts, display = select_anchor(self._anchors, path)
+        return anchor, parts, display, actions
 
     def list(self, path, *, task_id=None, session_id=None):
-        target, actions = self._read_path("fs.list", path, task_id=task_id, session_id=session_id)
+        anchor, parts, target, actions = self._read_path(
+            "fs.list", path, task_id=task_id, session_id=session_id
+        )
         try:
-            rows = [{"name": item.name, "path": str(item), "type": (
-                "symlink" if item.is_symlink() else "directory" if item.is_dir() else "file"
-            )} for item in sorted(target.iterdir(), key=lambda item: item.name)]
+            rows = [{"name": name, "path": str(target / name), "type": (
+                "symlink" if stat_module.S_ISLNK(value.st_mode)
+                else "directory" if stat_module.S_ISDIR(value.st_mode)
+                else "file" if stat_module.S_ISREG(value.st_mode) else "other"
+            )} for name, value in anchor.list(parts)]
             result = {"path": str(target), "entries": rows}
         except Exception as exc:
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
@@ -46,12 +52,16 @@ class FilesystemTools:
                           action_ids=tuple(a.id for a in actions), evidence_ids=(evidence.id,))
 
     def stat(self, path, *, task_id=None, session_id=None):
-        target, actions = self._read_path("fs.stat", path, task_id=task_id, session_id=session_id)
+        anchor, parts, target, actions = self._read_path(
+            "fs.stat", path, task_id=task_id, session_id=session_id
+        )
         try:
-            value = target.lstat()
+            value = anchor.lstat(parts)
             result = {"path": str(target), "size": value.st_size, "mode": value.st_mode,
-                      "mtime_ns": value.st_mtime_ns, "is_file": target.is_file(),
-                      "is_dir": target.is_dir(), "is_symlink": target.is_symlink()}
+                      "mtime_ns": value.st_mtime_ns,
+                      "is_file": stat_module.S_ISREG(value.st_mode),
+                      "is_dir": stat_module.S_ISDIR(value.st_mode),
+                      "is_symlink": stat_module.S_ISLNK(value.st_mode)}
         except Exception as exc:
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
@@ -64,9 +74,11 @@ class FilesystemTools:
     def read(self, path, *, offset=0, limit=1_000_000, task_id=None, session_id=None):
         if offset < 0 or limit <= 0:
             raise ValueError("invalid read bounds")
-        target, actions = self._read_path("fs.read", path, task_id=task_id, session_id=session_id)
+        anchor, parts, target, actions = self._read_path(
+            "fs.read", path, task_id=task_id, session_id=session_id
+        )
         try:
-            with target.open("rb") as handle:
+            with anchor.reader(parts) as handle:
                 handle.seek(offset)
                 payload = handle.read(limit + 1)
             truncated = len(payload) > limit
@@ -86,15 +98,23 @@ class FilesystemTools:
                           action_ids=tuple(a.id for a in actions), evidence_ids=(evidence.id,))
 
     def search(self, root, query, *, limit=100, task_id=None, session_id=None):
-        target, actions = self._read_path("fs.search", root, task_id=task_id, session_id=session_id)
+        anchor, parts, target, actions = self._read_path(
+            "fs.search", root, task_id=task_id, session_id=session_id
+        )
         hits = []
         try:
-            for path in sorted(target.rglob("*")):
-                if len(hits) >= limit or not path.is_file() or path.is_symlink():
-                    continue
+            for relative, fd in anchor.walk_files(parts):
+                if len(hits) >= limit:
+                    break
                 try:
-                    for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
-                        if query.casefold() in line.casefold():
+                    with os.fdopen(os.dup(fd), "r", encoding="utf-8",
+                                   errors="replace") as handle:
+                        lines = handle
+                        for number, line in enumerate(lines, 1):
+                            line = line.rstrip("\r\n")
+                            if query.casefold() not in line.casefold():
+                                continue
+                            path = anchor.path.joinpath(*relative)
                             hits.append({"path": str(path), "line": number, "text": line})
                             if len(hits) >= limit:
                                 break
@@ -152,6 +172,8 @@ class FilesystemTools:
         def operation(anchor, parts, target):
             fd = anchor.open(parts, os.O_RDONLY)
             try:
+                value = os.fstat(fd)
+                identity = (value.st_dev, value.st_ino)
                 with os.fdopen(fd, "r", encoding="utf-8") as handle:
                     original = handle.read()
             except Exception:
@@ -164,7 +186,10 @@ class FilesystemTools:
                     raise ValueError(f"patch context must match exactly once; matched {count}")
                 updated = updated.replace(old, new, 1)
                 applied.append(hashlib.sha256(old.encode()).hexdigest())
-            anchor.atomic_write(parts, updated.encode(), require_existing=True)
+            anchor.atomic_write(
+                parts, updated.encode(), require_existing=True,
+                expected_identity=identity,
+            )
             return {"path": str(target), "replacements": len(applied),
                     "before_sha256": hashlib.sha256(original.encode()).hexdigest(),
                     "after_sha256": hashlib.sha256(updated.encode()).hexdigest()}

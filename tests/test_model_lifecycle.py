@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+import hashlib
 import io
 import struct
 from pathlib import Path
@@ -44,6 +46,50 @@ def test_import_verify_and_deduplicate(monkeypatch, tmp_path):
     result = lifecycle.verify_model("one")
     assert result.runtime_compatible
     assert not result.runtime_ready
+
+
+def test_import_model_binds_source_before_parent_replacement(monkeypatch, tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    original_payload = _gguf_payload(b"authorized-model")
+    (source_root / "model.gguf").write_bytes(original_payload)
+    replacement_root = tmp_path / "replacement"
+    replacement_root.mkdir()
+    (replacement_root / "model.gguf").write_bytes(_gguf_payload(b"outside-model"))
+    displaced_root = tmp_path / "displaced"
+    artifact_root = tmp_path / "artifacts"
+    registry = _registry()
+    monkeypatch.setattr(lifecycle, "MODEL_ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(lifecycle, "ensure_registry", lambda: registry)
+    monkeypatch.setattr(
+        lifecycle,
+        "save_registry",
+        lambda data: (registry.clear(), registry.update(data)),
+    )
+
+    original_reader = lifecycle.AnchoredRoot.reader
+    source_identity = source_root.resolve()
+    replaced = False
+
+    @contextmanager
+    def replacing_reader(self, parts, **kwargs):
+        nonlocal replaced
+        if not replaced and self.path == source_identity:
+            source_root.rename(displaced_root)
+            source_root.symlink_to(replacement_root, target_is_directory=True)
+            replaced = True
+        with original_reader(self, parts, **kwargs) as handle:
+            yield handle
+
+    monkeypatch.setattr(lifecycle.AnchoredRoot, "reader", replacing_reader)
+
+    artifact = lifecycle.import_model(source_root / "model.gguf", "bound")
+
+    assert replaced
+    assert artifact.read_bytes() == original_payload
+    assert registry["models"]["bound"]["sha256"] == hashlib.sha256(
+        original_payload
+    ).hexdigest()
 
 
 def test_import_rejects_bad_hash(monkeypatch, tmp_path):

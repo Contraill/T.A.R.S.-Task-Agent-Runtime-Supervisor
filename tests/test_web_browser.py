@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import socket
 
 import pytest
@@ -135,6 +136,41 @@ def test_browser_screenshot_is_forced_into_isolated_location(web_environment):
         "screenshot", path="../../personal.png", approval_id=_approve(request),
     )
     assert result.data["path"] == str(downloads / "personal.png")
+
+
+def test_browser_output_root_replacement_cannot_redirect_screenshot(
+        web_environment, monkeypatch):
+    class OutputBrowser(FakeBrowser):
+        def call(self, operation, **kwargs):
+            if operation == "screenshot":
+                Path(kwargs["path"]).write_bytes(b"image")
+            return super().call(operation, **kwargs)
+
+    downloads = web_environment / "downloads"
+    outside = web_environment / "outside"
+    outside.mkdir()
+    browser = browser_tools.BrowserTools(
+        profile=web_environment / "profile", downloads=downloads,
+        driver=OutputBrowser(),
+    )
+    request = policy.ScopeRequest(
+        "browser.screenshot", "write", "browser-session",
+        {"path": str(downloads / "screen.png")},
+    )
+    approval = _approve(request)
+    authorize = browser.runtime.authorize
+
+    def swap_after_authorization(*args, **kwargs):
+        actions = authorize(*args, **kwargs)
+        downloads.rename(web_environment / "displaced-downloads")
+        downloads.symlink_to(outside, target_is_directory=True)
+        return actions
+
+    monkeypatch.setattr(browser.runtime, "authorize", swap_after_authorization)
+    result = browser.action("screenshot", path="screen.png", approval_id=approval)
+    assert result.succeeded
+    assert not (outside / "screen.png").exists()
+    assert (web_environment / "displaced-downloads" / "screen.png").read_bytes() == b"image"
 
 
 def test_tavily_is_optional_and_secret_reference_is_not_exposed(monkeypatch, web_environment):

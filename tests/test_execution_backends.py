@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import socket
 import subprocess
 
@@ -129,8 +130,56 @@ def test_container_command_owns_isolation_limits_and_mount_semantics(isolated_ex
     assert "--userns=keep-id" in command and "--rm" in command and "--pull=never" in command
     assert command[command.index("--network") + 1] == "none"
     assert "2g" in command and "64" in command
-    assert f"{workspace}:/workspace:rw" in command
-    assert f"{dependency}:/deps:ro" in command
+    workspace_volume = next(value for value in command if value.endswith(":/workspace:rw"))
+    dependency_volume = next(value for value in command if value.endswith(":/deps:ro"))
+    assert workspace_volume.startswith("/proc/")
+    assert dependency_volume.startswith("/proc/")
+
+
+def test_container_mount_identity_is_bound_before_authorization(
+        isolated_execution):
+    workspace = isolated_execution / "workspace"
+    workspace.mkdir()
+    (workspace / "identity.txt").write_text("inside")
+    outside = isolated_execution / "outside"
+    outside.mkdir()
+    (outside / "identity.txt").write_text("outside")
+    bound_targets = []
+
+    class IdentityRunner(FakeRunner):
+        def __call__(self, argv, **kwargs):
+            volume = next(value for value in argv if value.endswith(":/workspace:ro"))
+            bound_targets.append(os.readlink(volume.removesuffix(":/workspace:ro")))
+            return super().__call__(argv, **kwargs)
+
+    runner = IdentityRunner()
+    backend = execution.ContainerBackend(
+        runtime="/usr/bin/podman", runner=runner, rootless_verified=True,
+    )
+    _allow("execute", "container")
+    policy.add_rule("read", "allow", target=str(workspace), target_kind="path")
+
+    class SwappingGuard(policy.ScopeGuard):
+        swapped = False
+
+        def evaluate(self, request):
+            decision = super().evaluate(request)
+            if request.tool == "terminal.run" and not self.swapped:
+                self.swapped = True
+                workspace.rename(isolated_execution / "displaced")
+                workspace.symlink_to(outside, target_is_directory=True)
+            return decision
+
+    request = execution.ExecutionRequest(
+        ("true",), workspace=str(workspace), image="python:3.13",
+        allowed_paths=(str(workspace),), workspace_mode="read_only",
+    )
+    result = execution.GuardedExecutor(
+        {"container": backend}, guard=SwappingGuard(),
+    ).execute("container", request)
+    assert result.succeeded
+    assert "displaced" in bound_targets[0]
+    assert "outside" not in bound_targets[0]
 
 
 def test_container_mount_outside_workspace_requires_separate_escape_approval(isolated_execution):

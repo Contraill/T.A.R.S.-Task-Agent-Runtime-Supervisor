@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from pathlib import Path
+import os
 import urllib.request
 
 from .network import NetworkDestination, network_destination, open_bound
 from .policy import ScopeRequest, canonical_path, redact
+from .secure_paths import AnchoredRoot, select_anchor
 from .tool_core import ToolResult, ToolRuntime
 
 
@@ -86,17 +87,25 @@ class HTTPTools:
                 task_id=task_id, session_id=session_id,
             )))
         output_path = None
+        output_anchors = ()
         if output is not None:
             if method != "GET":
                 raise ValueError("HTTP output files are supported only for GET")
-            output_path = canonical_path(output)
+            output_path = os.path.abspath(os.fspath(output))
+            output_roots = tuple(canonical_path(path) for path in allowed_paths)
+            output_anchors = tuple(AnchoredRoot(path) for path in output_roots)
             requests.append(("output", ScopeRequest(
                 "http.download", "write", output_path,
                 {"url": destination.policy_url, "url_sha256": destination.url_sha256},
                 task_id=task_id, session_id=session_id,
-                allowed_paths=tuple(allowed_paths),
+                allowed_paths=output_roots,
             )))
-        actions = self.runtime.authorize(tuple(requests), approval_ids)
+        try:
+            actions = self.runtime.authorize(tuple(requests), approval_ids)
+        except Exception:
+            for anchor in output_anchors:
+                anchor.close()
+            raise
         try:
             redirects = []
             for _ in range(self.max_redirects + 1):
@@ -150,17 +159,19 @@ class HTTPTools:
             if output_path and state == "succeeded":
                 if response.truncated:
                     raise RuntimeError("download exceeded maximum response size")
-                target = Path(output_path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(response.body)
+                anchor, parts, target = select_anchor(output_anchors, output_path)
+                anchor.atomic_write(parts, response.body)
                 data.update({"output": output_path,
                              "sha256": hashlib.sha256(response.body).hexdigest(),
-                             "verified_bytes": target.stat().st_size})
+                             "verified_bytes": anchor.stat(parts).st_size})
             if method in {"GET", "HEAD"} and state == "succeeded":
                 self.cache[destination.policy_url] = response
         except Exception as exc:
             self.runtime.finish(actions, state="failed", result={"error": str(exc)})
             raise
+        finally:
+            for anchor in output_anchors:
+                anchor.close()
         self.runtime.finish(actions, state=state, result=data)
         evidence_payload = content.encode() if textual else response.body
         evidence = self.runtime.evidence(

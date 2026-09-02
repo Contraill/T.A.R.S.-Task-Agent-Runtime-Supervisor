@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import tempfile
@@ -14,6 +15,7 @@ from .calibration import calibration_path, load_calibration
 from .config import MODEL_ARTIFACT_ROOT, MODEL_DOWNLOAD_ROOT
 from .network import network_destination, open_bound
 from .registry import ensure_registry, get_model, role_for_alias, save_registry
+from .secure_paths import AnchoredRoot
 
 COMPATIBILITY_MANIFEST = json.loads(
     Path(__file__).with_name("compatibility_manifest.json").read_text(encoding="utf-8")
@@ -33,12 +35,23 @@ class VerificationResult:
         return self.integrity_verified and self.runtime_compatible and self.calibration_ready
 
 
-def _sha256(path: Path) -> str:
+def _snapshot_bound_file(source: Path, destination: Path):
+    requested = source.expanduser().absolute()
+    anchor = AnchoredRoot(requested.parent.resolve(strict=True))
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    size = 0
+    try:
+        with anchor.reader((requested.name,)) as input_handle, destination.open("wb") as output:
+            while True:
+                chunk = input_handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                output.write(chunk)
+    finally:
+        anchor.close()
+    return digest.hexdigest(), size
 
 
 def _preflight(target: Path, required: int) -> None:
@@ -53,26 +66,36 @@ def _artifact_path(digest: str) -> Path:
 
 
 def _commit_artifact(source: Path, digest: str) -> Path:
-    target = _artifact_path(digest)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        if _sha256(target) != digest:
-            raise RuntimeError(f"content-addressed artifact is corrupt: {target}")
-        return target
-    fd, temp_name = tempfile.mkstemp(prefix=".artifact-", dir=target.parent)
-    os.close(fd)
-    temp = Path(temp_name)
+    MODEL_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+    anchor = AnchoredRoot(MODEL_ARTIFACT_ROOT.resolve(strict=True))
+    parts = (digest[:2], f"{digest}.gguf")
+    target = anchor.path.joinpath(*parts)
     try:
-        shutil.copyfile(source, temp)
-        os.replace(temp, target)
+        try:
+            value, _ = anchor.hash(parts)
+        except FileNotFoundError:
+            pass
+        else:
+            if value != digest:
+                raise RuntimeError(f"content-addressed artifact is corrupt: {target}")
+            return target
+        source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            copied_digest, _ = anchor.copy_fd_to(source_fd, parts)
+        finally:
+            os.close(source_fd)
+        if copied_digest != digest:
+            anchor.delete(parts)
+            raise RuntimeError("model source changed during artifact commit")
+        return target
     finally:
-        temp.unlink(missing_ok=True)
-    return target
+        anchor.close()
 
 
 def _register(alias: str, path: Path, digest: str, *, name: str, source: str,
               source_revision: str = "", license_name: str = "unknown",
-              quant: str = "unknown", native_context: int = 0) -> None:
+              quant: str = "unknown", native_context: int = 0, size: int,
+              runtime_compatible: bool) -> None:
     registry = ensure_registry()
     if alias in registry["models"]:
         raise ValueError(f"model alias already exists: {alias}")
@@ -83,37 +106,63 @@ def _register(alias: str, path: Path, digest: str, *, name: str, source: str,
         "artifact_sha256": digest, "backend": "llama.cpp", "quant": quant,
         "native_context": native_context, "source": source,
         "source_revision": source_revision, "license": license_name,
-        "size": path.stat().st_size, "integrity_verified": True,
-        "runtime_compatible": _gguf_compatible(path),
+        "size": int(size), "integrity_verified": True,
+        "runtime_compatible": bool(runtime_compatible),
     }
     save_registry(candidate)
 
 
-def _gguf_compatible(path: Path) -> bool:
-    with path.open("rb") as handle:
-        header = handle.read(24)
+def _gguf_header_compatible(header: bytes) -> bool:
     if len(header) < 24 or header[:4] != b"GGUF":
         return False
     version, tensor_count, metadata_count = struct.unpack("<IQQ", header[4:24])
     return version in {2, 3} and tensor_count >= 0 and metadata_count >= 0
 
 
+def _gguf_compatible(path: Path) -> bool:
+    with path.open("rb") as handle:
+        return _gguf_header_compatible(handle.read(24))
+
+
+def _inspect_bound_file(path: Path):
+    requested = path.expanduser().absolute()
+    anchor = AnchoredRoot(requested.parent.resolve(strict=True))
+    digest = hashlib.sha256()
+    size = 0
+    header = b""
+    try:
+        with anchor.reader((requested.name,)) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                if len(header) < 24:
+                    header = (header + chunk)[:24]
+                digest.update(chunk)
+                size += len(chunk)
+    finally:
+        anchor.close()
+    return digest.hexdigest(), size, _gguf_header_compatible(header)
+
+
 def import_model(path: str | Path, alias: str, *, expected_sha256: str | None = None,
                  name: str | None = None, license_name: str = "unknown",
                  quant: str = "unknown", native_context: int = 0) -> Path:
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise FileNotFoundError(source)
-    digest = _sha256(source)
-    if expected_sha256 and digest.lower() != expected_sha256.lower():
-        raise ValueError(f"SHA-256 mismatch: expected {expected_sha256}, got {digest}")
-    if not _gguf_compatible(source):
-        raise ValueError("unsupported local model: expected a GGUF artifact")
-    if not _artifact_path(digest).exists():
-        _preflight(MODEL_ARTIFACT_ROOT, source.stat().st_size)
-    artifact = _commit_artifact(source, digest)
+    source = Path(path).expanduser().absolute()
+    with tempfile.TemporaryDirectory(prefix="tars-model-import-") as temporary:
+        staged = Path(temporary) / "source.gguf"
+        digest, size = _snapshot_bound_file(source, staged)
+        if expected_sha256 and digest.lower() != expected_sha256.lower():
+            raise ValueError(f"SHA-256 mismatch: expected {expected_sha256}, got {digest}")
+        compatible = _gguf_compatible(staged)
+        if not compatible:
+            raise ValueError("unsupported local model: expected a GGUF artifact")
+        if not _artifact_path(digest).exists():
+            _preflight(MODEL_ARTIFACT_ROOT, size)
+        artifact = _commit_artifact(staged, digest)
     _register(alias, artifact, digest, name=name or source.stem, source=f"file:{source}",
-              license_name=license_name, quant=quant, native_context=native_context)
+              license_name=license_name, quant=quant, native_context=native_context,
+              size=size, runtime_compatible=compatible)
     return artifact
 
 
@@ -174,15 +223,19 @@ def pull_model(source: str, alias: str, *, expected_sha256: str | None = None,
     MODEL_DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     partial = MODEL_DOWNLOAD_ROOT / f"{alias}.partial"
     _download(url, partial)
-    digest = _sha256(partial)
-    if expected_sha256 and digest.lower() != expected_sha256.lower():
-        raise ValueError(f"SHA-256 mismatch: expected {expected_sha256}, got {digest}")
-    if not _gguf_compatible(partial):
-        raise ValueError("downloaded artifact is not GGUF-compatible")
-    artifact = _commit_artifact(partial, digest)
+    with tempfile.TemporaryDirectory(prefix="tars-model-download-") as temporary:
+        staged = Path(temporary) / "download.gguf"
+        digest, size = _snapshot_bound_file(partial, staged)
+        if expected_sha256 and digest.lower() != expected_sha256.lower():
+            raise ValueError(f"SHA-256 mismatch: expected {expected_sha256}, got {digest}")
+        compatible = _gguf_compatible(staged)
+        if not compatible:
+            raise ValueError("downloaded artifact is not GGUF-compatible")
+        artifact = _commit_artifact(staged, digest)
     _register(alias, artifact, digest, name=filename or Path(urllib.parse.urlparse(url).path).name,
               source=source_name, source_revision=revision, license_name=license_name,
-              quant=quant, native_context=native_context)
+              quant=quant, native_context=native_context, size=size,
+              runtime_compatible=compatible)
     partial.unlink(missing_ok=True)
     return artifact
 
@@ -202,10 +255,10 @@ def verify_model(alias: str) -> VerificationResult:
     model = get_model(alias)
     if not model.path.is_file():
         raise FileNotFoundError(model.path)
-    digest = _sha256(model.path)
+    digest, _, header_compatible = _inspect_bound_file(model.path)
     if digest != model.sha256:
         raise ValueError(f"SHA-256 mismatch for {alias}: expected {model.sha256}, got {digest}")
-    compatible = model.backend == "llama.cpp" and _gguf_compatible(model.path)
+    compatible = model.backend == "llama.cpp" and header_compatible
     try:
         calibration = load_calibration(alias)
         calibrated = (calibration.get("status") == "ready" and
@@ -236,14 +289,21 @@ def remove_model(alias: str) -> bool:
         info.get("artifact_sha256", info.get("sha256", "")) == digest
         for info in candidate["models"].values()
     )
-    if digest and not digest_shared:
+    valid_digest = bool(re.fullmatch(r"[0-9a-f]{64}", digest))
+    if valid_digest and not digest_shared:
         calibration_path(digest).unlink(missing_ok=True)
     shared = any(Path(info["path"]).expanduser() == path for info in candidate["models"].values())
-    if not shared and path.is_file() and MODEL_ARTIFACT_ROOT in path.parents:
-        path.unlink()
+    expected = _artifact_path(digest) if valid_digest else None
+    if not shared and expected is not None and path.absolute() == expected.absolute():
+        MODEL_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+        anchor = AnchoredRoot(MODEL_ARTIFACT_ROOT.resolve(strict=True))
         try:
-            path.parent.rmdir()
-        except OSError:
-            pass
+            anchor.delete((digest[:2], f"{digest}.gguf"))
+            try:
+                anchor.delete((digest[:2],))
+            except OSError:
+                pass
+        finally:
+            anchor.close()
         return True
     return False

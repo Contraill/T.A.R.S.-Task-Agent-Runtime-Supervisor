@@ -46,6 +46,25 @@ def test_git_read_tools_return_real_repository_state(repository):
     assert tools.show().evidence_ids and tools.diff().succeeded
 
 
+def test_git_repository_identity_survives_path_replacement(repository):
+    tools, repo = repository
+    outside = repo.parent / "outside-repo"
+    outside.mkdir()
+    _run(outside, "init", "-b", "main")
+    _run(outside, "config", "user.name", "Other User")
+    _run(outside, "config", "user.email", "other@example.com")
+    (outside / "file.txt").write_text("outside\n")
+    _run(outside, "add", "file.txt")
+    _run(outside, "commit", "-m", "outside repository")
+    displaced = repo.parent / "displaced-repo"
+    repo.rename(displaced)
+    repo.symlink_to(outside, target_is_directory=True)
+    result = tools.log()
+    assert result.succeeded
+    assert "initial" in result.data["stdout"]
+    assert "outside repository" not in result.data["stdout"]
+
+
 def test_git_commit_reports_sha_and_human_metadata(repository):
     tools, repo = repository
     (repo / "file.txt").write_text("two\n")

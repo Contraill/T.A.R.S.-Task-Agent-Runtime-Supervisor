@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 
 from .config import CONFIG_PATH, ROLE_PERSONA_ROOT
 from .roles import resolve_role_id
+from .secure_paths import AnchoredRoot
 
 
 SKILL_FILENAME = "SKILL.md"
@@ -23,6 +26,7 @@ class SkillDescriptor:
     path: str
     valid: bool
     errors: tuple[str, ...] = ()
+    content_sha256: str = ""
 
     def summary(self):
         return {"name": self.name, "description": self.description,
@@ -58,20 +62,17 @@ def _frontmatter(text):
     return metadata, body
 
 
-def _inspect(path, scope, root):
+def _inspect(anchor, parts, path, scope):
     errors = []
+    digest = ""
     try:
-        resolved_root = root.resolve()
-        resolved = path.resolve(strict=True)
-        resolved.relative_to(resolved_root)
-        relative = path.relative_to(root)
-        cursor = root
-        if any((cursor := cursor / part).is_symlink() for part in relative.parts):
-            raise ValueError("skill entry cannot be a symlink")
-        size = resolved.stat().st_size
-        if size > MAX_SKILL_BYTES:
+        with anchor.reader(parts) as handle:
+            payload = handle.read(MAX_SKILL_BYTES + 1)
+        if len(payload) > MAX_SKILL_BYTES:
             raise ValueError("skill instructions exceed size limit")
-        metadata, body = _frontmatter(resolved.read_text(encoding="utf-8"))
+        text = payload.decode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        metadata, body = _frontmatter(text)
     except (OSError, UnicodeError, ValueError) as exc:
         return SkillDescriptor(path.parent.name, "", "", scope, str(path), False,
                                (str(exc),))
@@ -87,32 +88,46 @@ def _inspect(path, scope, root):
     if not body.strip():
         errors.append("instructions are empty")
     return SkillDescriptor(name, description, version, scope, str(path), not errors,
-                           tuple(errors))
+                           tuple(errors), digest)
 
 
 class SkillRegistry:
     def __init__(self, *, global_root=None):
-        self.global_root = Path(global_root or (CONFIG_PATH.parent / "skills"))
+        self.global_root = Path(global_root or (CONFIG_PATH.parent / "skills")).expanduser().absolute()
 
     def _roots(self, *, project_path=None, role=None):
-        roots = [("global", self.global_root)]
+        roots = [("global", self.global_root, ())]
         if project_path:
-            roots.append(("project", Path(project_path).resolve() / ".tars" / "skills"))
+            project_root = Path(project_path).expanduser().resolve(strict=True)
+            roots.append(("project", project_root, (".tars", "skills")))
         if role:
             role_id = resolve_role_id(role)
-            roots.append((f"role:{role_id}", ROLE_PERSONA_ROOT / role_id / "skills"))
+            roots.append((f"role:{role_id}", ROLE_PERSONA_ROOT, (role_id, "skills")))
         return roots
 
     def discover(self, *, project_path=None, role=None, include_invalid=False):
         # Later/more-specific roots replace matching names without loading bodies.
         found = {}
-        for scope, root in self._roots(project_path=project_path, role=role):
-            if not root.is_dir():
+        for scope, base, prefix in self._roots(project_path=project_path, role=role):
+            try:
+                anchor = AnchoredRoot(base.resolve(strict=True))
+            except (FileNotFoundError, NotADirectoryError, OSError):
                 continue
-            for path in sorted(root.glob(f"*/{SKILL_FILENAME}")):
-                descriptor = _inspect(path, scope, root)
-                if descriptor.valid or include_invalid:
-                    found[descriptor.name] = descriptor
+            try:
+                directory = anchor.open_directory(prefix)
+            except (FileNotFoundError, NotADirectoryError, OSError):
+                anchor.close()
+                continue
+            try:
+                for entry in sorted(os.listdir(directory)):
+                    parts = prefix + (entry, SKILL_FILENAME)
+                    path = anchor.path.joinpath(*parts)
+                    descriptor = _inspect(anchor, parts, path, scope)
+                    if descriptor.valid or include_invalid:
+                        found[descriptor.name] = descriptor
+            finally:
+                os.close(directory)
+                anchor.close()
         return sorted(found.values(), key=lambda item: item.name)
 
     def load(self, name, *, project_path=None, role=None):
@@ -124,14 +139,44 @@ class SkillRegistry:
         if not descriptor.valid:
             raise ValueError("invalid skill: " + "; ".join(descriptor.errors))
         path = Path(descriptor.path)
-        metadata, body = _frontmatter(path.read_text(encoding="utf-8"))
-        resources = []
-        root = path.parent.resolve()
-        for value in metadata.get("resources", ()) if isinstance(metadata.get("resources", ()), list) else ():
-            candidate = (root / str(value)).resolve(strict=True)
-            candidate.relative_to(root)
-            if candidate.is_file():
-                resources.append(str(candidate))
+        anchor = None
+        try:
+            for scope, base, _prefix in self._roots(project_path=project_path, role=role):
+                if scope != descriptor.scope:
+                    continue
+                try:
+                    candidate_anchor = AnchoredRoot(base.resolve(strict=True))
+                except (FileNotFoundError, NotADirectoryError, OSError):
+                    continue
+                try:
+                    parts = candidate_anchor.relative(path)
+                except PermissionError:
+                    candidate_anchor.close()
+                    continue
+                anchor = candidate_anchor
+                break
+            if anchor is None:
+                raise RuntimeError("skill authority root changed during loading")
+            with anchor.reader(parts) as handle:
+                payload = handle.read(MAX_SKILL_BYTES + 1)
+            if (len(payload) > MAX_SKILL_BYTES or
+                    hashlib.sha256(payload).hexdigest() != descriptor.content_sha256):
+                raise RuntimeError("skill changed between discovery and loading")
+            metadata, body = _frontmatter(payload.decode("utf-8"))
+            resources = []
+            resource_values = (metadata.get("resources", ())
+                               if isinstance(metadata.get("resources", ()), list) else ())
+            for value in resource_values:
+                relative = Path(str(value))
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("skill resource escapes the skill directory")
+                resource_parts = parts[:-1] + tuple(relative.parts)
+                with anchor.reader(resource_parts):
+                    pass
+                resources.append(str(anchor.path.joinpath(*resource_parts)))
+        finally:
+            if anchor is not None:
+                anchor.close()
         return LoadedSkill(descriptor, body.strip(), tuple(resources))
 
     def doctor(self, *, project_path=None, role=None):

@@ -134,6 +134,28 @@ def test_backup_refuses_plaintext_like_configured_secrets(source, tmp_path):
     assert not (tmp_path / "unsafe.tarsbundle").exists()
 
 
+def test_backup_destination_parent_replacement_cannot_redirect_output(
+        monkeypatch, source, tmp_path):
+    destination_root = tmp_path / "destination"
+    destination_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    destination = destination_root / "portable.tarsbundle"
+    snapshot = backup._snapshot_database
+
+    def snapshot_then_swap(*args, **kwargs):
+        result = snapshot(*args, **kwargs)
+        destination_root.rename(tmp_path / "displaced-destination")
+        destination_root.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(backup, "_snapshot_database", snapshot_then_swap)
+    report = backup.create_bundle(destination, paths=source)
+    assert report.files > 0
+    assert not (outside / destination.name).exists()
+    assert (tmp_path / "displaced-destination" / destination.name).is_file()
+
+
 def test_restore_requires_explicit_replace(source, tmp_path):
     bundle = tmp_path / "portable.tarsbundle"
     backup.create_bundle(bundle, paths=source)

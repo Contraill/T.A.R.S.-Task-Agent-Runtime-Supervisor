@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -116,6 +117,31 @@ def test_git_checkpoint_rejects_untracked_symlink(recovery, tmp_path):
     (root / "untracked-link").symlink_to(outside)
     with pytest.raises(ValueError, match="unsupported untracked entry"):
         tools.create_git(root)
+
+
+def test_git_rollback_quarantines_swapped_symlink_without_moving_target(
+        recovery, tmp_path, monkeypatch):
+    tools, root = recovery
+    init_repo(root)
+    checkpoint = tools.create_git(root)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must remain outside")
+    original_create = tools.create_git
+
+    def create_safety_then_swap(*args, **kwargs):
+        safety = original_create(*args, **kwargs)
+        (root / "leak").symlink_to(outside)
+        return safety
+
+    monkeypatch.setattr(tools, "create_git", create_safety_then_swap)
+    result = tools.rollback(
+        checkpoint.data["checkpoint_id"], approval_id=approve_rollback(root),
+    )
+    quarantined = (Path(result.data["quarantine_ref"]) / "leak")
+    assert result.succeeded
+    assert outside.read_text() == "must remain outside"
+    assert quarantined.is_symlink() and quarantined.resolve() == outside
+    assert not (root / "leak").exists()
 
 
 def test_rollback_requires_explicit_destructive_approval(recovery):

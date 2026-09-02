@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
+import os
 import re
 import subprocess
 
 from .network import network_destination
 from .policy import ScopeRequest, canonical_path
+from .secure_paths import AnchoredRoot
 from .tool_core import ToolResult, ToolRuntime
 
 
@@ -37,16 +38,31 @@ def _remote_name(value):
 class GitTools:
     def __init__(self, repository, *, runtime=None, runner=subprocess.run):
         self.repository = canonical_path(repository)
-        if not (Path(self.repository) / ".git").exists():
+        self._anchor = AnchoredRoot(self.repository)
+        try:
+            self._anchor.lstat((".git",))
+        except FileNotFoundError:
+            self._anchor.close()
             raise ValueError(f"not a Git repository: {self.repository}")
+        self._repository_fd = self._anchor.open_directory()
         self.runtime = runtime or ToolRuntime()
         self.runner = runner
 
     def _git(self, arguments):
         return self.runner(
-            ["git", *arguments], cwd=self.repository, capture_output=True,
-            text=True, check=False,
+            ["git", *arguments], cwd=f"/proc/self/fd/{self._repository_fd}",
+            capture_output=True, text=True, check=False,
+            pass_fds=(self._repository_fd,),
         )
+
+    def close(self):
+        if self._repository_fd >= 0:
+            os.close(self._repository_fd)
+            self._repository_fd = -1
+        self._anchor.close()
+
+    def __del__(self):
+        self.close()
 
     def _state(self):
         head = self._git(["rev-parse", "HEAD"])

@@ -110,6 +110,56 @@ def test_csv_range_write_read_and_document_edit(artifacts):
     assert edited.succeeded and document.read_text() == "supported claim"
 
 
+def test_document_edit_rejects_parent_swap_after_authorization(
+        artifacts, tmp_path, monkeypatch):
+    inside = artifacts / "inside"
+    inside.mkdir()
+    target = inside / "note.md"
+    target.write_text("inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "note.md"
+    outside_target.write_text("outside")
+    tools = document_tools.DocumentTools((artifacts,))
+    approval = approve("document.edit", target, artifacts)
+    authorize = tools.artifacts.runtime.authorize
+
+    def swap_after_authorization(*args, **kwargs):
+        actions = authorize(*args, **kwargs)
+        inside.rename(artifacts / "displaced")
+        inside.symlink_to(outside, target_is_directory=True)
+        return actions
+
+    monkeypatch.setattr(tools.artifacts.runtime, "authorize", swap_after_authorization)
+    with pytest.raises(OSError):
+        tools.edit(target, [("inside", "changed")], approval_id=approval)
+    assert outside_target.read_text() == "outside"
+
+
+def test_document_edit_rejects_file_identity_swap_before_commit(
+        artifacts, monkeypatch):
+    target = artifacts / "note.md"
+    target.write_text("original")
+    tools = document_tools.DocumentTools((artifacts,))
+    approval = approve("document.edit", target, artifacts)
+    writer = tools.artifacts.writer
+    swapped = False
+
+    def swap_before_writer(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target.rename(artifacts / "displaced.md")
+            target.write_text("replacement")
+        return writer(*args, **kwargs)
+
+    monkeypatch.setattr(tools.artifacts, "writer", swap_before_writer)
+    with pytest.raises(RuntimeError, match="object changed"):
+        tools.edit(target, [("original", "updated")], approval_id=approval)
+    assert target.read_text() == "replacement"
+    assert (artifacts / "displaced.md").read_text() == "original"
+
+
 def test_pdf_capabilities_are_truthful_and_info_is_structured(monkeypatch, artifacts):
     target = artifacts / "fixture.pdf"
     target.write_bytes(b"%PDF fixture")
