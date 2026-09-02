@@ -154,7 +154,7 @@ def _intent_value(value, *, sensitive=False):
 
 def canonical_intent(request: ScopeRequest, decision: PolicyDecision) -> dict:
     paths = sorted({canonical_path(path) for path in request.allowed_paths})
-    hosts = sorted({normalize_network_target(host)[1] for host in request.allowed_hosts})
+    hosts = sorted({normalize_network_scope(host) for host in request.allowed_hosts})
     intent = {
         "tool": request.tool, "effect": decision.effect, "risk_class": decision.risk_class,
         "target": decision.target, "task_id": request.task_id, "session_id": request.session_id,
@@ -163,6 +163,10 @@ def canonical_intent(request: ScopeRequest, decision: PolicyDecision) -> dict:
         "sandbox_escape": bool(request.sandbox_escape),
         "arguments": _intent_value(request.arguments),
     }
+    if request.effect in {"network", "remote"} and request.target:
+        intent["network_target_sha256"] = _network_target_sha256(
+            request.effect, request.target
+        )
     encoded = json_dumps(intent).encode("utf-8")
     return {"version": 1, "sha256": hashlib.sha256(encoded).hexdigest(), "value": intent}
 
@@ -194,6 +198,47 @@ def normalize_network_target(value: str, *, resolve_dns=False) -> tuple[str, str
     return destination.policy_url, destination.host
 
 
+def normalize_network_scope(value: str) -> str:
+    """Normalize an exact host or exact origin without silently widening either."""
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("authorized network scope cannot be empty")
+    explicit_origin = "://" in raw
+    parsed = urlsplit(raw if explicit_origin else "https://" + raw)
+    if (parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path not in {"", "/"}):
+        raise ValueError("authorized network scopes contain only a host or an origin")
+    destination = network_destination(raw, resolve_dns=False)
+    if explicit_origin:
+        return "origin:" + destination.origin
+    if parsed.port is not None:
+        raise ValueError("a port-specific network scope requires an explicit origin")
+    return "host:" + destination.host
+
+
+def _normalized_origin(target: str) -> str:
+    parsed = urlsplit(target)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("network target does not have an origin")
+    default = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
+    port = parsed.port or default
+    if port is None:
+        raise ValueError("network target origin requires an explicit port")
+    host = parsed.hostname
+    authority = f"[{host}]" if ":" in host else host
+    return f"{parsed.scheme}://{authority}:{port}"
+
+
+def _network_target_sha256(effect: str, value: str) -> str:
+    parsed = urlsplit(str(value))
+    if effect == "remote" and parsed.scheme == "ssh":
+        normalized, _ = normalize_remote_target(value)
+        payload = normalized.encode("utf-8")
+    else:
+        payload = network_destination(value, resolve_dns=False).request_url.encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def normalize_remote_target(value: str, *, resolve_dns=False) -> tuple[str, str]:
     parsed = urlsplit(str(value))
     if parsed.scheme == "ssh" and parsed.hostname:
@@ -215,14 +260,35 @@ def add_rule_in_transaction(conn, effect: str, action: str, *, target="",
         raise ValueError("invalid policy effect or action")
     rule_id = "rule-" + uuid.uuid4().hex
     rule_metadata = dict(metadata or {})
-    if target_kind:
-        rule_metadata["target_kind"] = target_kind
     normalized_target = target
-    if rule_metadata.get("target_kind") == "path" and target:
+    if target_kind == "path" and target:
+        rule_metadata["target_kind"] = "path"
         normalized_target = canonical_path(target)
     elif effect in {"network", "remote"} and target:
-        parsed = urlsplit(target if "://" in target else "https://" + target)
-        normalized_target = (parsed.hostname or target).rstrip(".").casefold()
+        kind = target_kind or "domain"
+        if kind == "origin":
+            if "://" not in str(target):
+                raise ValueError("an origin policy rule requires an explicit scheme")
+            if effect == "remote":
+                remote_target, _ = normalize_remote_target(target)
+                normalized_target = _normalized_origin(remote_target)
+            else:
+                normalized_target = network_destination(
+                    target, resolve_dns=False
+                ).origin
+        elif kind in {"host", "domain"}:
+            parsed = urlsplit(target if "://" in target else "https://" + target)
+            if (not parsed.hostname or parsed.username or parsed.password
+                    or parsed.query or parsed.fragment or parsed.path not in {"", "/"}):
+                raise ValueError("host/domain policy targets contain only a hostname")
+            if parsed.port is not None:
+                raise ValueError("port-specific policy requires an origin target")
+            normalized_target = parsed.hostname.rstrip(".").casefold()
+        else:
+            raise ValueError("network policy target kind must be domain, host or origin")
+        rule_metadata["target_kind"] = kind
+    elif target_kind:
+        rule_metadata["target_kind"] = target_kind
     conn.execute(
         """INSERT INTO policy_rules(id,effect,action,target,scope,created_at,expires_at,metadata_json)
            VALUES(?,?,?,?,?,?,?,?)""",
@@ -299,14 +365,15 @@ class ScopeGuard:
                     else normalize_network_target
                 )
                 target, host = normalizer(target)
+                origin = _normalized_origin(target)
+                allowed_scopes = {
+                    normalize_network_scope(item) for item in request.allowed_hosts
+                }
             except ValueError as exc:
                 return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target, str(exc),
                                       normalized_arguments=redact_arguments(request.arguments))
-            allowed_hosts = set()
-            for item in request.allowed_hosts:
-                parsed_allowed = urlsplit(item if "://" in item else "https://" + item)
-                allowed_hosts.add((parsed_allowed.hostname or item).rstrip(".").casefold())
-            if allowed_hosts and host not in allowed_hosts:
+            if allowed_scopes and not (
+                    f"origin:{origin}" in allowed_scopes or f"host:{host}" in allowed_scopes):
                 return PolicyDecision("deny", RISK_BY_EFFECT[effect], effect, target,
                                       "destination is outside authorized network scope",
                                       normalized_arguments=redact_arguments(request.arguments))
@@ -345,7 +412,16 @@ class ScopeGuard:
                         host = urlsplit(target).hostname or target
                     except ValueError:
                         host = target
-                    target_matches = host == configured or host.endswith("." + configured)
+                    kind = metadata.get("target_kind", "domain")
+                    if kind == "origin":
+                        try:
+                            target_matches = _normalized_origin(target) == configured
+                        except ValueError:
+                            target_matches = False
+                    elif kind == "host":
+                        target_matches = host == configured
+                    else:
+                        target_matches = host == configured or host.endswith("." + configured)
                 elif configured:
                     target_matches = target == configured
                 if not target_matches:

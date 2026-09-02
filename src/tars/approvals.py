@@ -94,9 +94,14 @@ class ApprovalBroker:
                 raise RuntimeError("approval changed concurrently")
             if approve and approval.scope == "persistent":
                 intent = approval.request["intent"]
+                target_kind = (
+                    "path" if approval.tool.startswith("fs.")
+                    else "origin" if approval.request["effect"] in {"network", "remote"}
+                    else None
+                )
                 add_rule_in_transaction(
                     conn, approval.request["effect"], "allow", target=approval.target,
-                    target_kind="path" if approval.tool.startswith("fs.") else None,
+                    target_kind=target_kind,
                     expires_at=approval.expires_at,
                     metadata={
                         "approval_id": approval.id, "reason": reason,

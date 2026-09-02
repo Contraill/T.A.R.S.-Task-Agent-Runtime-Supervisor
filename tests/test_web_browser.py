@@ -1,6 +1,9 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
 import json
 from pathlib import Path
 import socket
+import threading
 
 import pytest
 
@@ -76,6 +79,14 @@ def test_browser_uses_dedicated_profile_stable_actions_and_evidence(web_environm
     click = browser.action("click", ref="e1", approval_id=_approve(click_request))
     assert navigation.succeeded and snapshot.data["refs"][0]["ref"] == "e1"
     assert click.succeeded and browser.status()["profile_policy"] == "dedicated-tars"
+    assert browser.status()["network_contract"] == {
+        "javascript": "enabled",
+        "http": "exact-origin pinned-peer transport",
+        "service_workers": "blocked",
+        "websocket": "blocked until a pinned-peer transport exists",
+        "webrtc": "blocked",
+        "webtransport": "blocked",
+    }
     assert snapshot.evidence_ids and profile.is_dir() and downloads.is_dir()
     browser.close()
     assert driver.closed
@@ -171,6 +182,126 @@ def test_browser_output_root_replacement_cannot_redirect_screenshot(
     assert result.succeeded
     assert not (outside / "screen.png").exists()
     assert (web_environment / "displaced-downloads" / "screen.png").read_bytes() == b"image"
+
+
+def test_live_browser_javascript_uses_bound_http_and_cannot_escape_origin(tmp_path):
+    if importlib.util.find_spec("playwright") is None:
+        pytest.skip("Playwright is not installed")
+
+    class DeniedHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def _record(self):
+            type(self).requests.append((self.command, self.path))
+            self.send_response(204)
+            self.end_headers()
+
+        do_GET = do_POST = _record
+
+        def log_message(self, *_):
+            pass
+
+    denied = ThreadingHTTPServer(("127.0.0.1", 0), DeniedHandler)
+    denied_thread = threading.Thread(target=denied.serve_forever, daemon=True)
+    denied_thread.start()
+    denied_origin = f"http://127.0.0.1:{denied.server_port}"
+
+    class AllowedHandler(BaseHTTPRequestHandler):
+        requests = []
+
+        def do_GET(self):
+            type(self).requests.append((self.command, self.path))
+            if self.path == "/":
+                cross = json.dumps(denied_origin)
+                body = f"""<!doctype html><body><div id='app'>initial</div><script>
+                    const cross = {cross};
+                    document.querySelector('#app').textContent = 'javascript-ready';
+                    fetch('/api').then(r => r.text()).then(
+                        value => document.body.dataset.api = value);
+                    const worker = new Worker('/worker.js');
+                    worker.onmessage = event => document.body.dataset.worker = event.data;
+                    fetch(cross + '/fetch').catch(() => {{}});
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('GET', cross + '/xhr'); xhr.send();
+                    for (const tag of ['img', 'iframe', 'script']) {{
+                        const node = document.createElement(tag);
+                        node.src = cross + '/' + tag; document.body.appendChild(node);
+                    }}
+                    const formFrame = document.createElement('iframe');
+                    formFrame.name = 'form-target'; document.body.appendChild(formFrame);
+                    const form = document.createElement('form');
+                    form.method = 'POST'; form.action = cross + '/form';
+                    form.target = formFrame.name; document.body.appendChild(form); form.submit();
+                    navigator.sendBeacon(cross + '/beacon', 'payload');
+                    try {{
+                        const events = new EventSource(cross + '/events');
+                        setTimeout(() => events.close(), 100);
+                    }} catch (_) {{}}
+                    try {{ new WebSocket(cross.replace('http:', 'ws:') + '/socket'); }} catch (_) {{}}
+                    window.open(cross + '/popup', 'blocked-popup');
+                    navigator.serviceWorker.register('/sw.js').catch(() => {{}});
+                </script>""".encode()
+                content_type = "text/html"
+            elif self.path == "/api":
+                body, content_type = b"api-ready", "text/plain"
+            elif self.path == "/worker.js":
+                body, content_type = b"postMessage('worker-ready')", "text/javascript"
+            elif self.path == "/sw.js":
+                body, content_type = b"", "text/javascript"
+            else:
+                body, content_type = b"not-found", "text/plain"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    allowed = ThreadingHTTPServer(("127.0.0.1", 0), AllowedHandler)
+    allowed_thread = threading.Thread(target=allowed.serve_forever, daemon=True)
+    allowed_thread.start()
+    allowed_origin = f"http://127.0.0.1:{allowed.server_port}"
+    profile = tmp_path / "profile"
+    downloads = tmp_path / "downloads"
+    profile.mkdir()
+    downloads.mkdir()
+    driver = None
+    try:
+        try:
+            driver = browser_tools.PlaywrightDriver(
+                profile, downloads, allow_loopback=True,
+            )
+        except Exception as exc:
+            if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc):
+                pytest.skip("Playwright Chromium is not installed")
+            raise
+        driver.set_allowed_origins((allowed_origin,))
+        driver.call("navigate", url=allowed_origin + "/")
+        driver.page.wait_for_function(
+            "document.body.dataset.api === 'api-ready' && "
+            "document.body.dataset.worker === 'worker-ready'",
+            timeout=10_000,
+        )
+        driver.page.wait_for_timeout(500)
+        assert driver.page.locator("#app").inner_text() == "javascript-ready"
+        assert driver.page.evaluate(
+            "[typeof RTCPeerConnection, typeof WebSocket, typeof WebTransport]"
+        ) == ["undefined", "undefined", "undefined"]
+        assert ("GET", "/api") in AllowedHandler.requests
+        assert ("GET", "/worker.js") in AllowedHandler.requests
+        assert driver.context.service_workers == []
+        assert not DeniedHandler.requests
+    finally:
+        if driver is not None:
+            driver.close()
+        allowed.shutdown()
+        allowed.server_close()
+        allowed_thread.join()
+        denied.shutdown()
+        denied.server_close()
+        denied_thread.join()
 
 
 def test_tavily_is_optional_and_secret_reference_is_not_exposed(monkeypatch, web_environment):

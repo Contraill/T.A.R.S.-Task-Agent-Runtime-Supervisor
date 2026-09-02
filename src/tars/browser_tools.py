@@ -15,7 +15,7 @@ from .tool_core import ToolResult, ToolRuntime
 
 class PlaywrightDriver:
     def __init__(self, profile, downloads, *, headless=True,
-                 max_resource_bytes=16_000_000):
+                 max_resource_bytes=16_000_000, allow_loopback=False):
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -24,15 +24,34 @@ class PlaywrightDriver:
         self.context = self._playwright.chromium.launch_persistent_context(
             str(profile), headless=headless, accept_downloads=True,
             downloads_path=str(downloads), service_workers="block",
-            java_script_enabled=False,
+            java_script_enabled=True,
             args=[
                 "--host-resolver-rules=MAP * ~NOTFOUND",
+                "--disable-background-networking",
+                "--disable-component-update",
+                "--disable-extensions",
                 "--disable-quic",
                 "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             ],
         )
+        self.context.add_init_script(script="""
+            for (const name of [
+                "RTCPeerConnection", "webkitRTCPeerConnection", "WebSocket",
+                "WebTransport"
+            ]) {
+                try {
+                    Object.defineProperty(globalThis, name, {
+                        configurable: false,
+                        enumerable: false,
+                        get: () => undefined,
+                        set: () => { throw new TypeError(name + " is disabled"); },
+                    });
+                } catch (_) {}
+            }
+        """)
         self.allowed_origins = set()
         self.max_resource_bytes = int(max_resource_bytes)
+        self.allow_loopback = bool(allow_loopback)
         self.peer_addresses = {}
 
         def route_request(route):
@@ -44,7 +63,9 @@ class PlaywrightDriver:
                     route.abort("blockedbyclient")
                 return
             try:
-                destination = network_destination(url, resolve_dns=True)
+                destination = network_destination(
+                    url, resolve_dns=True, allow_loopback=self.allow_loopback,
+                )
                 if destination.origin not in self.allowed_origins:
                     raise PermissionError("browser request left its authorized origin set")
                 request_headers = route.request.all_headers()
@@ -69,9 +90,6 @@ class PlaywrightDriver:
             except Exception:
                 route.abort("blockedbyclient")
         self.context.route("**/*", route_request)
-        self.context.route_web_socket(
-            "**/*", lambda route: route.close(code=1008, reason="network authority required")
-        )
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
 
     def set_allowed_origins(self, origins):
@@ -115,6 +133,9 @@ class PlaywrightDriver:
         raise ValueError(f"unsupported browser operation: {operation}")
 
     def close(self):
+        for page in tuple(self.context.pages):
+            if not page.is_closed():
+                page.close(run_before_unload=False)
         self.context.close()
         self._playwright.stop()
 
@@ -146,7 +167,15 @@ class BrowserTools:
                    "installed-unverified" if available else "unavailable")
         return {"available": available, "support": support,
                 "profile": str(self.profile), "downloads": str(self.downloads),
-                "profile_policy": "explicit-personal" if self.personal_profile else "dedicated-tars"}
+                "profile_policy": "explicit-personal" if self.personal_profile else "dedicated-tars",
+                "network_contract": {
+                    "javascript": "enabled",
+                    "http": "exact-origin pinned-peer transport",
+                    "service_workers": "blocked",
+                    "websocket": "blocked until a pinned-peer transport exists",
+                    "webrtc": "blocked",
+                    "webtransport": "blocked",
+                }}
 
     def _driver(self):
         if self.driver is None:

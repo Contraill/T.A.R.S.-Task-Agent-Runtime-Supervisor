@@ -112,6 +112,11 @@ def test_policy_approval_and_audit_cli_parsing():
         "--allow-path", "/tmp/work",
     ])
     assert scope.scope_command == "explain" and scope.allow_path == ["/tmp/work"]
+    origin_rule = parser.parse_args([
+        "scope", "rule-add", "network", "allow", "https://example.com",
+        "--origin",
+    ])
+    assert origin_rule.origin and not origin_rule.host and not origin_rule.domain
     approval = parser.parse_args(["approvals", "--approve", "approval-one"])
     assert approval.approve == "approval-one"
     audit = parser.parse_args(["audit", "--state", "denied"])

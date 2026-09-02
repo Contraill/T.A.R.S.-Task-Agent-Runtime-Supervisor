@@ -92,6 +92,88 @@ def test_network_allowlist_and_credentials_are_enforced(isolated_policy):
     assert "raw-secret" not in redacted.target and "view=short" in redacted.target
 
 
+def test_network_scopes_distinguish_exact_origins_from_exact_hosts(isolated_policy):
+    guard = policy.ScopeGuard()
+    exact = policy.ScopeRequest(
+        "http.get", "network", "https://example.com/docs",
+        allowed_hosts=("https://example.com",),
+    )
+    assert guard.evaluate(exact).action == "ask"
+    for target in (
+            "http://example.com/docs",
+            "https://example.com:444/docs",
+            "https://api.example.com/docs"):
+        changed = policy.ScopeRequest(
+            "http.get", "network", target,
+            allowed_hosts=("https://example.com",),
+        )
+        assert guard.evaluate(changed).action == "deny"
+
+    for target in (
+            "https://example.com/docs",
+            "http://example.com/docs",
+            "https://example.com:444/docs"):
+        host_scoped = policy.ScopeRequest(
+            "http.get", "network", target, allowed_hosts=("example.com",),
+        )
+        assert guard.evaluate(host_scoped).action == "ask"
+    assert guard.evaluate(policy.ScopeRequest(
+        "http.get", "network", "https://api.example.com/docs",
+        allowed_hosts=("example.com",),
+    )).action == "deny"
+    with pytest.raises(ValueError, match="explicit origin"):
+        policy.normalize_network_scope("example.com:444")
+
+
+def test_network_intent_hashes_redacted_target_identity_and_origin_scope(isolated_policy):
+    guard = policy.ScopeGuard()
+    first = policy.ScopeRequest(
+        "http.get", "network", "https://example.com/data?token=alpha",
+        allowed_hosts=("https://example.com",),
+    )
+    second = policy.ScopeRequest(
+        "http.get", "network", "https://example.com/data?token=bravo",
+        allowed_hosts=("https://example.com",),
+    )
+    first_decision = guard.evaluate(first)
+    second_decision = guard.evaluate(second)
+    assert first_decision.target == second_decision.target
+    first_intent = policy.canonical_intent(first, first_decision)
+    second_intent = policy.canonical_intent(second, second_decision)
+    assert first_intent["sha256"] != second_intent["sha256"]
+    assert first_intent["value"]["allowed_hosts"] == [
+        "origin:https://example.com:443"
+    ]
+    host_scoped = policy.ScopeRequest(
+        "http.get", "network", first.target, allowed_hosts=("example.com",),
+    )
+    host_intent = policy.canonical_intent(host_scoped, guard.evaluate(host_scoped))
+    assert host_intent["sha256"] != first_intent["sha256"]
+    assert "alpha" not in str(first_intent)
+
+
+def test_network_policy_rule_kind_makes_widening_explicit(isolated_policy):
+    guard = policy.ScopeGuard()
+    policy.add_rule(
+        "network", "allow", target="https://example.com",
+        target_kind="origin",
+    )
+    assert guard.evaluate(policy.ScopeRequest(
+        "http.get", "network", "https://example.com/docs",
+    )).action == "allow"
+    assert guard.evaluate(policy.ScopeRequest(
+        "http.get", "network", "http://example.com/docs",
+    )).action == "ask"
+
+    policy.add_rule("network", "deny", target="api.example.net", target_kind="host")
+    assert guard.evaluate(policy.ScopeRequest(
+        "http.get", "network", "https://api.example.net/docs",
+    )).action == "deny"
+    assert guard.evaluate(policy.ScopeRequest(
+        "http.get", "network", "https://child.api.example.net/docs",
+    )).action == "ask"
+
+
 def test_risk_defaults_and_model_arguments_cannot_override_policy(isolated_policy):
     guard = policy.ScopeGuard()
     execute = guard.evaluate(policy.ScopeRequest(
@@ -256,6 +338,12 @@ def test_persistent_approval_retains_complete_authority_dimensions(isolated_poli
         broker.request(network, guard.evaluate(network), scope="persistent").id,
         approve=True)
     assert guard.evaluate(network).action == "allow"
+    network_rule = next(
+        item for item in policy.list_rules()
+        if item["effect"] == "network" and item["metadata"].get("approval_id")
+    )
+    assert network_rule["metadata"]["target_kind"] == "origin"
+    assert network_rule["target"] == "https://example.com:443"
     for target in (
             "https://example.com/admin", "http://example.com/docs",
             "https://example.com:8443/docs"):

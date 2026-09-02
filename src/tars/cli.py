@@ -1684,9 +1684,11 @@ def command_scope(args):
         console.print_json(data=list_policy_rules())
         return 0
     if args.scope_command == "rule-add":
+        target_kind = next((kind for kind in ("path", "origin", "host", "domain")
+                            if getattr(args, kind, False)), None)
         rule_id = add_policy_rule(
             args.effect, args.action, target=args.target or "",
-            target_kind="path" if args.path else None,
+            target_kind=target_kind,
         )
         console.print(rule_id)
         return 0
@@ -1875,7 +1877,15 @@ def build_parser():
     }))
     scope_rule.add_argument("action", choices=["allow", "deny", "ask"])
     scope_rule.add_argument("target", nargs="?", default="")
-    scope_rule.add_argument("--path", action="store_true", help="treat target as a filesystem root")
+    rule_kind = scope_rule.add_mutually_exclusive_group()
+    rule_kind.add_argument("--path", action="store_true",
+                           help="treat target as a filesystem root")
+    rule_kind.add_argument("--origin", action="store_true",
+                           help="match one exact scheme, host and effective port")
+    rule_kind.add_argument("--host", action="store_true",
+                           help="match one exact host across schemes and ports")
+    rule_kind.add_argument("--domain", action="store_true",
+                           help="match a host and its subdomains across schemes and ports")
 
     approvals = sub.add_parser("approvals", help="inspect or decide approval requests")
     approval_decision = approvals.add_mutually_exclusive_group()
