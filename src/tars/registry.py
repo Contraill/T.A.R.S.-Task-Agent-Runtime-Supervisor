@@ -1,11 +1,28 @@
 import json
 import os
+import re
 import tempfile
 import tomllib
 from pathlib import Path
 
 from .config import DATA_ROOT, REGISTRY_PATH
 from .models import ModelRecord
+
+MODEL_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def validate_model_alias(value):
+    if not isinstance(value, str) or not MODEL_ALIAS_RE.fullmatch(value):
+        raise ValueError(f"invalid model alias: {value!r}")
+    return value
+
+
+def _validate_registry(data):
+    models = data.get("models", {})
+    if not isinstance(models, dict):
+        raise ValueError("model registry models must be a table")
+    for alias in models:
+        validate_model_alias(alias)
 
 
 def _quote(value):
@@ -79,6 +96,7 @@ def serialize_registry(data):
 
 
 def save_registry(data):
+    _validate_registry(data)
     REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = serialize_registry(data)
 
@@ -110,6 +128,7 @@ def load_registry():
         data = tomllib.load(handle)
 
     data.setdefault("models", {})
+    _validate_registry(data)
     for info in data["models"].values():
         info.setdefault("backend", "llama.cpp")
     return data
@@ -124,6 +143,7 @@ def models():
 
 
 def get_model(alias):
+    validate_model_alias(alias)
     available = models()
     if alias not in available:
         raise KeyError(f"unknown model alias: {alias}")
@@ -131,6 +151,7 @@ def get_model(alias):
 
 
 def set_thinking_control(alias, control):
+    validate_model_alias(alias)
     if control not in {"unknown", "toggle"}:
         raise ValueError("thinking control must be unknown or toggle")
     data = ensure_registry()
@@ -142,6 +163,7 @@ def set_thinking_control(alias, control):
 
 
 def role_for_alias(alias):
+    validate_model_alias(alias)
     from .roles import list_roles
 
     return [

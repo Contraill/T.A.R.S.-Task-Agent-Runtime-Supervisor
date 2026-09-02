@@ -83,6 +83,27 @@ def _same_owner(row, owner: Owner) -> bool:
                 and row["owner_start"] == owner.process_start)
 
 
+def _fence_processes_alive(row) -> bool:
+    from .state_store import json_loads
+    metadata = json_loads(row["metadata_json"], {})
+    for identity in metadata.get("fence_processes", ()):
+        if not isinstance(identity, dict):
+            return True
+        try:
+            pid = int(identity["pid"])
+            start = str(identity["start"])
+        except (KeyError, TypeError, ValueError):
+            return True
+        if not owner_gone(pid, start):
+            return True
+    return False
+
+
+def _reclaimable(row) -> bool:
+    return bool(owner_gone(row["owner_pid"], row["owner_start"])
+                and not _fence_processes_alive(row))
+
+
 def _expiry(seconds: float, *, now=None) -> str:
     current = now or datetime.now(timezone.utc)
     return (current + timedelta(seconds=max(1.0, float(seconds)))).isoformat()
@@ -107,8 +128,7 @@ def claim_in_transaction(conn, resource_type, resource_key, owner: Owner, *,
         ).fetchone()
         if fence or (task and task["phase"] == "cancellation-recovery-required"):
             return False
-    if row and not _same_owner(row, owner) and not owner_gone(
-            row["owner_pid"], row["owner_start"]):
+    if row and not _same_owner(row, owner) and not _reclaimable(row):
         return False
     if row:
         changed = conn.execute(
@@ -158,7 +178,7 @@ def claim_workspace(resource_key, owner: Owner, *, lease_seconds=30.0,
                         or other.startswith(key.rstrip("/") + "/"))
             if not overlaps or _same_owner(row, owner):
                 continue
-            if not owner_gone(row["owner_pid"], row["owner_start"]):
+            if not _reclaimable(row):
                 return False
             conn.execute(
                 "DELETE FROM resource_leases WHERE resource_type='workspace' "
@@ -184,8 +204,80 @@ def heartbeat(resource_type, resource_key, owner: Owner, *, lease_seconds=30.0) 
     return changed == 1
 
 
+def _normalized_process_identities(identities):
+    normalized = []
+    for identity in identities:
+        pid = int(identity["pid"])
+        start = str(identity["start"])
+        if pid <= 1 or not start:
+            raise ValueError("external process fence requires a stable process identity")
+        normalized.append({"pid": pid, "start": start})
+    return normalized
+
+
+def _update_external_process_fence(resource_type, resource_key, owner: Owner, *,
+                                   add=(), remove=()) -> bool:
+    additions = _normalized_process_identities(add)
+    removals = {
+        (item["pid"], item["start"])
+        for item in _normalized_process_identities(remove)
+    }
+    with transaction(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM resource_leases WHERE resource_type=? AND resource_key=?",
+            (resource_type, resource_key),
+        ).fetchone()
+        if not _same_owner(row, owner):
+            return False
+        from .state_store import json_loads
+        metadata = json_loads(row["metadata_json"], {})
+        retained = []
+        for identity in metadata.get("fence_processes", ()):
+            if not isinstance(identity, dict):
+                retained.append(identity)
+                continue
+            key = (identity.get("pid"), identity.get("start"))
+            if key not in removals:
+                retained.append(identity)
+        present = {
+            (item.get("pid"), item.get("start"))
+            for item in retained if isinstance(item, dict)
+        }
+        retained.extend(
+            item for item in additions
+            if (item["pid"], item["start"]) not in present
+        )
+        metadata["fence_processes"] = retained
+        changed = conn.execute(
+            "UPDATE resource_leases SET metadata_json=? WHERE resource_type=? "
+            "AND resource_key=? AND owner_token=? AND owner_pid=? AND owner_start=?",
+            (json_dumps(metadata), resource_type, resource_key, owner.token,
+             owner.pid, owner.process_start),
+        ).rowcount
+    return changed == 1
+
+
+def add_external_process_fence(resource_type, resource_key, owner: Owner,
+                               identities) -> bool:
+    """Prevent reclaim while supervised effect processes may still be live."""
+    return _update_external_process_fence(
+        resource_type, resource_key, owner, add=identities)
+
+
+def remove_external_process_fence(resource_type, resource_key, owner: Owner,
+                                  identities) -> bool:
+    return _update_external_process_fence(
+        resource_type, resource_key, owner, remove=identities)
+
+
 def release(resource_type, resource_key, owner: Owner) -> bool:
     with transaction(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM resource_leases WHERE resource_type=? AND resource_key=?",
+            (resource_type, resource_key),
+        ).fetchone()
+        if not _same_owner(row, owner) or _fence_processes_alive(row):
+            return False
         changed = conn.execute(
             "DELETE FROM resource_leases WHERE resource_type=? AND resource_key=? "
             "AND owner_token=? AND owner_pid=? AND owner_start=?",
@@ -219,10 +311,10 @@ def active(resource_type, resource_key) -> bool:
 
 def active_in_transaction(conn, resource_type, resource_key) -> bool:
     row = conn.execute(
-        "SELECT owner_pid,owner_start FROM resource_leases "
+        "SELECT owner_pid,owner_start,metadata_json FROM resource_leases "
         "WHERE resource_type=? AND resource_key=?", (resource_type, resource_key),
     ).fetchone()
-    return bool(row and not owner_gone(row["owner_pid"], row["owner_start"]))
+    return bool(row and not _reclaimable(row))
 
 
 def active_metadata(resource_type, resource_key) -> dict | None:
@@ -233,7 +325,7 @@ def active_metadata(resource_type, resource_key) -> dict | None:
             "WHERE resource_type=? AND resource_key=?",
             (resource_type, resource_key),
         ).fetchone()
-    if not row or owner_gone(row["owner_pid"], row["owner_start"]):
+    if not row or _reclaimable(row):
         return None
     from .state_store import json_loads
     return json_loads(row["metadata_json"], {})
@@ -272,10 +364,12 @@ def model_execution_scope(*, operation, lease_seconds=30.0, timeout=30.0,
         raise RuntimeError("local inference slot is busy")
     token = _MODEL_EXECUTION_OWNER.set(owner)
     try:
+        from .model_integrity import model_artifact_cache_scope
         with Heartbeat(
             resource_type, resource_key, owner, lease_seconds=lease_seconds,
         ):
-            yield owner
+            with model_artifact_cache_scope():
+                yield owner
     finally:
         _MODEL_EXECUTION_OWNER.reset(token)
         release(resource_type, resource_key, owner)

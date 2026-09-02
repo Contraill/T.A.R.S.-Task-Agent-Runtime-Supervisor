@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import hashlib
 import multiprocessing
 from pathlib import Path
 import threading
@@ -65,8 +66,16 @@ def test_llama_cpp_backend_contract(monkeypatch, tmp_path):
     transport = FakeTransport()
     binary = tmp_path / "llama-server"
     binary.write_text("binary")
+    model_path = tmp_path / "model.gguf"
+    model_path.write_bytes(b"fixture-model")
+    model = SimpleNamespace(
+        alias="fixture", path=model_path,
+        sha256=hashlib.sha256(b"fixture-model").hexdigest(),
+        thinking_control="unknown",
+    )
     monkeypatch.setattr(backends, "LLAMA_SERVER_PATH", binary)
-    backend = backends.LlamaCppBackend(_cfg(), transport=transport)
+    backend = backends.LlamaCppBackend(
+        _cfg(), transport=transport, model_record=model)
     assert backend.status().healthy
     assert backend.capabilities().on_demand
     caps = backend.model_capabilities("daily")
@@ -78,6 +87,70 @@ def test_llama_cpp_backend_contract(monkeypatch, tmp_path):
     events = list(backend.stream(request))
     assert events[0].reasoning == "think"
     assert events[1].content == "answer" and events[1].tool_calls[0]["id"] == "one"
+
+
+@pytest.mark.parametrize("base_url", [
+    "https://example.com",
+    "http://192.168.1.10:8080",
+    "http://runtime.internal:8080",
+    "http://127.0.0.1:8080/v1",
+    "http://user:secret@127.0.0.1:8080",
+    "http://127.0.0.1:8080?token=secret",
+    "http://127.0.0.1:bad",
+])
+def test_llama_cpp_local_only_rejects_nonlocal_or_nonorigin_transport(base_url):
+    with pytest.raises(ValueError, match="runtime base_url"):
+        backends.LlamaCppBackend({"runtime": {"base_url": base_url}})
+
+
+def test_local_runtime_origins_are_literal_and_dns_free():
+    ipv4 = backends.LlamaCppBackend(
+        {"runtime": {"base_url": "http://127.0.0.1:8080"}},
+        transport=FakeTransport(),
+    )
+    ipv6 = backends.LlamaCppBackend(
+        {"runtime": {"base_url": "http://[::1]:8081"}},
+        transport=FakeTransport(),
+    )
+    localhost = backends.LlamaCppBackend(
+        {"runtime": {"base_url": "http://localhost:8082"}},
+        transport=FakeTransport(),
+    )
+    assert ipv4.base_url == "http://127.0.0.1:8080"
+    assert ipv6.base_url == "http://[::1]:8081"
+    assert localhost.base_url == "http://127.0.0.1:8082"
+
+
+def test_direct_runtime_helpers_share_local_transport_validation(monkeypatch):
+    monkeypatch.setattr(
+        runtime, "get_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("remote transport was reached")),
+    )
+    with pytest.raises(ValueError, match="loopback-local"):
+        runtime.runtime_models(
+            {"runtime": {"base_url": "https://models.example.com"}})
+
+
+def test_llama_cpp_dispatch_rechecks_current_artifact_bytes(tmp_path):
+    payload = b"verified-model"
+    path = tmp_path / "model.gguf"
+    path.write_bytes(payload)
+    model = SimpleNamespace(
+        alias="fixture", path=path, sha256=hashlib.sha256(payload).hexdigest(),
+        thinking_control="unknown",
+    )
+    transport = FakeTransport()
+    backend = backends.LlamaCppBackend(
+        _cfg(), transport=transport, model_record=model)
+    request = backends.InferenceRequest(
+        "daily", ({"role": "user", "content": "hi"},))
+    with ownership.model_execution_scope(operation="artifact-recheck-test"):
+        assert backend.complete(request)["choices"]
+        path.write_bytes(b"same-path-different-model")
+        with pytest.raises(RuntimeError, match="no longer match"):
+            backend.complete(request)
+    assert [call[0] for call in transport.calls] == ["POST"]
 
 
 def test_colibri_unconfigured_is_a_supported_truthful_state():
@@ -150,8 +223,7 @@ def test_colibri_rejects_nonlocal_endpoint_and_clamps_heavy_ttl():
     assert backend.diagnostics()["configured"]
     local = backends.ColibriBackend(
         {"colibri": {"base_url": "http://127.0.0.1:9988"}})
-    assert any(isinstance(handler, backends._NoRedirectHandler)
-               for handler in local.transport.opener.handlers)
+    assert isinstance(local.transport, backends.UrllibTransport)
     malformed = backends.ColibriBackend(
         {"colibri": {"base_url": "http://127.0.0.1:9988", "ttl_seconds": "bad"}})
     assert "must be an integer" in malformed.status().message
@@ -468,14 +540,63 @@ def test_end_to_end_chat_does_not_prepare_before_cross_process_model_ownership(
 
 
 def test_backend_readiness_requires_matching_local_calibration(monkeypatch):
-    model = SimpleNamespace(alias="local", backend="llama.cpp", sha256="abc")
+    payload = b"current-model"
+    path = state_store.STATE_DB_PATH.parent / "model.gguf"
+    path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    server = state_store.STATE_DB_PATH.parent / "llama-server"
+    bench = state_store.STATE_DB_PATH.parent / "llama-bench"
+    server.write_bytes(b"server-binary")
+    bench.write_bytes(b"bench-binary")
+    server_digest = hashlib.sha256(b"server-binary").hexdigest()
+    bench_digest = hashlib.sha256(b"bench-binary").hexdigest()
+    monkeypatch.setattr(backends, "LLAMA_SERVER_PATH", server)
+    monkeypatch.setattr(backends, "LLAMA_BENCH_PATH", bench)
+    model = SimpleNamespace(
+        alias="local", backend="llama.cpp", sha256=digest, path=path)
     monkeypatch.setattr(backends, "load_calibration", lambda alias: {
-        "status": "ready", "model_sha256": "abc"
+        "status": "ready", "model_sha256": digest,
+        "fingerprint": {"llama_server_sha256": server_digest,
+                        "llama_bench_sha256": bench_digest},
     })
     assert backends.backend_binding_ready(model)
     monkeypatch.setattr(backends, "load_calibration", lambda alias: {
         "status": "ready", "model_sha256": "different"
     })
+    assert not backends.backend_binding_ready(model)
+    path.write_bytes(b"changed-model")
+    monkeypatch.setattr(backends, "load_calibration", lambda alias: {
+        "status": "ready", "model_sha256": digest,
+        "fingerprint": {"llama_server_sha256": server_digest,
+                        "llama_bench_sha256": bench_digest},
+    })
+    assert not backends.backend_binding_ready(model)
+
+
+def test_runtime_binary_change_invalidates_calibrated_binding(monkeypatch):
+    root = state_store.STATE_DB_PATH.parent
+    model_path = root / "model.gguf"
+    server = root / "llama-server"
+    bench = root / "llama-bench"
+    model_path.write_bytes(b"model")
+    server.write_bytes(b"server")
+    bench.write_bytes(b"bench")
+    model = SimpleNamespace(
+        alias="local", backend="llama.cpp", path=model_path,
+        sha256=hashlib.sha256(b"model").hexdigest(),
+    )
+    calibration = {
+        "status": "ready", "model_sha256": model.sha256,
+        "fingerprint": {
+            "llama_server_sha256": hashlib.sha256(b"server").hexdigest(),
+            "llama_bench_sha256": hashlib.sha256(b"bench").hexdigest(),
+        },
+    }
+    monkeypatch.setattr(backends, "LLAMA_SERVER_PATH", server)
+    monkeypatch.setattr(backends, "LLAMA_BENCH_PATH", bench)
+    monkeypatch.setattr(backends, "load_calibration", lambda alias: calibration)
+    assert backends.backend_binding_ready(model)
+    server.write_bytes(b"changed-server")
     assert not backends.backend_binding_ready(model)
     colibri = SimpleNamespace(
         backend="colibri", integrity_verified=True, runtime_compatible=True,

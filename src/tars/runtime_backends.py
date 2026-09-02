@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import ipaddress
-import json
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from typing import Iterable, Protocol
-import urllib.request
 
 from .calibration import load_calibration
-from .config import LLAMA_SERVER_PATH, runtime_base_url
+from .config import (
+    LLAMA_BENCH_PATH,
+    LLAMA_SERVER_PATH,
+    local_http_origin,
+    runtime_base_url,
+)
+from .model_integrity import (
+    calibration_runtime_artifacts_match,
+    model_artifact_matches,
+    require_current_model_artifact,
+)
+from .runtime_http import request_json, request_sse
 
 
 @dataclass(frozen=True)
@@ -85,43 +93,12 @@ class Transport(Protocol):
 
 
 class UrllibTransport:
-    def __init__(self, *, allow_redirects=True):
-        self.opener = (urllib.request.build_opener() if allow_redirects else
-                       urllib.request.build_opener(_NoRedirectHandler()))
-
     def json(self, method, url, *, payload=None, timeout=30):
-        body = json.dumps(payload).encode() if payload is not None else None
-        request = urllib.request.Request(
-            url, data=body, method=method, headers={"Content-Type": "application/json"}
-        )
-        with self.opener.open(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        return request_json(
+            method, url, payload=payload, timeout=timeout)
 
     def sse(self, url, *, payload, timeout=1200):
-        request = urllib.request.Request(
-            url, data=json.dumps(payload).encode(), method="POST",
-            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
-        )
-        with self.opener.open(request, timeout=timeout) as response:
-            for raw in response:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line or line.startswith(":"):
-                    continue
-                if line.startswith("data:"):
-                    line = line[5:].strip()
-                if line == "[DONE]":
-                    break
-                try:
-                    value = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(value, dict):
-                    yield value
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        yield from request_sse(url, payload=payload, timeout=timeout)
 
 
 class RuntimeBackend(Protocol):
@@ -168,6 +145,12 @@ class LlamaCppBackend:
 
     def _models(self):
         return self.transport.json("GET", self.base_url + "/v1/models", timeout=5).get("data", [])
+
+    def _require_current_model(self):
+        if self.model_record is None:
+            raise BackendUnavailable(
+                "llama.cpp inference requires a verified model artifact binding")
+        require_current_model_artifact(self.model_record)
 
     def status(self):
         if not LLAMA_SERVER_PATH.is_file():
@@ -222,10 +205,12 @@ class LlamaCppBackend:
         return payload
 
     def complete(self, request):
+        self._require_current_model()
         return self.transport.json("POST", self.base_url + "/v1/chat/completions",
                                    payload=self._payload(request), timeout=1200)
 
     def stream(self, request):
+        self._require_current_model()
         chunks = self.transport.sse(self.base_url + "/v1/chat/completions",
                                     payload=self._payload(request, stream=True), timeout=1200)
         yield from normalize_chat_stream(chunks)
@@ -258,34 +243,29 @@ class ColibriBackend:
         nested = runtime_cfg.get("colibri", {}) if isinstance(runtime_cfg, dict) else {}
         direct = self.cfg.get("colibri", {}) if isinstance(self.cfg, dict) else {}
         self.settings = dict(nested or direct or {})
-        self.base_url = str(self.settings.get("base_url", "")).rstrip("/")
+        raw_base_url = str(self.settings.get("base_url", "")).strip()
+        self.base_url = raw_base_url.rstrip("/")
+        self._base_url_error = ""
+        if raw_base_url:
+            try:
+                self.base_url = local_http_origin(
+                    raw_base_url, label="Colibri base_url")
+            except ValueError as exc:
+                self._base_url_error = str(exc)
         self._ttl_error = ""
         try:
             self.ttl_seconds = max(5, min(300, int(self.settings.get("ttl_seconds", 60))))
         except (TypeError, ValueError):
             self.ttl_seconds = 60
             self._ttl_error = "Colibri ttl_seconds must be an integer"
-        self.transport = transport or UrllibTransport(allow_redirects=False)
+        self.transport = transport or UrllibTransport()
 
     def _configuration_error(self):
         if not self.base_url:
             return "Colibri is not configured"
         if self._ttl_error:
             return self._ttl_error
-        parsed = urlsplit(self.base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return "Colibri base_url must be a local HTTP(S) endpoint"
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            return "Colibri base_url must be a local origin without credentials or query data"
-        if parsed.path not in {"", "/"}:
-            return "Colibri base_url must not contain an API path"
-        try:
-            local = ipaddress.ip_address(parsed.hostname.split("%", 1)[0]).is_loopback
-        except ValueError:
-            local = parsed.hostname.casefold() == "localhost"
-        if not local:
-            return "Colibri base_url must be loopback-local"
-        return ""
+        return self._base_url_error
 
     def _probe(self):
         error = self._configuration_error()
@@ -447,12 +427,16 @@ def backend_for_model(model, cfg, *, transport=None) -> RuntimeBackend:
 
 def backend_binding_ready(model, cfg=None) -> bool:
     if model.backend == "llama.cpp":
+        if not model_artifact_matches(model):
+            return False
         try:
             calibration = load_calibration(model.alias)
         except (FileNotFoundError, KeyError):
             return False
         return (calibration.get("status") == "ready" and
-                calibration.get("model_sha256") == model.sha256)
+                calibration.get("model_sha256") == model.sha256 and
+                calibration_runtime_artifacts_match(
+                    calibration, LLAMA_SERVER_PATH, LLAMA_BENCH_PATH))
     if model.backend == "colibri":
         return (bool(getattr(model, "integrity_verified", False)) and
                 bool(getattr(model, "runtime_compatible", False)) and

@@ -101,7 +101,8 @@ for user_signal_number in (
     signal.signal(user_signal_number, user_signal)
 if os.getppid() != expected_parent:
     parent_died()
-child = subprocess.Popen(sys.argv[5:], start_new_session=True)
+extra_fds = tuple(int(value) for value in sys.argv[5].split(",") if value)
+child = subprocess.Popen(sys.argv[6:], start_new_session=True, pass_fds=extra_fds)
 child_pgid = child.pid
 def child_start():
     return process_identity(child.pid)
@@ -142,6 +143,20 @@ while True:
 raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
 """
 
+EXEC_GATE_WRAPPER = r"""
+import os
+import sys
+
+gate_fd = int(sys.argv[1])
+try:
+    released = os.read(gate_fd, 1)
+finally:
+    os.close(gate_fd)
+if released != b"1":
+    raise SystemExit(125)
+os.execvp(sys.argv[2], sys.argv[2:])
+"""
+
 
 def _close_fd(descriptor):
     if descriptor is None or descriptor < 0:
@@ -160,12 +175,25 @@ class SupervisedProcess:
     supervisor_start: str
     control_write: int
     response_read: int
+    gate_write: int = -1
+
+    def release_start_gate(self):
+        if self.gate_write < 0:
+            return
+        descriptor = self.gate_write
+        self.gate_write = -1
+        try:
+            os.write(descriptor, b"1")
+        finally:
+            _close_fd(descriptor)
 
     def close_control(self):
         _close_fd(self.control_write)
         _close_fd(self.response_read)
+        _close_fd(self.gate_write)
         self.control_write = -1
         self.response_read = -1
+        self.gate_write = -1
 
     def stop(self, *, timeout=5.0):
         if self.process.poll() is None:
@@ -194,20 +222,33 @@ class SupervisedProcess:
 
 
 def spawn_supervised(argv, *, cwd=None, env=None, popen=subprocess.Popen,
-                     startup_timeout=5.0, **popen_kwargs):
+                     startup_timeout=5.0, start_gated=False, inherited_fds=(),
+                     **popen_kwargs):
+    extra_fds = tuple(int(value) for value in inherited_fds)
+    if any(value < 0 for value in extra_fds):
+        raise ValueError("inherited process descriptors must be open")
     ready_read, ready_write = os.pipe()
     control_read, control_write = os.pipe()
     response_read, response_write = os.pipe()
+    gate_read, gate_write = (-1, -1)
+    command = list(map(str, argv))
+    if start_gated:
+        gate_read, gate_write = os.pipe()
+        extra_fds = (*extra_fds, gate_read)
+        command = [
+            sys.executable, "-c", EXEC_GATE_WRAPPER, str(gate_read), *command,
+        ]
     process = None
     managed_argv = [
         sys.executable, "-c", PARENT_DEATH_WRAPPER,
         str(os.getpid()), str(ready_write), str(control_read), str(response_write),
-        *map(str, argv),
+        ",".join(map(str, extra_fds)), *command,
     ]
     try:
         process = popen(
             managed_argv, cwd=cwd, env=env, start_new_session=True,
-            pass_fds=(ready_write, control_read, response_write), **popen_kwargs,
+            pass_fds=(ready_write, control_read, response_write, *extra_fds),
+            **popen_kwargs,
         )
         _close_fd(ready_write)
         ready_write = -1
@@ -215,6 +256,8 @@ def spawn_supervised(argv, *, cwd=None, env=None, popen=subprocess.Popen,
         control_read = -1
         _close_fd(response_write)
         response_write = -1
+        _close_fd(gate_read)
+        gate_read = -1
         readable, _, _ = select.select((ready_read,), (), (), startup_timeout)
         ready_payload = os.read(ready_read, 128) if readable else b""
         try:
@@ -227,7 +270,7 @@ def spawn_supervised(argv, *, cwd=None, env=None, popen=subprocess.Popen,
             raise RuntimeError("process supervisor returned invalid child identity")
         return SupervisedProcess(
             process, child_pid, child_start, supervisor_start,
-            control_write, response_read,
+            control_write, response_read, gate_write,
         )
     except Exception:
         if process is not None and process.poll() is None:
@@ -246,6 +289,7 @@ def spawn_supervised(argv, *, cwd=None, env=None, popen=subprocess.Popen,
                 process.wait(timeout=startup_timeout)
         _close_fd(control_write)
         _close_fd(response_read)
+        _close_fd(gate_write)
         if process is not None:
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is None:
@@ -260,3 +304,4 @@ def spawn_supervised(argv, *, cwd=None, env=None, popen=subprocess.Popen,
         _close_fd(ready_write)
         _close_fd(control_read)
         _close_fd(response_write)
+        _close_fd(gate_read)

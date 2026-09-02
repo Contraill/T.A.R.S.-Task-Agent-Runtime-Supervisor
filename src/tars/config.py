@@ -1,5 +1,7 @@
 from pathlib import Path
+import ipaddress
 import tomllib
+from urllib.parse import urlsplit
 
 CONFIG_PATH = Path.home() / ".config/tars/config.toml"
 DATA_ROOT = Path.home() / ".local/share/tars"
@@ -50,5 +52,37 @@ def expand_path(value):
     return Path(value).expanduser().resolve()
 
 
+def local_http_origin(value, *, label="local runtime base_url"):
+    """Return a canonical loopback HTTP origin or fail closed."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{label} is invalid: {exc}") from exc
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"{label} must be a loopback HTTP(S) origin")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(f"{label} must not contain credentials, query data or a fragment")
+    if parsed.path not in {"", "/"}:
+        raise ValueError(f"{label} must not contain an API path")
+
+    hostname = parsed.hostname.casefold()
+    address_text = hostname.split("%", 1)[0]
+    try:
+        loopback = ipaddress.ip_address(address_text).is_loopback
+    except ValueError:
+        loopback = hostname == "localhost"
+    if not loopback:
+        raise ValueError(f"{label} must be loopback-local")
+
+    scheme = parsed.scheme.casefold()
+    effective_port = port or (443 if scheme == "https" else 80)
+    if hostname == "localhost":
+        hostname = "127.0.0.1"
+    host_text = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{scheme}://{host_text}:{effective_port}"
+
+
 def runtime_base_url(cfg):
-    return cfg["runtime"]["base_url"].rstrip("/")
+    return local_http_origin(cfg["runtime"]["base_url"], label="runtime base_url")

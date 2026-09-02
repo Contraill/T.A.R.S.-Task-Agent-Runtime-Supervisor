@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
 
 import pytest
 
@@ -17,7 +18,7 @@ def _role(role_id, runtime_id, model, *, execution="chat", profile="normal"):
     )
 
 
-def _model(alias, sha="abc"):
+def _model(alias, sha="a" * 64):
     return SimpleNamespace(
         alias=alias,
         name=alias.upper(),
@@ -29,7 +30,8 @@ def _model(alias, sha="abc"):
     )
 
 
-def _calibration(sha="abc", *, context=65536, ngl=-1, tensor_overrides=None):
+def _calibration(sha="a" * 64, *, context=65536, ngl=-1,
+                 tensor_overrides=None):
     profile = {
         "context": context,
         "cache_type_k": "q8_0",
@@ -44,6 +46,10 @@ def _calibration(sha="abc", *, context=65536, ngl=-1, tensor_overrides=None):
     return {
         "status": "ready",
         "model_sha256": sha,
+        "fingerprint": {
+            "llama_server_sha256": "1" * 64,
+            "llama_bench_sha256": "2" * 64,
+        },
         "profiles": {"normal": profile},
     }
 
@@ -64,6 +70,25 @@ def test_render_enforces_zero_idle_and_calibration(monkeypatch):
     assert "-ngl all" in rendered
     assert "-ctk q8_0 -ctv q8_0" in rendered
     assert "--port ${PORT}" in rendered
+    assert '  "daily":' in rendered
+    assert "-m tars.runtime_exec" in rendered
+    assert f"--server-sha256 {'1' * 64}" in rendered
+    assert f"--model-sha256 {'a' * 64}" in rendered
+
+
+def test_render_quotes_yaml_scalar_like_runtime_ids(monkeypatch):
+    role = _role("general", "true", "qwen")
+    monkeypatch.setattr(
+        runtime_config, "list_roles", lambda include_disabled=False: [role])
+    monkeypatch.setattr(runtime_config, "get_model", lambda alias: _model(alias))
+    monkeypatch.setattr(
+        runtime_config, "load_calibration", lambda alias: _calibration())
+
+    rendered = runtime_config.render_runtime_config(
+        runtime_config.build_runtime_plan())
+
+    assert '  "true":' in rendered
+    assert "  true:" not in rendered
 
 
 def test_render_preserves_tensor_overrides(monkeypatch):
@@ -94,11 +119,41 @@ def test_duplicate_runtime_ids_are_rejected(monkeypatch):
         _role("two", "shared", "b"),
     ]
     monkeypatch.setattr(runtime_config, "list_roles", lambda include_disabled=False: roles)
-    monkeypatch.setattr(runtime_config, "get_model", lambda alias: _model(alias, sha=alias))
-    monkeypatch.setattr(runtime_config, "load_calibration", lambda alias: _calibration(sha=alias))
+    monkeypatch.setattr(
+        runtime_config, "get_model",
+        lambda alias: _model(alias, sha=hashlib.sha256(alias.encode()).hexdigest()))
+    monkeypatch.setattr(
+        runtime_config, "load_calibration",
+        lambda alias: _calibration(sha=hashlib.sha256(alias.encode()).hexdigest()))
 
     with pytest.raises(ValueError, match="duplicate enabled runtime id"):
         runtime_config.build_runtime_plan()
+
+
+@pytest.mark.parametrize("runtime_id", [
+    "--network=host",
+    "daily:\n  injected: true",
+    "daily.example",
+    "daily/../../outside",
+    "daily\x00suffix",
+])
+def test_runtime_id_cannot_inject_generated_yaml(monkeypatch, runtime_id):
+    role = _role("general", runtime_id, "qwen")
+    monkeypatch.setattr(runtime_config, "list_roles", lambda include_disabled=False: [role])
+    monkeypatch.setattr(runtime_config, "get_model", lambda alias: _model(alias))
+    monkeypatch.setattr(runtime_config, "load_calibration", lambda alias: _calibration())
+
+    with pytest.raises(ValueError, match="invalid runtime id"):
+        runtime_config.build_runtime_plan()
+
+
+def test_render_revalidates_runtime_id_from_direct_plan():
+    plan = runtime_config.RuntimePlan(
+        models=(SimpleNamespace(runtime_id="daily:\n  injected: true"),),
+        llama_server=Path("/fixture/llama-server"),
+    )
+    with pytest.raises(ValueError, match="invalid runtime id"):
+        runtime_config.render_runtime_config(plan)
 
 
 def test_apply_restores_previous_config_when_health_check_fails(monkeypatch, tmp_path):
@@ -278,3 +333,42 @@ def test_colibri_roles_are_excluded_from_llama_swap(monkeypatch):
     monkeypatch.setattr(runtime_config, "get_model", lambda alias: model)
     plan = runtime_config.build_runtime_plan()
     assert plan.models == ()
+
+
+def test_runtime_health_probe_rejects_remote_config_before_transport(monkeypatch):
+    monkeypatch.setattr(
+        runtime_config, "request_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("remote runtime probe was attempted")),
+    )
+    with pytest.raises(ValueError, match="loopback-local"):
+        runtime_config._api_runtime_ids(
+            {"runtime": {"base_url": "http://runtime.internal:8080"}})
+
+
+def test_runtime_config_refuses_stale_calibration_executable_identity(
+        monkeypatch, tmp_path):
+    model_path = tmp_path / "model.gguf"
+    server = tmp_path / "llama-server"
+    bench = tmp_path / "llama-bench"
+    model_path.write_bytes(b"model")
+    server.write_bytes(b"server")
+    bench.write_bytes(b"bench")
+    model = _model("qwen", sha=hashlib.sha256(b"model").hexdigest())
+    model.path = model_path
+    calibration = _calibration(sha=model.sha256)
+    calibration["fingerprint"] = {
+        "llama_server_sha256": hashlib.sha256(b"server").hexdigest(),
+        "llama_bench_sha256": hashlib.sha256(b"bench").hexdigest(),
+    }
+    monkeypatch.setattr(runtime_config, "LLAMA_SERVER_PATH", server)
+    monkeypatch.setattr(
+        runtime_config, "list_roles",
+        lambda include_disabled=False: [_role("general", "daily", "qwen")],
+    )
+    monkeypatch.setattr(runtime_config, "get_model", lambda alias: model)
+    monkeypatch.setattr(runtime_config, "load_calibration", lambda alias: calibration)
+    server.write_bytes(b"changed-server")
+
+    with pytest.raises(RuntimeError, match="runtime identity.*stale"):
+        runtime_config.build_runtime_plan(require_files=True)

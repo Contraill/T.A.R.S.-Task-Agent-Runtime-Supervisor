@@ -100,6 +100,57 @@ def test_import_rejects_bad_hash(monkeypatch, tmp_path):
         lifecycle.import_model(source, "bad", expected_sha256="0" * 64)
 
 
+def test_failed_reverification_revokes_stale_integrity_flags(monkeypatch, tmp_path):
+    path = tmp_path / "model.gguf"
+    original = _gguf_payload(b"original")
+    path.write_bytes(original)
+    digest = hashlib.sha256(original).hexdigest()
+    registry = {"version": 3, "models": {"model": {
+        "name": "Model", "path": str(path), "sha256": digest,
+        "backend": "llama.cpp", "quant": "Q4", "native_context": 4096,
+        "integrity_verified": True, "runtime_compatible": True,
+    }}}
+    monkeypatch.setattr(lifecycle, "ensure_registry", lambda: registry)
+    monkeypatch.setattr(
+        lifecycle, "save_registry",
+        lambda data: None,
+    )
+    # Keep the lookup bound to the in-memory fixture without involving user state.
+    monkeypatch.setattr(
+        lifecycle, "get_model",
+        lambda alias: SimpleNamespace(
+            alias=alias, path=path, sha256=digest, backend="llama.cpp"),
+    )
+    path.write_bytes(_gguf_payload(b"mutated"))
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        lifecycle.verify_model("model")
+    assert registry["models"]["model"]["integrity_verified"] is False
+    assert registry["models"]["model"]["runtime_compatible"] is False
+
+
+@pytest.mark.parametrize("alias", [
+    "../outside",
+    "nested/model",
+    ".hidden",
+    "model:\n[injected]",
+    "model\x00suffix",
+])
+def test_model_alias_is_rejected_before_import_or_download_paths(
+        monkeypatch, tmp_path, alias):
+    source = tmp_path / "model.gguf"
+    source.write_bytes(_gguf_payload())
+    monkeypatch.setattr(
+        lifecycle, "_download",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("download path was reached")),
+    )
+    with pytest.raises(ValueError, match="invalid model alias"):
+        lifecycle.import_model(source, alias)
+    with pytest.raises(ValueError, match="invalid model alias"):
+        lifecycle.pull_model("https://example.invalid/model.gguf", alias)
+
+
 def test_disk_preflight_rejects_insufficient_space(monkeypatch, tmp_path):
     monkeypatch.setattr(lifecycle.shutil, "disk_usage", lambda path: SimpleNamespace(free=1))
     with pytest.raises(OSError, match="insufficient disk space"):

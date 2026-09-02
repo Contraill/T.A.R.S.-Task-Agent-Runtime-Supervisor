@@ -1,4 +1,5 @@
 import json
+import os
 import platform
 import shlex
 import subprocess
@@ -8,6 +9,15 @@ from pathlib import Path
 from .config import CALIBRATION_ROOT, MODEL_CALIBRATION_ROOT
 from .models import RuntimeProfile
 from .registry import ensure_registry
+from .model_integrity import SHA256_RE, inspect_model_artifact
+from .secure_paths import AnchoredRoot
+
+
+def _file_sha256(path):
+    try:
+        return inspect_model_artifact(path).sha256
+    except OSError:
+        return ""
 
 
 def _cmd_text(args):
@@ -35,7 +45,8 @@ def capture_fingerprint():
         "machine": platform.machine(),
         "python": platform.python_version(),
         "power_profile": _cmd_text(["powerprofilesctl", "get"]),
-        "llama_cpp": _cmd_text([str(llama_server), "--version"]),
+        "llama_server_sha256": _file_sha256(llama_server),
+        "llama_bench_sha256": _file_sha256(llama_server.with_name("llama-bench")),
     }
 
 
@@ -195,19 +206,82 @@ def calibration_path(sha256):
     return MODEL_CALIBRATION_ROOT / f"{sha256}.json"
 
 
+def _encoded_calibration(payload):
+    return (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _read_seed_record(root, name):
+    fd = root.open((name,), os.O_RDONLY)
+    try:
+        identity = os.fstat(fd)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            return json.load(handle), (identity.st_dev, identity.st_ino)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _legacy_seed_requires_identity(current, expected):
+    fingerprint = current.get("fingerprint")
+    if not isinstance(fingerprint, dict):
+        return False
+    if all(
+            isinstance(fingerprint.get(key), str)
+            and SHA256_RE.fullmatch(fingerprint[key])
+            for key in ("llama_server_sha256", "llama_bench_sha256")):
+        return False
+
+    semantic_record = {
+        key: value for key, value in current.items() if key != "fingerprint"
+    }
+    return (semantic_record == expected
+            and isinstance(fingerprint.get("llama_cpp"), str))
+
+
+def _upgrade_legacy_seed_identity(current, identity):
+    fingerprint = current["fingerprint"]
+    if not all(
+            isinstance(identity.get(key), str) and SHA256_RE.fullmatch(identity[key])
+            for key in ("llama_server_sha256", "llama_bench_sha256")):
+        raise RuntimeError("cannot bind legacy seed calibration to missing runtime artifacts")
+
+    upgraded = dict(current)
+    upgraded["fingerprint"] = {
+        **fingerprint,
+        "llama_server_sha256": identity["llama_server_sha256"],
+        "llama_bench_sha256": identity["llama_bench_sha256"],
+        "runtime_identity_bound_at": identity["captured_at"],
+    }
+    return upgraded
+
+
 def ensure_seed_calibrations():
     registry = ensure_registry()
     MODEL_CALIBRATION_ROOT.mkdir(parents=True, exist_ok=True)
+    captured_identity = None
 
-    for alias, payload in seed_payloads(registry).items():
-        path = calibration_path(payload["model_sha256"])
-        if path.exists():
-            continue
-        payload["fingerprint"] = capture_fingerprint()
-        path.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+    with AnchoredRoot(MODEL_CALIBRATION_ROOT) as root:
+        for _alias, payload in seed_payloads(registry).items():
+            name = f"{payload['model_sha256']}.json"
+            try:
+                current, file_identity = _read_seed_record(root, name)
+            except FileNotFoundError:
+                if captured_identity is None:
+                    captured_identity = capture_fingerprint()
+                created = dict(payload)
+                created["fingerprint"] = captured_identity
+                root.atomic_write((name,), _encoded_calibration(created))
+                continue
+
+            if not _legacy_seed_requires_identity(current, payload):
+                continue
+            if captured_identity is None:
+                captured_identity = capture_fingerprint()
+            upgraded = _upgrade_legacy_seed_identity(current, captured_identity)
+            root.atomic_write(
+                (name,), _encoded_calibration(upgraded),
+                require_existing=True, expected_identity=file_identity)
 
 
 def load_calibration(alias):

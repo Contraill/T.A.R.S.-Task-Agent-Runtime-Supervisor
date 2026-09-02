@@ -9,6 +9,7 @@ from .config import ROLE_REGISTRY_PATH
 from .registry import ensure_registry
 
 ROLE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+RUNTIME_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 LEGACY_ROLE_ALIASES = {
     "daily": "general",
     "coder": "builder",
@@ -30,12 +31,13 @@ class RoleRecord:
 
     @classmethod
     def from_dict(cls, role_id, data):
+        runtime_id = validate_runtime_id(data.get("runtime_id", role_id))
         return cls(
             id=role_id,
             display_name=data.get("display_name", role_id.title()),
             description=data.get("description", ""),
             enabled=bool(data.get("enabled", True)),
-            runtime_id=data.get("runtime_id", role_id),
+            runtime_id=runtime_id,
             model=data.get("model", ""),
             profile=data.get("profile", "normal"),
             execution=data.get("execution", "chat"),
@@ -50,6 +52,12 @@ def _quote(value):
 
 def _array(values):
     return "[" + ", ".join(_quote(v) for v in values) + "]"
+
+
+def validate_runtime_id(value):
+    if not isinstance(value, str) or not RUNTIME_ID_RE.fullmatch(value):
+        raise ValueError(f"invalid runtime id: {value!r}")
+    return value
 
 
 def default_role_registry():
@@ -189,6 +197,7 @@ def _validate_registry(data):
     for role_id, role in roles.items():
         if not ROLE_ID_RE.match(role_id):
             raise ValueError(f"invalid role id: {role_id}")
+        validate_runtime_id(role.get("runtime_id", role_id))
 
         model = role.get("model", "")
         if model and model not in models:
@@ -213,6 +222,7 @@ def load_role_registry():
         data = tomllib.load(handle)
     data.setdefault("roles", {})
     data.setdefault("default_role", "general")
+    _validate_registry(data)
     return data
 
 

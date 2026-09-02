@@ -14,10 +14,28 @@ from typing import Protocol
 
 from .calibration import calibration_path, load_calibration
 from .config import CALIBRATION_ROOT, LLAMA_BENCH_PATH, LLAMA_SERVER_PATH
+from .model_integrity import (
+    current_artifact_handle,
+    current_model_artifact_handle,
+    inspect_model_artifact,
+    require_current_model_artifact,
+)
+from .ownership import (
+    MODEL_EXECUTION_RESOURCE,
+    add_external_process_fence,
+    held_by,
+    model_execution_owner,
+    model_execution_scope,
+    remove_external_process_fence,
+)
+from .process_supervision import spawn_supervised
 from .registry import get_model
 from .runtime_config import GLOBAL_TTL, UNLOAD_TIMEOUT
 
 DEPTH_RANK = {"min": 1, "mid": 2, "max": 3}
+CALIBRATION_SLOT_WAIT_SECONDS = 30.0
+CALIBRATION_PROCESS_TIMEOUT_SECONDS = 1800.0
+CALIBRATION_POLL_SECONDS = 0.25
 STAGES = {
     "min": ("fit", "throughput", "finalize", "zero_idle"),
     "mid": ("fit", "throughput", "context_kv", "cpu", "resources", "finalize", "zero_idle"),
@@ -55,12 +73,63 @@ class CalibrationProbe(Protocol):
     def zero_idle(self) -> dict: ...
 
 
-def _command_text(args, timeout=15) -> str:
+def _require_model_execution_owner():
+    owner = model_execution_owner()
+    if owner is None or not held_by(*MODEL_EXECUTION_RESOURCE, owner):
+        raise RuntimeError("calibration probe requires model execution ownership")
+    return owner
+
+
+def _spawn_fenced(args, **kwargs):
+    owner = _require_model_execution_owner()
+    supervised = spawn_supervised(args, start_gated=True, **kwargs)
+    identities = (
+        {"pid": supervised.process.pid, "start": supervised.supervisor_start},
+        {"pid": supervised.child_pid, "start": supervised.child_start},
+    )
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
-        return (result.stdout or result.stderr).strip()
+        if not add_external_process_fence(
+                *MODEL_EXECUTION_RESOURCE, owner, identities):
+            raise RuntimeError("model execution ownership was lost before process start")
+        supervised.release_start_gate()
+        return supervised, owner, identities
+    except Exception:
+        try:
+            supervised.stop(timeout=5)
+        finally:
+            supervised.close_control()
+        raise
+
+
+def _finish_fenced(supervised, owner, identities):
+    try:
+        if supervised.process.poll() is None:
+            supervised.stop(timeout=5)
+        if not remove_external_process_fence(
+                *MODEL_EXECUTION_RESOURCE, owner, identities):
+            raise RuntimeError("model execution ownership was lost during process cleanup")
+    finally:
+        supervised.close_control()
+
+
+def _command_text(args, timeout=15) -> str:
+    supervised = None
+    owner = None
+    identities = ()
+    try:
+        supervised, owner, identities = _spawn_fenced(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = supervised.process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            supervised.stop(timeout=5)
+            stdout, stderr = supervised.process.communicate()
+        return (stdout or stderr).strip()
     except (OSError, subprocess.TimeoutExpired):
         return ""
+    finally:
+        if supervised is not None:
+            _finish_fenced(supervised, owner, identities)
 
 
 def _mem_available() -> int:
@@ -119,6 +188,9 @@ def _cpu_model() -> str:
 
 
 def hardware_fingerprint() -> dict:
+    _require_model_execution_owner()
+    bench = inspect_model_artifact(LLAMA_BENCH_PATH)
+    server = inspect_model_artifact(LLAMA_SERVER_PATH)
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 1))
     stable = {
         "schema": 1,
@@ -129,8 +201,10 @@ def hardware_fingerprint() -> dict:
         "cpu_affinity": affinity,
         "memory_total_bytes": _mem_total(),
         "gpus": _gpu_snapshot(),
-        "llama_bench": _command_text([str(LLAMA_BENCH_PATH), "--version"]),
-        "llama_server": _command_text([str(LLAMA_SERVER_PATH), "--version"]),
+        "llama_bench": f"sha256:{bench.sha256}",
+        "llama_server": f"sha256:{server.sha256}",
+        "llama_bench_sha256": bench.sha256,
+        "llama_server_sha256": server.sha256,
     }
     stable["digest"] = hashlib.sha256(
         json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -152,15 +226,41 @@ def _mem_total() -> int:
 class LlamaBenchProbe:
     """Objective llama.cpp calibration probe used by the local reference backend."""
 
+    def __init__(self):
+        self._bench_sha256 = ""
+        self._model = None
+
+    def bind_model(self, model):
+        self._model = model
+
     def fingerprint(self) -> dict:
-        return hardware_fingerprint()
+        fingerprint = hardware_fingerprint()
+        self._bench_sha256 = fingerprint["llama_bench_sha256"]
+        return fingerprint
 
     def measure(self, model_path: Path, candidate: Candidate, *, pressure: float = 0.0,
                 fit: bool = False) -> Measurement:
+        _require_model_execution_owner()
+        expected_bench = self._bench_sha256
+        if not expected_bench:
+            expected_bench = inspect_model_artifact(LLAMA_BENCH_PATH).sha256
+        bench_handle = current_artifact_handle(
+            LLAMA_BENCH_PATH, expected_bench, label="llama-bench")
+        if self._model is not None:
+            if Path(model_path).expanduser().absolute() != Path(
+                    self._model.path).expanduser().absolute():
+                raise RuntimeError("calibration probe model path differs from its binding")
+            model_handle = current_model_artifact_handle(self._model)
+        else:
+            model_inspection = inspect_model_artifact(model_path)
+            model_handle = current_artifact_handle(
+                model_path, model_inspection.sha256, label="calibration model")
         prompt = max(512, int(candidate.context * pressure)) if pressure else 512
+        bench_ref = f"/proc/self/fd/{bench_handle.fileno()}"
+        model_ref = f"/proc/self/fd/{model_handle.fileno()}"
         args = [
-            "taskset", "-c", candidate.cpus, str(LLAMA_BENCH_PATH),
-            "-m", str(model_path), "-p", str(prompt), "-n", "64",
+            "taskset", "-c", candidate.cpus, bench_ref,
+            "-m", model_ref, "-p", str(prompt), "-n", "64",
             "-r", "1", "-o", "json", "-ctk", candidate.cache_type_k,
             "-ctv", candidate.cache_type_v, "-t", str(candidate.threads), "-fa", "on",
             "-ngl", "999" if str(candidate.ngl) in {"all", "-1", "None"} else str(candidate.ngl),
@@ -170,45 +270,57 @@ class LlamaBenchProbe:
         if candidate.tensor_overrides:
             args.extend(["-ot", candidate.tensor_overrides])
         before_gpu = _gpu_snapshot()
+        supervised = None
+        owner = None
+        identities = ()
         try:
-            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            supervised, owner, identities = _spawn_fenced(
+                args, inherited_fds=(bench_handle.fileno(), model_handle.fileno()),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = supervised.process
         except OSError as exc:
             return Measurement(False, error=str(exc))
-        deadline = time.monotonic() + 1800
-        ram_peak = 0
-        vram_peak_mib = 0
-        baseline_vram = sum(row.get("memory_used_mib", 0) for row in before_gpu)
-        while process.poll() is None:
-            ram_peak = max(ram_peak, _process_rss(process.pid))
-            current_vram = sum(row.get("memory_used_mib", 0) for row in _gpu_snapshot())
-            vram_peak_mib = max(vram_peak_mib, max(0, current_vram - baseline_vram))
-            if time.monotonic() >= deadline:
-                process.kill()
-                stdout, stderr = process.communicate()
+        try:
+            deadline = time.monotonic() + CALIBRATION_PROCESS_TIMEOUT_SECONDS
+            ram_peak = 0
+            vram_peak_mib = 0
+            baseline_vram = sum(row.get("memory_used_mib", 0) for row in before_gpu)
+            while process.poll() is None:
+                ram_peak = max(ram_peak, _process_rss(supervised.child_pid))
+                current_vram = sum(row.get("memory_used_mib", 0) for row in _gpu_snapshot())
+                vram_peak_mib = max(vram_peak_mib, max(0, current_vram - baseline_vram))
+                if time.monotonic() >= deadline:
+                    supervised.stop(timeout=5)
+                    stdout, stderr = process.communicate()
+                    return Measurement(False, ram_peak_bytes=ram_peak,
+                                       vram_peak_bytes=vram_peak_mib * 1024 * 1024,
+                                       error="llama-bench timed out")
+                time.sleep(CALIBRATION_POLL_SECONDS)
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
                 return Measurement(False, ram_peak_bytes=ram_peak,
                                    vram_peak_bytes=vram_peak_mib * 1024 * 1024,
-                                   error="llama-bench timed out")
-            time.sleep(0.25)
-        stdout, stderr = process.communicate()
-        if process.returncode != 0:
-            return Measurement(False, ram_peak_bytes=ram_peak,
-                               vram_peak_bytes=vram_peak_mib * 1024 * 1024,
-                               error=(stderr or stdout)[-1000:])
-        try:
-            rows = json.loads(stdout)
-            if isinstance(rows, dict):
-                rows = [rows]
-        except json.JSONDecodeError as exc:
-            return Measurement(False, error=f"invalid llama-bench JSON: {exc}")
-        pp = [float(row.get("avg_ts", 0)) for row in rows if int(row.get("n_prompt", 0)) > 0]
-        tg = [float(row.get("avg_ts", 0)) for row in rows if int(row.get("n_gen", 0)) > 0]
-        placement = next(({
-            "n_gpu_layers": row.get("n_gpu_layers"),
-            "n_cpu_moe": row.get("n_cpu_moe"),
-            "tensor_split": row.get("tensor_split"),
-        } for row in rows if isinstance(row, dict)), {})
-        return Measurement(True, max(pp, default=0.0), max(tg, default=0.0), ram_peak,
-                           vram_peak_mib * 1024 * 1024, placement=placement)
+                                   error=(stderr or stdout)[-1000:])
+            try:
+                rows = json.loads(stdout)
+                if isinstance(rows, dict):
+                    rows = [rows]
+            except json.JSONDecodeError as exc:
+                return Measurement(False, error=f"invalid llama-bench JSON: {exc}")
+            pp = [float(row.get("avg_ts", 0)) for row in rows
+                  if int(row.get("n_prompt", 0)) > 0]
+            tg = [float(row.get("avg_ts", 0)) for row in rows
+                  if int(row.get("n_gen", 0)) > 0]
+            placement = next(({
+                "n_gpu_layers": row.get("n_gpu_layers"),
+                "n_cpu_moe": row.get("n_cpu_moe"),
+                "tensor_split": row.get("tensor_split"),
+            } for row in rows if isinstance(row, dict)), {})
+            return Measurement(
+                True, max(pp, default=0.0), max(tg, default=0.0), ram_peak,
+                vram_peak_mib * 1024 * 1024, placement=placement)
+        finally:
+            _finish_fenced(supervised, owner, identities)
 
     def zero_idle(self) -> dict:
         deadline = time.monotonic() + 30
@@ -271,6 +383,20 @@ class CalibrationEngine:
             raise ValueError(f"local calibration does not apply to backend {model.backend!r}")
         if not model.path.is_file():
             raise FileNotFoundError(model.path)
+        with model_execution_scope(
+            operation="calibration",
+            timeout=CALIBRATION_SLOT_WAIT_SECONDS,
+            metadata={"model_alias": str(alias), "depth": depth},
+        ):
+            require_current_model_artifact(model)
+            bind_model = getattr(self.probe, "bind_model", None)
+            if bind_model is not None:
+                bind_model(model)
+            return self._calibrate_owned(model, alias, depth=depth, fresh=fresh)
+
+    def _calibrate_owned(self, model, alias: str, *, depth: str, fresh: bool) -> dict:
+        fingerprint = self.probe.fingerprint()
+        fingerprint_digest = fingerprint["digest"]
         try:
             existing = load_calibration(alias)
         except FileNotFoundError:
@@ -278,13 +404,13 @@ class CalibrationEngine:
         if existing and existing.get("status") == "ready":
             old_depth = existing.get("depth", "min")
             same_artifact = existing.get("model_sha256") == model.sha256
-            if same_artifact and DEPTH_RANK.get(old_depth, 0) > DEPTH_RANK[depth]:
+            same_runtime = existing.get("fingerprint_digest") == fingerprint_digest
+            if (same_artifact and same_runtime
+                    and DEPTH_RANK.get(old_depth, 0) > DEPTH_RANK[depth]):
                 return {**existing, "protected_from_shallower": True}
-            if same_artifact and old_depth == depth and not fresh:
+            if same_artifact and same_runtime and old_depth == depth and not fresh:
                 return {**existing, "resumed": True}
 
-        fingerprint = self.probe.fingerprint()
-        fingerprint_digest = fingerprint["digest"]
         run_root = self.root / "engine" / alias / fingerprint_digest
         state = {"model": model, "fingerprint": fingerprint, "results": {}, "cache_events": []}
         for stage in STAGES[depth]:

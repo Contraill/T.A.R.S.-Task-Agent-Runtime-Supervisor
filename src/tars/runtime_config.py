@@ -10,11 +10,16 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
-import urllib.request
 
 from .calibration import load_calibration
+from .model_integrity import (
+    SHA256_RE,
+    calibration_runtime_artifacts_match,
+    require_current_model_artifact,
+)
 from .config import (
     LLAMA_SERVER_PATH,
     LLAMA_SWAP_CONFIG_PATH,
@@ -24,12 +29,14 @@ from .config import (
 )
 from .registry import get_model
 from .runtime_backends import backend_binding_ready
+from .runtime_http import request_json
 from .roles import (
     get_role,
     list_roles,
     load_role_registry,
     resolve_role_id,
     save_role_registry,
+    validate_runtime_id,
 )
 
 START_PORT = 10001
@@ -54,6 +61,7 @@ class RuntimeModelPlan:
     model_name: str
     model_path: Path
     model_sha256: str
+    runtime_server_sha256: str
     quant: str
     profile_name: str
     context: int
@@ -126,8 +134,12 @@ def _ngl_text(value) -> str:
 def _runtime_command(model: RuntimeModelPlan, llama_server: Path) -> str:
     args = [
         "taskset", "-c", model.cpus,
-        str(llama_server),
-        "-m", str(model.model_path),
+        str(Path(sys.executable).resolve()), "-m", "tars.runtime_exec",
+        "--server", str(llama_server),
+        "--server-sha256", model.runtime_server_sha256,
+        "--model", str(model.model_path),
+        "--model-sha256", model.model_sha256,
+        "--",
         "-c", str(model.context),
         "-ngl", _ngl_text(model.ngl),
     ]
@@ -155,12 +167,16 @@ def build_runtime_plan(*, require_files: bool = False) -> RuntimePlan:
     for role in list_roles(include_disabled=False):
         if not role.model:
             continue
+        validate_runtime_id(role.runtime_id)
         if role.runtime_id in runtime_ids:
             raise ValueError(f"duplicate enabled runtime id: {role.runtime_id}")
 
         model = get_model(role.model)
         if not _is_llama_cpp_model(model):
             continue
+        if not isinstance(model.sha256, str) or not SHA256_RE.fullmatch(model.sha256):
+            raise RuntimeError(
+                f"model {model.alias} has no valid SHA-256 identity")
 
         calibration = load_calibration(model.alias)
         if calibration.get("status") != "ready":
@@ -168,10 +184,20 @@ def build_runtime_plan(*, require_files: bool = False) -> RuntimePlan:
                 f"calibration for {model.alias} is {calibration.get('status', 'unknown')!r}"
             )
         calibrated_sha = calibration.get("model_sha256")
-        if calibrated_sha and calibrated_sha != model.sha256:
+        if calibrated_sha != model.sha256:
             raise RuntimeError(
                 f"calibration SHA mismatch for {model.alias}; recalibration required"
             )
+        fingerprint = calibration.get("fingerprint")
+        if not isinstance(fingerprint, dict):
+            raise RuntimeError(
+                f"calibration runtime identity for {model.alias} is missing")
+        server_sha256 = fingerprint.get("llama_server_sha256")
+        bench_sha256 = fingerprint.get("llama_bench_sha256")
+        if not all(isinstance(value, str) and SHA256_RE.fullmatch(value)
+                   for value in (server_sha256, bench_sha256)):
+            raise RuntimeError(
+                f"calibration runtime identity for {model.alias} is invalid")
 
         profile_data = (calibration.get("profiles") or {}).get(role.profile)
         if not isinstance(profile_data, dict):
@@ -192,7 +218,8 @@ def build_runtime_plan(*, require_files: bool = False) -> RuntimePlan:
             model_alias=model.alias,
             model_name=model.name,
             model_path=model.path,
-            model_sha256=model.sha256,
+            model_sha256=model.sha256.casefold(),
+            runtime_server_sha256=server_sha256.casefold(),
             quant=model.quant,
             profile_name=role.profile,
             context=context,
@@ -210,6 +237,12 @@ def build_runtime_plan(*, require_files: bool = False) -> RuntimePlan:
             raise ValueError(f"invalid thread count for {model.alias}/{role.profile}")
         if require_files and not plan.model_path.is_file():
             raise FileNotFoundError(f"model file missing: {plan.model_path}")
+        if require_files:
+            require_current_model_artifact(model)
+            if not calibration_runtime_artifacts_match(
+                    calibration, LLAMA_SERVER_PATH, LLAMA_SERVER_PATH.with_name("llama-bench")):
+                raise RuntimeError(
+                    f"calibration runtime identity for {model.alias} is stale")
 
         plans.append(plan)
         runtime_ids.add(role.runtime_id)
@@ -241,8 +274,9 @@ def render_runtime_config(plan: RuntimePlan | None = None) -> str:
     ]
 
     for model in plan.models:
+        validate_runtime_id(model.runtime_id)
         lines.extend([
-            f"  {model.runtime_id}:",
+            f"  {_yaml_quote(model.runtime_id)}:",
             f"    name: {_yaml_quote('T.A.R.S. ' + model.display_name)}",
             "    description: " + _yaml_quote(
                 f"{model.model_name} {model.quant} — calibrated "
@@ -352,10 +386,8 @@ def runtime_service_logs(*, lines: int = 100, follow: bool = False) -> int:
 
 
 def _api_runtime_ids(cfg, *, timeout=2.0) -> set[str]:
-    with urllib.request.urlopen(
-        runtime_base_url(cfg) + "/v1/models", timeout=timeout
-    ) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = request_json(
+        "GET", runtime_base_url(cfg) + "/v1/models", timeout=timeout)
     return {
         str(item.get("id"))
         for item in payload.get("data", [])

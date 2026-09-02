@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
 
 import pytest
 
@@ -23,7 +24,8 @@ def route_state(monkeypatch, tmp_path):
         capabilities=("conversation", "tools"))
     model = SimpleNamespace(
         alias="local", backend="llama.cpp", path=model_path,
-        integrity_verified=True, runtime_compatible=True, sha256="abc")
+        integrity_verified=True, runtime_compatible=True,
+        sha256=hashlib.sha256(b"local").hexdigest())
     monkeypatch.setattr(routing, "resolve_role_id", lambda value: value)
     monkeypatch.setattr(routing, "get_role", lambda value: role)
     monkeypatch.setattr(routing, "get_model", lambda value: model)
@@ -129,6 +131,14 @@ def test_no_cloud_or_silent_model_substitution(route_state):
     assert not route.ready and route.selected_role == "general"
     assert route.model_alias == "local"
     assert any("not an allowed local runtime" in reason for reason in route.reasons)
+
+
+def test_invalid_llama_cpp_transport_never_becomes_a_local_route(route_state):
+    route = routing.LocalRuntimeRouter(
+        {"runtime": {"base_url": "http://192.168.1.20:8080"}},
+    ).resolve("general")
+    assert not route.ready
+    assert any("loopback-local" in reason for reason in route.reasons)
 
 
 def test_missing_role_semantics_do_not_fall_back(route_state):

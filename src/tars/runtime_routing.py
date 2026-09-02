@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 import uuid
 
 from .calibration import get_profile
+from .model_integrity import require_current_model_artifact
 from .registry import get_model
 from .roles import get_role, resolve_role_id
 from .runtime_backends import (BackendStatus, LifecycleResult,
@@ -259,6 +260,8 @@ class LocalRuntimeRouter:
             raise RuntimeRouteUnavailable(
                 "runtime preparation requires model execution ownership")
         route.require_ready()
+        if route.backend == "llama.cpp":
+            require_current_model_artifact(get_model(route.model_alias))
         if route._backend is None:
             raise RuntimeRouteUnavailable("runtime backend instance is unavailable")
         result = route._backend.load(route.runtime_id)

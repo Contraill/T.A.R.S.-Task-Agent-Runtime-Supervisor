@@ -14,7 +14,14 @@ import urllib.parse
 from .calibration import calibration_path, load_calibration
 from .config import MODEL_ARTIFACT_ROOT, MODEL_DOWNLOAD_ROOT
 from .network import network_destination, open_bound
-from .registry import ensure_registry, get_model, role_for_alias, save_registry
+from .model_integrity import inspect_model_artifact
+from .registry import (
+    ensure_registry,
+    get_model,
+    role_for_alias,
+    save_registry,
+    validate_model_alias,
+)
 from .secure_paths import AnchoredRoot
 
 COMPATIBILITY_MANIFEST = json.loads(
@@ -96,6 +103,7 @@ def _register(alias: str, path: Path, digest: str, *, name: str, source: str,
               source_revision: str = "", license_name: str = "unknown",
               quant: str = "unknown", native_context: int = 0, size: int,
               runtime_compatible: bool) -> None:
+    validate_model_alias(alias)
     registry = ensure_registry()
     if alias in registry["models"]:
         raise ValueError(f"model alias already exists: {alias}")
@@ -124,30 +132,10 @@ def _gguf_compatible(path: Path) -> bool:
         return _gguf_header_compatible(handle.read(24))
 
 
-def _inspect_bound_file(path: Path):
-    requested = path.expanduser().absolute()
-    anchor = AnchoredRoot(requested.parent.resolve(strict=True))
-    digest = hashlib.sha256()
-    size = 0
-    header = b""
-    try:
-        with anchor.reader((requested.name,)) as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                if len(header) < 24:
-                    header = (header + chunk)[:24]
-                digest.update(chunk)
-                size += len(chunk)
-    finally:
-        anchor.close()
-    return digest.hexdigest(), size, _gguf_header_compatible(header)
-
-
 def import_model(path: str | Path, alias: str, *, expected_sha256: str | None = None,
                  name: str | None = None, license_name: str = "unknown",
                  quant: str = "unknown", native_context: int = 0) -> Path:
+    validate_model_alias(alias)
     source = Path(path).expanduser().absolute()
     with tempfile.TemporaryDirectory(prefix="tars-model-import-") as temporary:
         staged = Path(temporary) / "source.gguf"
@@ -208,6 +196,7 @@ def pull_model(source: str, alias: str, *, expected_sha256: str | None = None,
                license_name: str = "unknown", revision: str = "main",
                filename: str | None = None, quant: str = "unknown",
                native_context: int = 0) -> Path:
+    validate_model_alias(alias)
     if source.startswith(("http://", "https://")):
         url = source
         destination = network_destination(source, resolve_dns=False)
@@ -252,13 +241,20 @@ def search_huggingface(query: str, *, limit: int = 10) -> list[dict]:
 
 
 def verify_model(alias: str) -> VerificationResult:
+    validate_model_alias(alias)
     model = get_model(alias)
     if not model.path.is_file():
         raise FileNotFoundError(model.path)
-    digest, _, header_compatible = _inspect_bound_file(model.path)
+    inspection = inspect_model_artifact(model.path)
+    digest = inspection.sha256
     if digest != model.sha256:
+        registry = ensure_registry()
+        registry["models"][alias]["integrity_verified"] = False
+        registry["models"][alias]["runtime_compatible"] = False
+        save_registry(registry)
         raise ValueError(f"SHA-256 mismatch for {alias}: expected {model.sha256}, got {digest}")
-    compatible = model.backend == "llama.cpp" and header_compatible
+    compatible = (model.backend == "llama.cpp" and
+                  _gguf_header_compatible(inspection.header))
     try:
         calibration = load_calibration(alias)
         calibrated = (calibration.get("status") == "ready" and
@@ -273,6 +269,7 @@ def verify_model(alias: str) -> VerificationResult:
 
 
 def remove_model(alias: str) -> bool:
+    validate_model_alias(alias)
     assigned = role_for_alias(alias)
     if assigned:
         raise ValueError(f"model {alias} is assigned to Roles: {', '.join(assigned)}")

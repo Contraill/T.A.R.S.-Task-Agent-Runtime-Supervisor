@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
 from dataclasses import replace
 from urllib.parse import quote
-import urllib.request
 import time
 
 from .config import runtime_base_url
+from .model_integrity import require_current_model_artifact
 from .runtime_backends import InferenceRequest
+from .runtime_http import request_json
 from .runtime_routing import LocalRuntimeRouter
 from .registry import get_model
-from .roles import get_role
+from .roles import get_role, list_roles
 from .generation import generation_budget, generation_ceiling
 from .thinking import capability_for_model, decide as decide_thinking
 from .ownership import model_execution_owner, model_execution_scope
@@ -21,20 +21,11 @@ INFERENCE_SLOT_WAIT_SECONDS = 30.0
 
 
 def get_json(url, timeout=5):
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        return json.loads(response.read().decode())
+    return request_json("GET", url, timeout=timeout)
 
 
 def post_json(url, payload, timeout=600):
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode())
+    return request_json("POST", url, payload=payload, timeout=timeout)
 
 
 def runtime_models(cfg):
@@ -52,6 +43,14 @@ def upstream_post_json(cfg, runtime_id, path, payload, *, timeout=600):
         timeout=INFERENCE_SLOT_WAIT_SECONDS,
         metadata={"runtime_id": str(runtime_id), "path": str(path)},
     ):
+        roles = [
+            role for role in list_roles(include_disabled=False)
+            if role.runtime_id == str(runtime_id) and role.model
+        ]
+        if len(roles) != 1:
+            raise RuntimeError(
+                f"runtime id {runtime_id!r} has no unique verified model binding")
+        require_current_model_artifact(get_model(roles[0].model))
         base = runtime_base_url(cfg)
         model_path = quote(str(runtime_id), safe="")
         endpoint = path if str(path).startswith("/") else "/" + str(path)
