@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from functools import lru_cache
 import json
 import os
 import sqlite3
@@ -812,6 +813,7 @@ def _migrate_control_cancellations(conn: sqlite3.Connection) -> None:
         )
 
 
+@lru_cache(maxsize=1)
 def _expected_schema() -> dict[str, tuple[str, ...]]:
     expected = {}
     conn = sqlite3.connect(":memory:")
@@ -844,8 +846,7 @@ def schema_errors(conn: sqlite3.Connection) -> list[str]:
     return errors
 
 
-def migrate_connection(conn: sqlite3.Connection) -> int:
-    """Upgrade an opened state database through ordered, atomic schema transitions."""
+def _schema_version(conn: sqlite3.Connection) -> int:
     tables = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     if "meta" not in tables:
@@ -859,6 +860,12 @@ def migrate_connection(conn: sqlite3.Connection) -> int:
             version = int(row[0])
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid state schema version: {row[0]!r}") from exc
+    return version
+
+
+def migrate_connection(conn: sqlite3.Connection) -> int:
+    """Upgrade an opened state database through ordered, atomic schema transitions."""
+    version = _schema_version(conn)
     if version > SCHEMA_VERSION:
         raise RuntimeError(
             f"state schema {version} is newer than supported {SCHEMA_VERSION}")
@@ -866,9 +873,25 @@ def migrate_connection(conn: sqlite3.Connection) -> int:
         raise RuntimeError(
             f"state schema {version} predates the supported SQLite baseline "
             f"{BASE_SCHEMA_VERSION}")
+    if version == SCHEMA_VERSION:
+        errors = schema_errors(conn)
+        if errors:
+            raise RuntimeError("state schema validation failed: " + "; ".join(errors))
+        return version
 
+    # Re-read after acquiring the write lock. Two first-use callers may both
+    # observe version zero above; only the winner may use that observation.
     conn.execute("BEGIN IMMEDIATE")
     try:
+        version = _schema_version(conn)
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"state schema {version} is newer than supported {SCHEMA_VERSION}")
+        if version and version < BASE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"state schema {version} predates the supported SQLite baseline "
+                f"{BASE_SCHEMA_VERSION}")
+
         if version == 0:
             _apply_schema_level(conn, BASE_SCHEMA_VERSION)
             version = BASE_SCHEMA_VERSION

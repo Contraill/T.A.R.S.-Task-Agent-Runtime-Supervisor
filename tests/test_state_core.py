@@ -289,6 +289,47 @@ def test_schema_upgrade_preserves_existing_conversation(isolated_state):
     assert state_store.health()["schema_version"] == state_store.SCHEMA_VERSION
 
 
+def test_concurrent_first_use_reads_schema_version_under_write_lock(
+        monkeypatch, isolated_state):
+    original = state_store._schema_version
+    observed_transactions = []
+    observed_lock = threading.Lock()
+    initial_reads = threading.Barrier(8)
+    local = threading.local()
+    failures = []
+
+    def guarded_version(conn):
+        version = original(conn)
+        with observed_lock:
+            observed_transactions.append(conn.in_transaction)
+        if version == 0 and not getattr(local, "initial_read", False):
+            local.initial_read = True
+            initial_reads.wait(timeout=10)
+        return version
+
+    def initialize():
+        try:
+            state_store.ensure_state_store_no_migration()
+        except Exception as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(state_store, "_schema_version", guarded_version)
+    workers = [threading.Thread(target=initialize) for _ in range(8)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=20)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert failures == []
+    assert observed_transactions.count(False) == 8
+    assert observed_transactions.count(True) == 8
+    with sqlite3.connect(isolated_state) as conn:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(
+                state_store.SCHEMA_VERSION)
+
+
 def test_real_v16_layout_is_migrated_in_order(isolated_state):
     conn = sqlite3.connect(isolated_state)
     try:
