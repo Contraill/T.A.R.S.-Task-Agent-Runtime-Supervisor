@@ -90,6 +90,27 @@ def test_state_database_and_directory_permissions_are_repaired(isolated_state):
             assert os.stat(sidecar).st_mode & 0o777 == 0o600
 
 
+def test_wal_initialization_retries_immediate_sqlite_busy(monkeypatch):
+    class LockedOnce:
+        attempts = 0
+
+        def execute(self, statement):
+            assert statement == "PRAGMA journal_mode = WAL"
+            self.attempts += 1
+            if self.attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return SimpleNamespace(fetchone=lambda: ("wal",))
+
+    connection = LockedOnce()
+    sleeps = []
+    monkeypatch.setattr(state_store.time, "sleep", sleeps.append)
+
+    state_store._enable_wal_journal(connection)
+
+    assert connection.attempts == 2
+    assert sleeps == [0.01]
+
+
 def test_expiry_never_reassigns_authority_while_owner_process_is_alive(isolated_state):
     state_store.ensure_state_store()
     context = multiprocessing.get_context("spawn")

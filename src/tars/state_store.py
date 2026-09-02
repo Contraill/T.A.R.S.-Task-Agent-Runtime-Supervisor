@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+import time
 
 from .config import (RESTORE_RECOVERY_MARKER, STATE_DB_PATH, TASK_EVENTS_ROOT,
                      TASK_INDEX_PATH, TASK_ROOT)
@@ -141,6 +142,22 @@ def state_db_path_scope(path):
         _STATE_DB_PATH_OVERRIDE.reset(token)
 
 
+def _enable_wal_journal(conn: sqlite3.Connection, *, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            journal_mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).casefold() or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+    if str(journal_mode).casefold() != "wal":
+        raise RuntimeError(
+            f"state database refused WAL journal mode: {journal_mode!r}"
+        )
+
+
 def connect() -> sqlite3.Connection:
     database = current_state_db_path()
     database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -154,16 +171,22 @@ def connect() -> sqlite3.Connection:
             os.close(fd)
     os.chmod(database, 0o600)
     conn = sqlite3.connect(database, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 10000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    for suffix in ("", "-wal", "-shm"):
-        path = Path(str(database) + suffix)
-        if path.exists():
-            os.chmod(path, 0o600)
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 10000")
+        # This PRAGMA can report SQLITE_BUSY immediately on concurrent first
+        # use even when busy_timeout is configured.
+        _enable_wal_journal(conn)
+        conn.execute("PRAGMA synchronous = NORMAL")
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(str(database) + suffix)
+            if path.exists():
+                os.chmod(path, 0o600)
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 @contextmanager
